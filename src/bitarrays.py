@@ -32,10 +32,16 @@ def get_address_bitarrays(shape: Tuple[int]):
     return repacked
 
 
-def output_to_np(output: np.ndarray[np.uint8], shape: Tuple[int]):
+def output_to_image_array(
+    output: np.ndarray[np.uint8], shape: Tuple[int]
+) -> np.ndarray[np.uint8]:
+    total = np.prod(shape)
     output = np.unpackbits(
         output, axis=-1
     )  # num_outputs x batch_size//8 -> num_outputs x batch_size
+    output = output[
+        :, :total
+    ]  # trim off any padding from if the address count is not a multiple of 8
     output = output.transpose()  # batch_size x num_outputs
     output = np.packbits(output, axis=-1)  # batch_size x 1
     output = output.reshape(shape)  # original image shape
