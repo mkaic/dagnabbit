@@ -13,22 +13,16 @@ class Node:
         self.output_nodes: List["Node"] = []
         self.logical_function = GF.NP_NAND
         self.value = None
-        self.hash = hash(self.id)
         self.descendants: Set[str] = set([self])
 
     def __repr__(self):
         return self.id
-
-    def __hash__(self):
-        return self.hash
-
 
 class ComputationGraph:
     def __init__(self, num_gates: int, num_inputs: int, num_outputs: int = 8):
         self.num_gates = num_gates
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
-        self.total_nodes = num_gates + num_inputs + num_outputs
 
         self.input_nodes: List[Node] = []
         for i in range(self.num_inputs):
@@ -65,6 +59,7 @@ class ComputationGraph:
             if refcounts[node.id] == 0:
                 gates_with_zero_references.append(node)
 
+
         while len(gates_with_zero_references) > 0:
 
             node: Node = gates_with_zero_references.pop()
@@ -77,13 +72,13 @@ class ComputationGraph:
                     gates_with_zero_references.append(input_node)
 
         sorted_gates.reverse()
-        sorted_gates = [n for n in sorted_gates if not (("I" in n.id) or ("?" in n.id))]
+        sorted_gates = [
+            n for n in sorted_gates if not (("I" in n.id) or ("?" in n.id))
+        ]
         self.gate_nodes = sorted_gates
 
         cyclic = [
-            f"{n.input_nodes} --> {n.id} --> {n.output_nodes} | {n.descendants}"
-            for n in all_nodes
-            if refcounts[n.id] != 0
+            f"{n.input_nodes} --> {n.id} --> {n.output_nodes} | {n.descendants}" for n in all_nodes if refcounts[n.id] != 0
         ]
         print("\n")
         print("Cyclic gates:")
