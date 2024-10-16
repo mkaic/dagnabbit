@@ -12,6 +12,7 @@ from ..src.bitarrays import (
 )
 from ..src.dag import ComputationGraph, Node
 
+
 parser = ArgumentParser()
 parser.add_argument("-g", "--num_gates", type=int, default=512)
 parser.add_argument(
@@ -36,13 +37,13 @@ address_bitarrays = get_address_bitarrays(original_shape)
 best_loss = np.inf
 last_updated_at = best_loss
 
-progress_bar = tqdm(range(100_000))
-for epoch in range(1_000):
+for epoch in range(100):
     permutation = np.random.permutation(args.num_gates)
     for i, gate_idx in enumerate(permutation):
         node, old_input, new_input = graph.stage_node_input_mutation(
             graph.gate_nodes[gate_idx]
         )
+        print(f"STAGED {node.id} | {old_input.id} -> {new_input.id}")
 
         output = graph.evaluate(address_bitarrays)
         output = output_to_image_array(output, original_shape)
@@ -72,3 +73,4 @@ for epoch in range(1_000):
             pass
         else:
             graph.undo_node_input_mutation(node, old_input, new_input)
+            print(f"REVERT {node.id} | {new_input.id} -> {old_input.id}")

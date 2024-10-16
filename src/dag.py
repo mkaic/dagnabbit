@@ -32,12 +32,12 @@ class ComputationGraph:
 
         self.input_nodes: List[Node] = []
         for i in range(self.num_inputs):
-            self.input_nodes.append(Node(id=f"INPUT_{i}"))
+            self.input_nodes.append(Node(id=f"I{i}"))
 
         self.gate_nodes: List[Node] = []
         print("Initializing gates...")
         for i in tqdm(range(self.num_gates)):
-            new_node = Node(id=f"GATE_{i}")
+            new_node = Node(id=f"G{i}")
             new_node.logical_function = GF.NP_NAND
 
             for _ in range(2):
@@ -48,50 +48,65 @@ class ComputationGraph:
 
         self.output_nodes: List[Node] = []
         for i in range(self.num_outputs):
-            node = Node(id=f"OUTPUT_{i}")
+            node = Node(id=f"?{i}")
             self.connect(transmitting=np.random.choice(self.gate_nodes), receiving=node)
             self.output_nodes.append(node)
 
     def topological_sort(self):
+        print("Topological sorting...")
         all_nodes = self.input_nodes + self.gate_nodes + self.output_nodes
-        reference_counts = {n: len(n.output_nodes) for n in all_nodes}
-        gates_with_zero_references = [n for n in all_nodes if reference_counts[n] == 0]
-        sorted_gates = []
+
+        refcounts = {}
+        gates_with_zero_references = []
+        sorted_gates: List[Node] = []
+
+        for node in all_nodes:
+            refcounts[node.id] = len(set(node.output_nodes))
+            if refcounts[node.id] == 0:
+                gates_with_zero_references.append(node)
 
         while len(gates_with_zero_references) > 0:
-            node = gates_with_zero_references.pop()
-            for input_node in node.input_nodes:
-                for output_node in input_node.output_nodes:
-                    if output_node == node:
-                        reference_counts[input_node] -= 1
-                if reference_counts[input_node] == 0:
-                    gates_with_zero_references.append(input_node)
 
+            node: Node = gates_with_zero_references.pop()
             sorted_gates.append(node)
 
+            for input_node in set(node.input_nodes):
+                refcounts[input_node.id] -= 1
+
+                if refcounts[input_node.id] == 0:
+                    gates_with_zero_references.append(input_node)
+
         sorted_gates.reverse()
-        sorted_gates = [
-            n for n in sorted_gates if not (("INPUT" in n.id) or ("OUTPUT" in n.id))
-        ]
+        sorted_gates = [n for n in sorted_gates if not (("I" in n.id) or ("?" in n.id))]
         self.gate_nodes = sorted_gates
+
+        cyclic = [
+            f"{n.input_nodes} --> {n.id} --> {n.output_nodes} | {n.descendants}"
+            for n in all_nodes
+            if refcounts[n.id] != 0
+        ]
+        print("\n")
+        print("Cyclic gates:")
+        for c in cyclic:
+            print(c)
+        print("\n")
+
+    def refresh_descendants(self):
+        for n in self.gate_nodes:
+            n.descendants = set([n])
+        for n in reversed(self.gate_nodes):
+            n: Node
+            for output_node in n.output_nodes:
+                n.descendants = n.descendants | output_node.descendants
 
     def connect(self, transmitting: Node, receiving: Node):
         receiving.input_nodes.append(transmitting)
         transmitting.output_nodes.append(receiving)
-        transmitting.descendants = transmitting.descendants.union(receiving.descendants)
+        transmitting.descendants = transmitting.descendants | receiving.descendants
 
     def disconnect(self, transmitting: Node, receiving: Node):
         receiving.input_nodes.remove(transmitting)
         transmitting.output_nodes.remove(receiving)
-
-        self.topological_sort()
-
-        for node in self.gate_nodes:
-            node.descendants = set([node.id])
-        for node in reversed(self.gate_nodes):
-            node: Node
-            for input_node in node.input_nodes:
-                input_node.descendants = input_node.descendants | node.descendants
 
     def stage_node_input_mutation(self, node: Node) -> Tuple[Node, Node, Node]:
         old_input = np.random.choice(node.input_nodes)
@@ -99,8 +114,23 @@ class ComputationGraph:
         options.remove(old_input)
         new_input = np.random.choice(list(options))
 
+        # not_enough_inputs = [n for n in self.gate_nodes if len(n.input_nodes) < 2]
+        # if len(not_enough_inputs) != 0:
+        #     print("\n\n")
+        #     print("Not enough inputs:")
+        #     for n in not_enough_inputs:
+        #         print(n.id)
+        #         print(n.input_nodes)
+        #         print(n.output_nodes)
+        #         print("\n")
+        #     raise Exception("Not enough inputs")
+
         self.disconnect(transmitting=old_input, receiving=node)
         self.connect(transmitting=new_input, receiving=node)
+
+        self.topological_sort()
+
+        self.refresh_descendants()
 
         return node, old_input, new_input
 
@@ -118,14 +148,7 @@ class ComputationGraph:
 
         for gate_node in self.gate_nodes:
             function_inputs = [n.value for n in gate_node.input_nodes]
-            try:
-                gate_node.value = gate_node.logical_function(*function_inputs)
-            except Exception as e:
-                print("gate_node.logical_function", gate_node.logical_function)
-                print("function_inputs", function_inputs)
-                print("gate_node.id", gate_node)
-                print("gate_node.input_nodes", gate_node.input_nodes)
-                raise e
+            gate_node.value = gate_node.logical_function(*function_inputs)
 
         for i, output_node in enumerate(self.output_nodes):
             output_node.value = output_node.input_nodes[0].value
