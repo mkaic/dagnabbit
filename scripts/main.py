@@ -24,6 +24,7 @@ args = parser.parse_args()
 image = Image.open(args.image_path).convert("RGB")
 image = image.resize((args.resize, args.resize))
 image = np.array(image)
+image = np.moveaxis(image, -1, 0)
 original_shape = image.shape
 
 print("image.shape", original_shape)
@@ -37,13 +38,19 @@ address_bitarrays = get_address_bitarrays(original_shape)
 best_loss = np.inf
 last_updated_at = best_loss
 
-for epoch in range(100):
+for epoch in range(1_000):
     permutation = np.random.permutation(args.num_gates)
     for i, gate_idx in enumerate(permutation):
-        node, old_input, new_input = graph.stage_node_input_mutation(
-            graph.gate_nodes[gate_idx]
-        )
-        print(f"STAGED {node.id} | {old_input.id} -> {new_input.id}")
+        mutation_type = np.random.choice(["function", "input"])
+        match mutation_type:
+            case "function":
+                node, old_function, new_function = graph.stage_node_function_mutation(
+                    graph.gate_nodes[gate_idx]
+                )
+            case "input":
+                node, old_input, new_input = graph.stage_node_input_mutation(
+                    graph.gate_nodes[gate_idx]
+                )
 
         output = graph.evaluate(address_bitarrays)
         output = output_to_image_array(output, original_shape)
@@ -55,11 +62,11 @@ for epoch in range(100):
         if loss < best_loss:
             best_loss = loss
             print(
-                f"RMSE: {best_loss:.5f} | Epoch: {epoch:04} | Step: {i:04} | Last Saved At: {last_updated_at:.5f}"
+                f"RMSE: {best_loss:.5f} | E: {epoch:04} | S: {i:04} | Saved: {last_updated_at:.5f} | {mutation_type}"
             )
 
             if best_loss < last_updated_at * 0.995:
-                output_pil = Image.fromarray(output)
+                output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
                 output_pil.save(
                     "dagnabbit/test_images/output.jpg",
                     format="JPEG",
@@ -72,5 +79,12 @@ for epoch in range(100):
         elif loss == best_loss:
             pass
         else:
-            graph.undo_node_input_mutation(node, old_input, new_input)
-            print(f"REVERT {node.id} | {new_input.id} -> {old_input.id}")
+            match mutation_type:
+                case "function":
+                    graph.undo_node_function_mutation(
+                        node=node, old_function=old_function, new_function=new_function
+                    )
+                case "input":
+                    graph.undo_node_input_mutation(
+                        node=node, old_input=old_input, new_input=new_input
+                    )
