@@ -44,9 +44,8 @@ def output_to_image_array(
     ]  # trim off any padding from if the address count is not a multiple of 8
     output = output.transpose()  # batch_size x num_outputs
 
-    output = np.sum(output, axis=-1).astype(np.uint8)  # batch_size x 1
-    # output = np.packbits(output, axis=-1)  # batch_size x 1
-
+    # output = np.sum(output, axis=-1).astype(np.uint8)  # batch_size x 1
+    output = np.packbits(output, axis=-1)  # batch_size x 1
     output = output.reshape(shape)  # original image shape
     # output = output.view(np.uint8)
 

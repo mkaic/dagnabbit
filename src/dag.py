@@ -20,7 +20,7 @@ class Node:
 
 
 class ComputationGraph:
-    def __init__(self, num_gates: int, num_inputs: int, num_outputs: int = 255):
+    def __init__(self, num_gates: int, num_inputs: int, num_outputs: int = 8):
         self.num_gates = num_gates
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
