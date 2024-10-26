@@ -1,0 +1,8 @@
+name: dagnabbit
+dependencies:
+  - python=3.12
+  - pytorch::pytorch=2.5.*
+  - pytorch::torchvision=0.20.*
+  - conda-forge::tqdm
+  - conda-forge::numpy=2.1.*
+
