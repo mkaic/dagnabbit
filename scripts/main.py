@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from pathlib import Path
+import shutil
 
 import numpy as np
 from PIL import Image
@@ -39,6 +40,7 @@ best_loss = np.inf
 last_updated_at = best_loss
 update_counter = 0
 
+shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
 Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
 for epoch in range(1_000):
@@ -77,7 +79,7 @@ for epoch in range(1_000):
                     quality=100,
                 )
                 output_pil.save(
-                    f"dagnabbit/outputs/timelapse/{update_counter:05}.jpg",
+                    f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
                     format="JPEG",
                     subsampling=0,
                     quality=100,
