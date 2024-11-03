@@ -1,8 +1,8 @@
 from argparse import ArgumentParser
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 from ..src import gates as GF
 from ..src.bitarrays import (
@@ -11,7 +11,6 @@ from ..src.bitarrays import (
     output_to_image_array,
 )
 from ..src.dag import ComputationGraph
-
 
 parser = ArgumentParser()
 parser.add_argument("-g", "--num_gates", type=int, default=512)
@@ -38,6 +37,9 @@ address_bitarrays = get_address_bitarrays(original_shape)
 
 best_loss = np.inf
 last_updated_at = best_loss
+update_counter = 0
+
+Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
 for epoch in range(1_000):
     permutation = np.random.permutation(args.num_gates)
@@ -66,15 +68,23 @@ for epoch in range(1_000):
             )
 
             if best_loss < last_updated_at * 0.995:
+
                 output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
                 output_pil.save(
-                    "dagnabbit/test_images/output.jpg",
+                    "dagnabbit/outputs/output.jpg",
+                    format="JPEG",
+                    subsampling=0,
+                    quality=100,
+                )
+                output_pil.save(
+                    f"dagnabbit/outputs/timelapse/{update_counter:05}.jpg",
                     format="JPEG",
                     subsampling=0,
                     quality=100,
                 )
 
                 last_updated_at = best_loss
+                update_counter += 1
 
         elif loss == best_loss:
             pass
