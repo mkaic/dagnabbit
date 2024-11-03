@@ -5,4 +5,5 @@ dependencies:
   - pytorch::torchvision=0.20.*
   - conda-forge::tqdm
   - conda-forge::numpy=2.1.*
-
+  - pip:
+    - snakeviz==2.2

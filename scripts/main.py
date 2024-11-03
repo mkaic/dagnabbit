@@ -10,7 +10,7 @@ from ..src.bitarrays import (
     get_address_bitarrays,
     output_to_image_array,
 )
-from ..src.dag import ComputationGraph, Node
+from ..src.dag import ComputationGraph
 
 
 parser = ArgumentParser()
@@ -33,6 +33,7 @@ address_bitdepth = calculate_address_bitdepth(original_shape)
 
 graph = ComputationGraph(num_gates=args.num_gates, num_inputs=address_bitdepth)
 
+
 address_bitarrays = get_address_bitarrays(original_shape)
 
 best_loss = np.inf
@@ -42,15 +43,14 @@ for epoch in range(1_000):
     permutation = np.random.permutation(args.num_gates)
     for i, gate_idx in enumerate(permutation):
         mutation_type = np.random.choice(["function", "input"])
+        mutant_id = sorted(graph.evaluation_order)[gate_idx]
         match mutation_type:
             case "function":
-                node, old_function, new_function = graph.stage_node_function_mutation(
-                    graph.gate_nodes[gate_idx]
+                old_function, new_function = graph.stage_node_function_mutation(
+                    mutant_id
                 )
             case "input":
-                node, old_input, new_input = graph.stage_node_input_mutation(
-                    graph.gate_nodes[gate_idx]
-                )
+                old_input_id, new_input_id = graph.stage_node_input_mutation(mutant_id)
 
         output = graph.evaluate(address_bitarrays)
         output = output_to_image_array(output, original_shape)
@@ -82,9 +82,13 @@ for epoch in range(1_000):
             match mutation_type:
                 case "function":
                     graph.undo_node_function_mutation(
-                        node=node, old_function=old_function, new_function=new_function
+                        node_id=mutant_id,
+                        old_function=old_function,
+                        new_function=new_function,
                     )
                 case "input":
                     graph.undo_node_input_mutation(
-                        node=node, old_input=old_input, new_input=new_input
+                        node_id=mutant_id,
+                        old_input_id=old_input_id,
+                        new_input_id=new_input_id,
                     )
