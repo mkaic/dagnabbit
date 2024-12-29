@@ -17,7 +17,7 @@ def printbin(x):
 
 def get_address_bitarrays(shape: Tuple[int]):
     total = np.prod(shape)
-    # dtype="<u8" means a little-endian 8-byte (64-bit) unsigned integer
+    # dtype=">u8" means a big-endian 8-byte (64-bit) unsigned integer
     addresses = np.arange(0, total, dtype=">u8")
     addresses = np.expand_dims(addresses, axis=-1)
     addresses = addresses.view(np.uint8)

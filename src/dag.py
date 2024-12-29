@@ -9,73 +9,102 @@ from pprint import pprint
 DEBUG = False
 
 
+def random_dag(
+    num_gates: int, num_inputs: int, num_outputs: int
+) -> List[Tuple[int, ...]]:
+    edges = []
+
+    # Add input nodes (empty tuples)
+    for _ in range(num_inputs):
+        edges.append(())
+
+    # Add gate nodes
+    for i in range(num_gates):
+        # Available nodes are inputs and previous gates
+        available = list(range(num_inputs + i))
+        inputs = tuple(np.random.choice(available, size=2, replace=False))
+        edges.append(inputs)
+
+    # Add output nodes (single input tuples)
+    available = list(range(num_inputs + num_gates))
+    for _ in range(num_outputs):
+        output_source = (np.random.choice(available),)
+        edges.append(output_source)
+
+    return edges
+
+
 class ComputationGraph:
-    def __init__(self, num_gates: int, num_inputs: int, num_outputs: int = 8):
-        self.num_gates = num_gates
-        self.num_inputs = num_inputs
-        self.num_outputs = num_outputs
+    def __init__(self):
 
         self.node_inputs: dict[str, list[str]] = {}
         self.node_outputs: dict[str, list[str]] = {}
         self.node_functions: dict[str, Callable] = {}
         self.node_values: dict[str, np.ndarray[np.byte]] = {}
-
         self.evaluation_order: list[str] = []
 
         self.input_node_ids: set[str] = set()
-        for i in range(self.num_inputs):
-            id = f"I{i}"
-            self.input_node_ids.add(id)
-            self.evaluation_order.append(id)
-
-            self.node_inputs[id] = []
-            self.node_outputs[id] = []
-            self.node_functions[id] = None
-            self.node_values[id] = None
-
         self.gate_node_ids: set[str] = set()
-        print("Initializing null gates...")
-        for i in tqdm(range(self.num_gates)):
-            id = f"G{i}"
-            self.gate_node_ids.add(id)
-            self.evaluation_order.append(id)
-
-            self.node_inputs[id] = []
-            self.node_outputs[id] = []
-            self.node_functions[id] = np.random.choice(GF.AVAILABLE_FUNCTIONS)
-            self.node_values[id] = None
-
-            options = self.input_node_ids | self.gate_node_ids
-            options = options - {id}
-            for _ in range(2):
-                random_input = str(np.random.choice(list(options)))
-                self.connect(transmitting_id=random_input, receiving_id=id)
-
         self.output_node_ids: set[str] = set()
-        for i in range(self.num_outputs):
+
+    @classmethod
+    def from_valid_edges(
+        cls, edges: List[Tuple[int, ...]], num_inputs: int, num_outputs: int
+    ) -> "ComputationGraph":
+
+        graph = cls()
+
+        graph.num_inputs = num_inputs
+        graph.num_outputs = num_outputs
+        graph.num_gates = len(edges) - num_inputs - num_outputs
+
+        # Set up input nodes
+        for i in range(num_inputs):
+            id = f"I{i}"
+            graph.input_node_ids.add(id)
+            graph.evaluation_order.append(id)
+            graph.node_inputs[id] = []
+            graph.node_outputs[id] = []
+            graph.node_functions[id] = None
+            graph.node_values[id] = None
+
+        # Set up gate nodes and their connections
+        for i, inputs in enumerate(edges[num_inputs:-num_outputs]):
+            id = f"G{i}"
+            graph.gate_node_ids.add(id)
+            graph.evaluation_order.append(id)
+            graph.node_inputs[id] = []
+            graph.node_outputs[id] = []
+            graph.node_functions[id] = np.random.choice(GF.AVAILABLE_FUNCTIONS)
+            graph.node_values[id] = None
+
+            # Connect inputs based on the edge tuple
+            for input_idx in inputs:
+                if input_idx < num_inputs:
+                    input_id = f"I{input_idx}"
+                else:
+                    input_id = f"G{input_idx - num_inputs}"
+                graph.connect(transmitting_id=input_id, receiving_id=id)
+
+        # Set up output nodes
+        for i in range(num_outputs):
             id = f"@{i}"
-            self.output_node_ids.add(id)
-            self.evaluation_order.append(id)
+            graph.output_node_ids.add(id)
+            graph.evaluation_order.append(id)
+            graph.node_inputs[id] = []
+            graph.node_outputs[id] = []
+            graph.node_functions[id] = None
+            graph.node_values[id] = None
 
-            self.node_inputs[id] = []
-            self.node_outputs[id] = []
-            self.node_functions[id] = None
-            self.node_values[id] = None
+            # Connect output to last gate in the edges list
+            output_source_idx = edges[-num_outputs + i][0]
+            if output_source_idx < num_inputs:
+                source_id = f"I{output_source_idx}"
+            else:
+                source_id = f"G{output_source_idx - num_inputs}"
+            graph.connect(transmitting_id=source_id, receiving_id=id)
 
-            self.connect(
-                transmitting_id=str(np.random.choice(list(self.gate_node_ids))),
-                receiving_id=id,
-            )
-
-        if DEBUG:
-
-            print(self)
-
-            presort_order = self.evaluation_order
-            self.topological_sort()
-            postsort_order = self.evaluation_order
-            diff = set(presort_order) - set(postsort_order)
-            print("postsort missing", sorted(list(diff)))
+        return graph
 
     def __repr__(self):
         to_return = []

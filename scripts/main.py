@@ -11,7 +11,7 @@ from ..src.bitarrays import (
     get_address_bitarrays,
     output_to_image_array,
 )
-from ..src.dag import ComputationGraph
+from ..src.dag import ComputationGraph, random_dag
 
 parser = ArgumentParser()
 parser.add_argument("-g", "--num_gates", type=int, default=512)
@@ -31,8 +31,12 @@ print("image.shape", original_shape)
 
 address_bitdepth = calculate_address_bitdepth(original_shape)
 
-graph = ComputationGraph(num_gates=args.num_gates, num_inputs=address_bitdepth)
-
+initialization = random_dag(
+    num_gates=args.num_gates, num_inputs=address_bitdepth, num_outputs=3
+)
+graph = ComputationGraph.from_valid_edges(
+    edges=initialization, num_inputs=address_bitdepth, num_outputs=3
+)
 
 address_bitarrays = get_address_bitarrays(original_shape)
 
