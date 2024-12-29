@@ -57,8 +57,11 @@ for step in range(1_000):
 
     # each pair of two connection decisions is allowed to reference previous gates as well as input gates
     valid_indices = torch.arange(0, args.num_compute_nodes * 2) // 2
+    print(valid_indices)
     for i in range(len(logits)):
-        logits[i, address_bitdepth + i :] = -torch.inf
+        logits[i, address_bitdepth + valid_indices[i] :] = -torch.inf
+
+    # TODO: For some reason, the decision sequences being generated are not valid. Need to fix.
 
     probabilities = torch.softmax(logits, dim=-1)
     print(probabilities)
