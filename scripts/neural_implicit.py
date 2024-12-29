@@ -5,7 +5,6 @@ import shutil
 import numpy as np
 from PIL import Image
 
-from ..src import gates as GF
 from ..src.bitarrays import (
     calculate_address_bitdepth,
     get_address_bitarrays,
