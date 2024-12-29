@@ -22,7 +22,7 @@ def random_dag(
     for i in range(num_gates):
         # Available nodes are inputs and previous gates
         available = list(range(num_inputs + i))
-        inputs = tuple(np.random.choice(available, size=2, replace=False))
+        inputs = tuple(np.random.choice(available, size=2, replace=True))
         edges.append(inputs)
 
     # Add output nodes (single input tuples)
@@ -48,15 +48,15 @@ class ComputationGraph:
         self.output_node_ids: set[str] = set()
 
     @classmethod
-    def from_valid_edges(
-        cls, edges: List[Tuple[int, ...]], num_inputs: int, num_outputs: int
+    def from_valid_decision_sequence(
+        cls, decisions: List[Tuple[int, ...]], num_inputs: int, num_outputs: int
     ) -> "ComputationGraph":
 
         graph = cls()
 
         graph.num_inputs = num_inputs
         graph.num_outputs = num_outputs
-        graph.num_gates = len(edges) - num_inputs - num_outputs
+        graph.num_gates = len(decisions) - num_inputs - num_outputs
 
         # Set up input nodes
         for i in range(num_inputs):
@@ -69,7 +69,7 @@ class ComputationGraph:
             graph.node_values[id] = None
 
         # Set up gate nodes and their connections
-        for i, inputs in enumerate(edges[num_inputs:-num_outputs]):
+        for i, inputs in enumerate(decisions[num_inputs:-num_outputs]):
             id = f"G{i}"
             graph.gate_node_ids.add(id)
             graph.evaluation_order.append(id)
@@ -97,7 +97,7 @@ class ComputationGraph:
             graph.node_values[id] = None
 
             # Connect output to last gate in the edges list
-            output_source_idx = edges[-num_outputs + i][0]
+            output_source_idx = decisions[-num_outputs + i][0]
             if output_source_idx < num_inputs:
                 source_id = f"I{output_source_idx}"
             else:

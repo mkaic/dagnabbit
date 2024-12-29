@@ -33,8 +33,8 @@ address_bitdepth = calculate_address_bitdepth(original_shape)
 initialization = random_dag(
     num_gates=args.num_gates, num_inputs=address_bitdepth, num_outputs=3
 )
-graph = ComputationGraph.from_valid_edges(
-    edges=initialization, num_inputs=address_bitdepth, num_outputs=3
+graph = ComputationGraph.from_valid_decision_sequence(
+    decisions=initialization, num_inputs=address_bitdepth, num_outputs=3
 )
 
 address_bitarrays = get_address_bitarrays(original_shape)
@@ -46,7 +46,7 @@ update_counter = 0
 shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
 Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
-for epoch in range(1_000):
+for episode in range(1_000):
     permutation = np.random.permutation(args.num_gates)
     for i, gate_idx in enumerate(permutation):
         mutation_type = np.random.choice(["function", "input"])

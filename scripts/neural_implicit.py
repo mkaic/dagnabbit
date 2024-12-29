@@ -1,8 +1,9 @@
+import shutil
 from argparse import ArgumentParser
 from pathlib import Path
-import shutil
 
 import numpy as np
+import torch
 from PIL import Image
 
 from ..src.bitarrays import (
@@ -11,9 +12,14 @@ from ..src.bitarrays import (
     output_to_image_array,
 )
 from ..src.dag import ComputationGraph, random_dag
+from ..src.model import (
+    MLP,
+    binary_to_integer,
+    get_sinusoidal_position_encodings,
+)
 
 parser = ArgumentParser()
-parser.add_argument("-g", "--num_gates", type=int, default=512)
+parser.add_argument("-g", "--num_compute_nodes", type=int, default=512)
 parser.add_argument(
     "-i", "--image_path", type=str, default="dagnabbit/test_images/branos.png"
 )
@@ -29,81 +35,73 @@ original_shape = image.shape
 print("image.shape", original_shape)
 
 address_bitdepth = calculate_address_bitdepth(original_shape)
-
-initialization = random_dag(
-    num_gates=args.num_gates, num_inputs=address_bitdepth, num_outputs=3
-)
-graph = ComputationGraph.from_valid_edges(
-    edges=initialization, num_inputs=address_bitdepth, num_outputs=3
-)
-
 address_bitarrays = get_address_bitarrays(original_shape)
+
+pos_enc = get_sinusoidal_position_encodings(
+    length=args.num_compute_nodes * 2, dim=64, base=10000
+)
+mlp = MLP(layer_sizes=[64, 64, 64, args.num_compute_nodes + address_bitdepth])
+
 
 best_loss = np.inf
 last_updated_at = best_loss
 update_counter = 0
 
+
 shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
 Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
-for epoch in range(1_000):
-    permutation = np.random.permutation(args.num_gates)
-    for i, gate_idx in enumerate(permutation):
-        mutation_type = np.random.choice(["function", "input"])
-        mutant_id = sorted(graph.evaluation_order)[gate_idx]
-        match mutation_type:
-            case "function":
-                old_function, new_function = graph.stage_node_function_mutation(
-                    mutant_id
-                )
-            case "input":
-                old_input_id, new_input_id = graph.stage_node_input_mutation(mutant_id)
+for step in range(1_000):
 
-        output = graph.evaluate(address_bitarrays)
-        output = output_to_image_array(output, original_shape)
+    logits = mlp(pos_enc)
 
-        loss = np.sqrt(
-            np.mean(np.square(image.astype(np.float32) - output.astype(np.float32)))
-        )
+    # each pair of two connection decisions is allowed to reference previous gates as well as input gates
+    valid_indices = torch.arange(0, args.num_compute_nodes * 2) // 2
+    for i in range(len(logits)):
+        logits[i, address_bitdepth + i :] = -torch.inf
 
-        if loss < best_loss:
-            best_loss = loss
-            print(
-                f"RMSE: {best_loss:.5f} | E: {epoch:04} | S: {i:04} | Saved: {last_updated_at:.5f} | {mutation_type}"
+    probabilities = torch.softmax(logits, dim=-1)
+    print(probabilities)
+
+    samples = torch.multinomial(probabilities, 1)
+    samples = samples.flatten()
+
+    decisions = [tuple() for _ in range(address_bitdepth)]
+    sample_pairs = zip(samples[::2], samples[1::2])
+    decisions.extend([(a.item(), b.item()) for a, b in sample_pairs])
+
+    print(decisions)
+
+    graph = ComputationGraph.from_valid_decision_sequence(
+        decisions=decisions, num_inputs=address_bitdepth, num_outputs=3
+    )
+
+    output = graph.evaluate(address_bitarrays)
+    output = output_to_image_array(output, original_shape)
+
+    loss = np.sqrt(
+        np.mean(np.square(image.astype(np.float32) - output.astype(np.float32)))
+    )
+
+    if loss < best_loss:
+        best_loss = loss
+        print(f"RMSE: {best_loss:.5f} | Step: {step:04} | Saved: {last_updated_at:.5f}")
+
+        if best_loss < last_updated_at * 0.995:
+
+            output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
+            output_pil.save(
+                "dagnabbit/outputs/output.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
+            )
+            output_pil.save(
+                f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
             )
 
-            if best_loss < last_updated_at * 0.995:
-
-                output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
-                output_pil.save(
-                    "dagnabbit/outputs/output.jpg",
-                    format="JPEG",
-                    subsampling=0,
-                    quality=100,
-                )
-                output_pil.save(
-                    f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
-                    format="JPEG",
-                    subsampling=0,
-                    quality=100,
-                )
-
-                last_updated_at = best_loss
-                update_counter += 1
-
-        elif loss == best_loss:
-            pass
-        else:
-            match mutation_type:
-                case "function":
-                    graph.undo_node_function_mutation(
-                        node_id=mutant_id,
-                        old_function=old_function,
-                        new_function=new_function,
-                    )
-                case "input":
-                    graph.undo_node_input_mutation(
-                        node_id=mutant_id,
-                        old_input_id=old_input_id,
-                        new_input_id=new_input_id,
-                    )
+            last_updated_at = best_loss
+            update_counter += 1
