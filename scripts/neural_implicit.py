@@ -57,14 +57,10 @@ for step in range(1_000):
 
     # each pair of two connection decisions is allowed to reference previous gates as well as input gates
     valid_indices = torch.arange(0, args.num_compute_nodes * 2) // 2
-    print(valid_indices)
     for i in range(len(logits)):
         logits[i, address_bitdepth + valid_indices[i] :] = -torch.inf
 
-    # TODO: For some reason, the decision sequences being generated are not valid. Need to fix.
-
     probabilities = torch.softmax(logits, dim=-1)
-    print(probabilities)
 
     samples = torch.multinomial(probabilities, 1)
     samples = samples.flatten()
@@ -72,8 +68,8 @@ for step in range(1_000):
     decisions = [tuple() for _ in range(address_bitdepth)]
     sample_pairs = zip(samples[::2], samples[1::2])
     decisions.extend([(a.item(), b.item()) for a, b in sample_pairs])
-
-    print(decisions)
+    output_indices = range(len(decisions) - 3, len(decisions))
+    decisions.extend([(i,) for i in output_indices])
 
     graph = ComputationGraph.from_valid_decision_sequence(
         decisions=decisions, num_inputs=address_bitdepth, num_outputs=3
