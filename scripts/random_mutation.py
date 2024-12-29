@@ -1,6 +1,6 @@
+import shutil
 from argparse import ArgumentParser
 from pathlib import Path
-import shutil
 
 import numpy as np
 from PIL import Image
@@ -10,7 +10,14 @@ from ..src.bitarrays import (
     get_address_bitarrays,
     output_to_image_array,
 )
-from ..src.dag import ComputationGraph, random_dag
+from ..src.dag import (
+    ComputationGraph,
+    random_dag,
+    stage_node_function_mutation,
+    stage_node_input_mutation,
+    undo_node_function_mutation,
+    undo_node_input_mutation,
+)
 
 parser = ArgumentParser()
 parser.add_argument("-g", "--num_gates", type=int, default=512)
@@ -30,12 +37,10 @@ print("image.shape", original_shape)
 
 address_bitdepth = calculate_address_bitdepth(original_shape)
 
-initialization = random_dag(
-    num_gates=args.num_gates, num_inputs=address_bitdepth, num_outputs=3
+description = random_dag(
+    num_gates=args.num_gates, num_inputs=address_bitdepth, num_outputs=8
 )
-graph = ComputationGraph.from_valid_decision_sequence(
-    decisions=initialization, num_inputs=address_bitdepth, num_outputs=3
-)
+graph = ComputationGraph.from_description(description=description)
 
 address_bitarrays = get_address_bitarrays(original_shape)
 
@@ -46,18 +51,20 @@ update_counter = 0
 shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
 Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
-for episode in range(1_000):
+for epoch in range(1_000):
     permutation = np.random.permutation(args.num_gates)
     for i, gate_idx in enumerate(permutation):
         mutation_type = np.random.choice(["function", "input"])
         mutant_id = sorted(graph.evaluation_order)[gate_idx]
         match mutation_type:
             case "function":
-                old_function, new_function = graph.stage_node_function_mutation(
-                    mutant_id
+                old_function, new_function = stage_node_function_mutation(
+                    graph=graph, node_id=mutant_id
                 )
             case "input":
-                old_input_id, new_input_id = graph.stage_node_input_mutation(mutant_id)
+                old_input_id, new_input_id = stage_node_input_mutation(
+                    graph=graph, node_id=mutant_id
+                )
 
         output = graph.evaluate(address_bitarrays)
         output = output_to_image_array(output, original_shape)
@@ -96,13 +103,15 @@ for episode in range(1_000):
         else:
             match mutation_type:
                 case "function":
-                    graph.undo_node_function_mutation(
+                    undo_node_function_mutation(
+                        graph=graph,
                         node_id=mutant_id,
                         old_function=old_function,
                         new_function=new_function,
                     )
                 case "input":
-                    graph.undo_node_input_mutation(
+                    undo_node_input_mutation(
+                        graph=graph,
                         node_id=mutant_id,
                         old_input_id=old_input_id,
                         new_input_id=new_input_id,

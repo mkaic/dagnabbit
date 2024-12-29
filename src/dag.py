@@ -9,29 +9,25 @@ from pprint import pprint
 DEBUG = False
 
 
-def random_dag(
-    num_gates: int, num_inputs: int, num_outputs: int
-) -> List[Tuple[int, ...]]:
+def random_dag(num_gates: int, num_inputs: int, num_outputs: int) -> dict:
     edges = []
-
-    # Add input nodes (empty tuples)
-    for _ in range(num_inputs):
-        edges.append(())
+    functions = [np.random.choice(GF.AVAILABLE_FUNCTIONS) for _ in range(num_gates)]
 
     # Add gate nodes
-    for i in range(num_gates):
+    for i in range(num_inputs, num_inputs + num_gates):
         # Available nodes are inputs and previous gates
-        available = list(range(num_inputs + i))
+        available = list(range(i))
         inputs = tuple(np.random.choice(available, size=2, replace=True))
         edges.append(inputs)
 
-    # Add output nodes (single input tuples)
-    available = list(range(num_inputs + num_gates))
-    for _ in range(num_outputs):
-        output_source = (np.random.choice(available),)
-        edges.append(output_source)
+    description = {
+        "num_inputs": num_inputs,
+        "num_outputs": num_outputs,
+        "edges": edges,
+        "functions": functions,
+    }
 
-    return edges
+    return description
 
 
 class ComputationGraph:
@@ -48,15 +44,19 @@ class ComputationGraph:
         self.output_node_ids: set[str] = set()
 
     @classmethod
-    def from_valid_decision_sequence(
-        cls, decisions: List[Tuple[int, ...]], num_inputs: int, num_outputs: int
-    ) -> "ComputationGraph":
-
+    def from_description(cls, description: dict) -> "ComputationGraph":
         graph = cls()
+
+        num_inputs = description["num_inputs"]
+        num_outputs = description["num_outputs"]
+        edges = description["edges"]
+        functions = description["functions"]
+
+        num_gates = len(edges)
 
         graph.num_inputs = num_inputs
         graph.num_outputs = num_outputs
-        graph.num_gates = len(decisions) - num_inputs - num_outputs
+        graph.num_gates = num_gates
 
         # Set up input nodes
         for i in range(num_inputs):
@@ -69,13 +69,13 @@ class ComputationGraph:
             graph.node_values[id] = None
 
         # Set up gate nodes and their connections
-        for i, inputs in enumerate(decisions[num_inputs:-num_outputs]):
+        for i, inputs in enumerate(edges):
             id = f"G{i}"
             graph.gate_node_ids.add(id)
             graph.evaluation_order.append(id)
             graph.node_inputs[id] = []
             graph.node_outputs[id] = []
-            graph.node_functions[id] = np.random.choice(GF.AVAILABLE_FUNCTIONS)
+            graph.node_functions[id] = functions[i]
             graph.node_values[id] = None
 
             # Connect inputs based on the edge tuple
@@ -86,7 +86,7 @@ class ComputationGraph:
                     input_id = f"G{input_idx - num_inputs}"
                 graph.connect(transmitting_id=input_id, receiving_id=id)
 
-        # Set up output nodes
+        # Set up output nodes - connecting to the last num_outputs gates
         for i in range(num_outputs):
             id = f"@{i}"
             graph.output_node_ids.add(id)
@@ -96,12 +96,8 @@ class ComputationGraph:
             graph.node_functions[id] = None
             graph.node_values[id] = None
 
-            # Connect output to last gate in the edges list
-            output_source_idx = decisions[-num_outputs + i][0]
-            if output_source_idx < num_inputs:
-                source_id = f"I{output_source_idx}"
-            else:
-                source_id = f"G{output_source_idx - num_inputs}"
+            # Connect to one of the last num_outputs gates
+            source_id = f"G{num_gates - num_outputs + i}"
             graph.connect(transmitting_id=source_id, receiving_id=id)
 
         return graph
@@ -213,48 +209,55 @@ class ComputationGraph:
 
         return descendants
 
-    def stage_node_input_mutation(self, node_id: str) -> Tuple[str, str, str]:
-        old_input_id = str(np.random.choice(self.node_inputs[node_id]))
 
-        descendants = self.find_descendants(node_id)
+def stage_node_input_mutation(
+    graph: ComputationGraph, node_id: str
+) -> Tuple[str, str, str]:
+    old_input_id = str(np.random.choice(graph.node_inputs[node_id]))
 
-        options: list[str] = [
-            i
-            for i in self.evaluation_order
-            if i not in descendants and i != old_input_id
-        ]
+    descendants = graph.find_descendants(node_id)
 
-        new_input_id = str(np.random.choice(options))
+    options: list[str] = [
+        i for i in graph.evaluation_order if i not in descendants and i != old_input_id
+    ]
 
-        self.disconnect(transmitting_id=old_input_id, receiving_id=node_id)
-        self.connect(transmitting_id=new_input_id, receiving_id=node_id)
+    new_input_id = str(np.random.choice(options))
 
-        self.topological_sort()
+    graph.disconnect(transmitting_id=old_input_id, receiving_id=node_id)
+    graph.connect(transmitting_id=new_input_id, receiving_id=node_id)
 
-        return old_input_id, new_input_id
+    graph.topological_sort()
 
-    def undo_node_input_mutation(
-        self, node_id: str, old_input_id: str, new_input_id: str
-    ):
-        self.disconnect(transmitting_id=new_input_id, receiving_id=node_id)
-        self.connect(transmitting_id=old_input_id, receiving_id=node_id)
+    return old_input_id, new_input_id
 
-        self.topological_sort()
 
-    def stage_node_function_mutation(
-        self, node_id: str
-    ) -> Tuple[str, Callable, Callable]:
+def undo_node_input_mutation(
+    graph: ComputationGraph, node_id: str, old_input_id: str, new_input_id: str
+):
+    graph.disconnect(transmitting_id=new_input_id, receiving_id=node_id)
+    graph.connect(transmitting_id=old_input_id, receiving_id=node_id)
 
-        old_function = self.node_functions[node_id]
+    graph.topological_sort()
 
-        options = [f for f in GF.AVAILABLE_FUNCTIONS if f != old_function]
-        new_function = np.random.choice(options)
 
-        self.node_functions[node_id] = new_function
+def stage_node_function_mutation(
+    graph: ComputationGraph, node_id: str
+) -> Tuple[str, Callable, Callable]:
 
-        return old_function, new_function
+    old_function = graph.node_functions[node_id]
 
-    def undo_node_function_mutation(
-        self, node_id: str, old_function: Callable, new_function: Callable
-    ):
-        self.node_functions[node_id] = old_function
+    options = [f for f in GF.AVAILABLE_FUNCTIONS if f != old_function]
+    new_function = np.random.choice(options)
+
+    graph.node_functions[node_id] = new_function
+
+    return old_function, new_function
+
+
+def undo_node_function_mutation(
+    graph: ComputationGraph,
+    node_id: str,
+    old_function: Callable,
+    new_function: Callable,
+):
+    graph.node_functions[node_id] = old_function

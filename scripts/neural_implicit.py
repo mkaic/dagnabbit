@@ -11,6 +11,7 @@ from ..src.bitarrays import (
     get_address_bitarrays,
     output_to_image_array,
 )
+from ..src import gates as GF
 from ..src.dag import ComputationGraph, random_dag
 from ..src.model import (
     MLP,
@@ -65,15 +66,23 @@ for step in range(1_000):
     samples = torch.multinomial(probabilities, 1)
     samples = samples.flatten()
 
-    decisions = [tuple() for _ in range(address_bitdepth)]
-    sample_pairs = zip(samples[::2], samples[1::2])
-    decisions.extend([(a.item(), b.item()) for a, b in sample_pairs])
-    output_indices = range(len(decisions) - 3, len(decisions))
-    decisions.extend([(i,) for i in output_indices])
+    # Convert samples into edges list
+    edges = []
+    functions = [GF.NP_NAND for _ in range(args.num_compute_nodes)]
 
-    graph = ComputationGraph.from_valid_decision_sequence(
-        decisions=decisions, num_inputs=address_bitdepth, num_outputs=3
-    )
+    # Group samples into pairs to form edges
+    sample_pairs = zip(samples[::2], samples[1::2])
+    for a, b in sample_pairs:
+        edges.append((a.item(), b.item()))
+
+    description = {
+        "num_inputs": address_bitdepth,
+        "num_outputs": 8,
+        "edges": edges,
+        "functions": functions,
+    }
+
+    graph = ComputationGraph.from_description(description=description)
 
     output = graph.evaluate(address_bitarrays)
     output = output_to_image_array(output, original_shape)
