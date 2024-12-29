@@ -1,7 +1,6 @@
-from typing import List, Tuple, Callable
+from typing import Tuple, Callable
 
 import numpy as np
-from tqdm import tqdm
 
 from . import gates as GF
 from pprint import pprint

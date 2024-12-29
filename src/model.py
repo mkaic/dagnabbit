@@ -1,8 +1,10 @@
-import torch
-from torch import Tensor
-import torch.nn as nn
-import numpy as np
 from typing import List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torch import Tensor
 
 
 def get_sinusoidal_position_encodings(
@@ -55,3 +57,30 @@ def binary_to_integer(binary_vectors: Tensor) -> Tensor:
         binary_vectors.shape[-1] - 1, -1, -1, device=binary_vectors.device
     )
     return (binary_vectors * powers).sum(dim=-1)
+
+
+def save_if_best_loss(loss, best_loss, output, last_updated_at, update_counter, step):
+    if loss < best_loss:
+        best_loss = loss
+        print(f"RMSE: {best_loss:.5f} | Step: {step:04} | Saved: {last_updated_at:.5f}")
+
+        if best_loss < last_updated_at * 0.995:
+
+            output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
+            output_pil.save(
+                "dagnabbit/outputs/output.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
+            )
+            output_pil.save(
+                f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
+            )
+
+            last_updated_at = best_loss
+            update_counter += 1
+
+    return best_loss, last_updated_at, update_counter
