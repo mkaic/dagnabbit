@@ -15,7 +15,12 @@ from ..src.bitarrays import (
     output_to_image_array,
 )
 from ..src.dag import ComputationGraph
-from ..src.model import MLP, get_sinusoidal_position_encodings, save_if_best_loss
+from ..src.model import (
+    MLP,
+    get_sinusoidal_position_encodings,
+    save_if_best_rmse,
+    get_binary_position_encodings,
+)
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")
@@ -41,22 +46,43 @@ print("image.shape", original_shape)
 address_bitdepth = calculate_address_bitdepth(original_shape)
 address_bitarrays = get_address_bitarrays(original_shape)
 
-pos_enc = get_sinusoidal_position_encodings(
-    length=args.num_compute_nodes * 2, dim=64, base=10000
-).to(device)
+# pos_enc_dim = np.ceil(np.log2(args.num_compute_nodes)).astype(int)
+# pos_enc = (
+#     get_binary_position_encodings(
+#         length=args.num_compute_nodes * 2,
+#         dim=pos_enc_dim,
+#     )
+#     .float()
+#     .to(device)
+# )
+pos_enc_dim = 64
+pos_enc = (
+    get_sinusoidal_position_encodings(
+        length=args.num_compute_nodes * 2,
+        dim=pos_enc_dim,
+        base=10_000,
+    )
+    .float()
+    .to(device)
+)
+
 mlp = MLP(
-    layer_sizes=[64, 512, 1024, 512, args.num_compute_nodes + address_bitdepth],
+    layer_sizes=[
+        pos_enc_dim,
+        *[256 for _ in range(6)],
+        args.num_compute_nodes + address_bitdepth,
+    ],
     activation=torch.nn.GELU,
 ).to(device)
 
 num_params = sum(p.numel() for p in mlp.parameters())
 print(f"Number of trainable parameters: {num_params:,}")
 
-optimizer = Adam(mlp.parameters(), lr=1e-2 / args.batch_size)
+optimizer = Adam(mlp.parameters(), lr=1e-3)
 loss_fn = torch.nn.CrossEntropyLoss()
 
-best_loss = np.inf
-last_updated_at = best_loss
+best_rmse = np.inf
+last_updated_at = best_rmse
 update_counter = 0
 
 
@@ -66,7 +92,7 @@ Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 for step in tqdm(range(100_000)):
 
     discrete_sampled_actions = []
-    losses = []
+    pixel_rmses = []
 
     with torch.no_grad():
         logits = mlp(pos_enc)
@@ -104,19 +130,20 @@ for step in tqdm(range(100_000)):
         output = graph.evaluate(address_bitarrays)
         output = output_to_image_array(output, original_shape)
 
-        loss = np.sqrt(
+        rmse = np.sqrt(
             np.mean(np.square(image.astype(np.float32) - output.astype(np.float32)))
         )
 
         discrete_sampled_actions.append(samples)
-        losses.append(loss)
+        pixel_rmses.append(rmse)
 
-        best_loss, last_updated_at, update_counter = save_if_best_loss(
-            loss, best_loss, output, last_updated_at, update_counter, step
+        best_rmse, last_updated_at, update_counter = save_if_best_rmse(
+            rmse, best_rmse, output, last_updated_at, update_counter, step
         )
 
-    median_loss = np.median(losses)
-    advantages = [l - median_loss for l in losses]
+    rmse_mean = np.mean(pixel_rmses)
+    advantages = [(l - rmse_mean) for l in pixel_rmses]
+    advantages = torch.tensor(advantages).to(device)
 
     logits_with_grad = (
         mlp(pos_enc).expand(args.batch_size, -1, -1).to(device)
@@ -129,8 +156,14 @@ for step in tqdm(range(100_000)):
     one_hots = torch.zeros_like(logits_with_grad)
     one_hots.scatter_(2, discrete_sampled_actions, 1)
 
-    loss = loss_fn(logits_with_grad, one_hots)
+    loss = torch.nn.functional.cross_entropy(
+        logits_with_grad, one_hots, reduction="none"
+    )
+    loss = torch.mean(loss * advantages.unsqueeze(-1))
     loss.backward()
+
+    if step % 100 == 0:
+        print(f"Step: {step} | RMSE: {rmse:.4f} | Loss: {loss.item():.4f}")
 
     optimizer.step()
     optimizer.zero_grad()
