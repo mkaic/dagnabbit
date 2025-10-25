@@ -1,8 +1,8 @@
-from typing import Tuple, Callable
+from typing import Any, Tuple, Callable
 
 import numpy as np
 
-from . import gates as GF
+from dagnabbit.src.gate_functions import gate_functions as GF
 from pprint import pprint
 
 DEBUG = False
@@ -38,9 +38,9 @@ class ComputationGraph:
         self.node_values: dict[str, np.ndarray[np.byte]] = {}
         self.evaluation_order: list[str] = []
 
-        self.input_node_ids: set[str] = set()
-        self.gate_node_ids: set[str] = set()
-        self.output_node_ids: set[str] = set()
+        self.input_node_ids: set[str] = set[str]()
+        self.gate_node_ids: set[str] = set[str]()
+        self.output_node_ids: set[str] = set[str]()
 
     @classmethod
     def from_description(cls, description: dict) -> "ComputationGraph":
@@ -48,14 +48,10 @@ class ComputationGraph:
 
         num_inputs = description["num_inputs"]
         num_outputs = description["num_outputs"]
-        edges = description["edges"]
-        functions = description["functions"]
+        compute_node_input_edge_pairs = description["compute_node_input_edge_pairs"]
+        compute_node_functions = description["compute_node_functions"]
 
-        num_gates = len(edges)
-
-        graph.num_inputs = num_inputs
-        graph.num_outputs = num_outputs
-        graph.num_gates = num_gates
+        num_gates = len(compute_node_input_edge_pairs)
 
         # Set up input nodes
         for i in range(num_inputs):
@@ -68,13 +64,13 @@ class ComputationGraph:
             graph.node_values[id] = None
 
         # Set up gate nodes and their connections
-        for i, inputs in enumerate(edges):
+        for i, inputs in enumerate[tuple[int, int]](compute_node_input_edge_pairs):
             id = f"G{i}"
             graph.gate_node_ids.add(id)
             graph.evaluation_order.append(id)
             graph.node_inputs[id] = []
             graph.node_outputs[id] = []
-            graph.node_functions[id] = functions[i]
+            graph.node_functions[id] = compute_node_functions[i]
             graph.node_values[id] = None
 
             # Connect inputs based on the edge tuple
@@ -114,7 +110,7 @@ class ComputationGraph:
 
         output_values = np.zeros((self.num_outputs, inputs.shape[-1]), dtype=np.uint8)
 
-        for i, input_node_id in enumerate(sorted(list(self.input_node_ids))):
+        for i, input_node_id in enumerate[str](sorted(list[str](self.input_node_ids))):
             self.node_values[input_node_id] = inputs[i]
 
         for gate_node_id in self.gate_node_ids:
@@ -131,7 +127,9 @@ class ComputationGraph:
                 *function_inputs
             )
 
-        for i, output_node_id in enumerate(sorted(list(self.output_node_ids))):
+        for i, output_node_id in enumerate[str](
+            sorted(list[str](self.output_node_ids))
+        ):
             output_source_node_id = self.node_inputs[output_node_id][0]
             self.node_values[output_node_id] = self.node_values[output_source_node_id]
             output_values[i] = self.node_values[output_node_id]
@@ -178,9 +176,7 @@ class ComputationGraph:
 
         if DEBUG:
             cyclic = [
-                f"{self.node_inputs[id]} --> "
-                "{id} --> {self.node_outputs[id]} | "
-                "{self.node_descendants[id]}"
+                f"{self.node_inputs[id]} --> " "{id} --> {self.node_outputs[id]}"
                 for id in self.evaluation_order
                 if refcounts[id] != 0
             ]
@@ -189,74 +185,3 @@ class ComputationGraph:
             for c in cyclic:
                 print(c)
             print("\n")
-
-    def find_descendants(self, node_id: str) -> set[str]:
-        descendants = set()
-        stack = [node_id]
-        seen = set()
-
-        while len(stack) > 0:
-            current_node_id = stack.pop()
-            if current_node_id in seen:
-                continue
-            else:
-                seen.add(current_node_id)
-                descendants.add(current_node_id)
-
-                for output_node_id in self.node_outputs[current_node_id]:
-                    stack.append(output_node_id)
-
-        return descendants
-
-
-def stage_node_input_mutation(
-    graph: ComputationGraph, node_id: str
-) -> Tuple[str, str, str]:
-    old_input_id = str(np.random.choice(graph.node_inputs[node_id]))
-
-    descendants = graph.find_descendants(node_id)
-
-    options: list[str] = [
-        i for i in graph.evaluation_order if i not in descendants and i != old_input_id
-    ]
-
-    new_input_id = str(np.random.choice(options))
-
-    graph.disconnect(transmitting_id=old_input_id, receiving_id=node_id)
-    graph.connect(transmitting_id=new_input_id, receiving_id=node_id)
-
-    graph.topological_sort()
-
-    return old_input_id, new_input_id
-
-
-def undo_node_input_mutation(
-    graph: ComputationGraph, node_id: str, old_input_id: str, new_input_id: str
-):
-    graph.disconnect(transmitting_id=new_input_id, receiving_id=node_id)
-    graph.connect(transmitting_id=old_input_id, receiving_id=node_id)
-
-    graph.topological_sort()
-
-
-def stage_node_function_mutation(
-    graph: ComputationGraph, node_id: str
-) -> Tuple[str, Callable, Callable]:
-
-    old_function = graph.node_functions[node_id]
-
-    options = [f for f in GF.AVAILABLE_FUNCTIONS if f != old_function]
-    new_function = np.random.choice(options)
-
-    graph.node_functions[node_id] = new_function
-
-    return old_function, new_function
-
-
-def undo_node_function_mutation(
-    graph: ComputationGraph,
-    node_id: str,
-    old_function: Callable,
-    new_function: Callable,
-):
-    graph.node_functions[node_id] = old_function
