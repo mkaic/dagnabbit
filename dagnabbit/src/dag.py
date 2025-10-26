@@ -1,32 +1,10 @@
-from typing import Any, Tuple, Callable
+from typing import Callable
 
 import numpy as np
 
-from dagnabbit.src.gate_functions import gate_functions as GF
 from pprint import pprint
 
 DEBUG = False
-
-
-def random_dag(num_gates: int, num_inputs: int, num_outputs: int) -> dict:
-    edges = []
-    functions = [np.random.choice(GF.AVAILABLE_FUNCTIONS) for _ in range(num_gates)]
-
-    # Add gate nodes
-    for i in range(num_inputs, num_inputs + num_gates):
-        # Available nodes are inputs and previous gates
-        available = list(range(i))
-        inputs = tuple(np.random.choice(available, size=2, replace=True))
-        edges.append(inputs)
-
-    description = {
-        "num_inputs": num_inputs,
-        "num_outputs": num_outputs,
-        "edges": edges,
-        "functions": functions,
-    }
-
-    return description
 
 
 class ComputationGraph:
@@ -42,19 +20,23 @@ class ComputationGraph:
         self.gate_node_ids: set[str] = set[str]()
         self.output_node_ids: set[str] = set[str]()
 
+        self.num_inputs = None
+        self.num_gates = None
+        self.num_outputs = None
+
     @classmethod
     def from_description(cls, description: dict) -> "ComputationGraph":
         graph = cls()
 
-        num_inputs = description["num_inputs"]
-        num_outputs = description["num_outputs"]
         compute_node_input_edge_pairs = description["compute_node_input_edge_pairs"]
         compute_node_functions = description["compute_node_functions"]
 
-        num_gates = len(compute_node_input_edge_pairs)
+        graph.num_inputs = description["num_inputs"]
+        graph.num_gates = len(compute_node_input_edge_pairs)
+        graph.num_outputs = description["num_outputs"]
 
         # Set up input nodes
-        for i in range(num_inputs):
+        for i in range(graph.num_inputs):
             id = f"I{i}"
             graph.input_node_ids.add(id)
             graph.evaluation_order.append(id)
@@ -75,14 +57,14 @@ class ComputationGraph:
 
             # Connect inputs based on the edge tuple
             for input_idx in inputs:
-                if input_idx < num_inputs:
+                if input_idx < graph.num_inputs:
                     input_id = f"I{input_idx}"
                 else:
-                    input_id = f"G{input_idx - num_inputs}"
+                    input_id = f"G{input_idx - graph.num_inputs}"
                 graph.connect(transmitting_id=input_id, receiving_id=id)
 
         # Set up output nodes - connecting to the last num_outputs gates
-        for i in range(num_outputs):
+        for i in range(graph.num_outputs):
             id = f"@{i}"
             graph.output_node_ids.add(id)
             graph.evaluation_order.append(id)
@@ -92,7 +74,7 @@ class ComputationGraph:
             graph.node_values[id] = None
 
             # Connect to one of the last num_outputs gates
-            source_id = f"G{num_gates - num_outputs + i}"
+            source_id = f"G{graph.num_gates - graph.num_outputs + i}"
             graph.connect(transmitting_id=source_id, receiving_id=id)
 
         return graph
@@ -106,7 +88,7 @@ class ComputationGraph:
         return "\n".join(to_return)
 
     def evaluate(self, inputs: np.ndarray[np.uint8]) -> np.ndarray[np.uint8]:
-        assert inputs.shape[0] == self.num_inputs
+        assert inputs.shape[0] == len(self.input_node_ids)
 
         output_values = np.zeros((self.num_outputs, inputs.shape[-1]), dtype=np.uint8)
 

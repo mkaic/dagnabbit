@@ -1,14 +1,14 @@
+from random import sample
 import shutil
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from collections import Counter
 
-from ..src import gates as GF
-from ..src.bitarrays import (
+from dagnabbit.src.bitarrays import (
     calculate_address_bitdepth,
     get_address_bitarrays,
 )
@@ -17,31 +17,23 @@ from dagnabbit.src.model import (
     get_sinusoidal_position_encodings,
 )
 from dagnabbit.src.cd_rge import apply_perturbation
+from dagnabbit.scripts import config
+from dagnabbit.src.gate_functions import AVAILABLE_FUNCTIONS
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
 
-IMAGE_PATH = "test_images/branos.png"
-RESIZE = 64
-NUM_COMPUTE_NODES = 512
-NUM_OUTPUT_NODES = 8
-POSITION_ENCODING_DIM = 128
-HIDDEN_DIM = 256
 
-NUM_PERTURBATIONS = 128
-PERTURBATION_SIZE = 0.01
-STEP_SIZE = 0.01
+def compute_mse(prediction: np.ndarray, target: np.ndarray) -> float:
+    prediction = prediction.astype(np.float32)
+    target = target.astype(np.float32)
+    mean_square_error = np.mean(np.square(prediction - target))
+    return np.sqrt(mean_square_error)
 
 
-def compute_rmse(prediction: np.ndarray, target: np.ndarray) -> float:
-    return np.sqrt(
-        np.mean(np.square(prediction.astype(np.float32) - target.astype(np.float32)))
-    )
-
-
-image = Image.open(IMAGE_PATH).convert("RGB")
-image = image.resize((RESIZE, RESIZE))
+image = Image.open(config.IMAGE_PATH).convert("RGB")
+image = image.resize((config.RESIZE, config.RESIZE))
 image = np.array(image)
 image = np.moveaxis(image, -1, 0)
 original_shape = image.shape
@@ -51,11 +43,10 @@ print("image.shape", original_shape)
 address_bitdepth = calculate_address_bitdepth(original_shape)
 address_bitarrays = get_address_bitarrays(original_shape)
 
-pos_enc_dim = 64
 position_encodings = (
     get_sinusoidal_position_encodings(
-        length=NUM_COMPUTE_NODES * 2,
-        dim=pos_enc_dim,
+        length=config.NUM_COMPUTE_NODES * 2,
+        dim=config.POSITION_ENCODING_DIM,
         base=10_000,
     )
     .float()
@@ -66,11 +57,11 @@ with torch.no_grad():
 
     model = NeuralImplicitComputationGraph(
         num_input_nodes=address_bitdepth,
-        num_compute_nodes=NUM_COMPUTE_NODES,
-        num_output_nodes=NUM_OUTPUT_NODES,
-        num_layers=4,
-        input_dim=POSITION_ENCODING_DIM,
-        hidden_dim=HIDDEN_DIM,
+        num_compute_nodes=config.NUM_COMPUTE_NODES,
+        num_output_nodes=config.NUM_OUTPUT_NODES,
+        num_layers=config.NUM_LAYERS,
+        input_dim=config.POSITION_ENCODING_DIM,
+        hidden_dim=config.HIDDEN_DIM,
     )
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of trainable parameters: {num_params:,}")
@@ -82,11 +73,15 @@ with torch.no_grad():
     shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
     Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
 
-    for step in tqdm[int](range(100_000)):
-        perturbation_progress_bar = tqdm[int](
-            range(NUM_PERTURBATIONS),
+    shutil.rmtree("dagnabbit/outputs/all_outputs", ignore_errors=True)
+    Path("dagnabbit/outputs/all_outputs").mkdir(parents=True, exist_ok=True)
+
+    progress_bar = tqdm(range(100_000))
+    for step in progress_bar:
+        perturbation_progress_bar = tqdm(
+            range(config.NUM_PERTURBATIONS),
             leave=False,
-            total=NUM_PERTURBATIONS,
+            total=config.NUM_PERTURBATIONS,
         )
 
         seed_gradient_pairs = []
@@ -99,25 +94,35 @@ with torch.no_grad():
             model: NeuralImplicitComputationGraph = apply_perturbation(
                 module=model,
                 seed=perturbation_seed,
-                step_size=(1 * PERTURBATION_SIZE),
+                step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(position_encodings=position_encodings)
-            positive_step_loss = compute_rmse(output, image)
+            output = model.forward(
+                position_encodings=position_encodings,
+                address_bitarrays=address_bitarrays,
+                output_shape=original_shape,
+            )
+            positive_step_loss = np.sqrt(compute_mse(output, image))
+            # print("\nPos", positive_step_loss)
 
             # Undo positive step size perturbation and apply negative step size perturbation
             model: NeuralImplicitComputationGraph = apply_perturbation(
                 module=model,
                 seed=perturbation_seed,
-                step_size=(-2 * PERTURBATION_SIZE),
+                step_size=(-2 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(position_encodings=position_encodings)
-            negative_step_loss = compute_rmse(output, image)
-
-            gradient = (positive_step_loss - negative_step_loss) / (
-                2 * PERTURBATION_SIZE
+            output = model.forward(
+                position_encodings=position_encodings,
+                address_bitarrays=address_bitarrays,
+                output_shape=original_shape,
             )
+            negative_step_loss = np.sqrt(compute_mse(output, image))
+            # print("Neg", negative_step_loss)
+
+            gradient = positive_step_loss - negative_step_loss
+            gradient = gradient / (2 * config.PERTURBATION_SIZE)
+            # print("Grad", gradient)
 
             # Record this noisy estimate of the gradient along the perturbation
             seed_gradient_pairs.append((perturbation_seed, gradient))
@@ -126,48 +131,81 @@ with torch.no_grad():
             model: NeuralImplicitComputationGraph = apply_perturbation(
                 module=model,
                 seed=perturbation_seed,
-                step_size=(1 * PERTURBATION_SIZE),
+                step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
 
         # Now we reapply each perturbation, but this timne we weight them by their estimated gradients.
         # This whole process is a zero-order optimization method called Central Difference Random Gradient Estimation.
         # I am basing my implementation on this paper by Francois Chaubard: https://arxiv.org/abs/2505.17852
-        for perturbation_seed, gradient in tqdm[tuple[int, float]](
+        model_param_copy = next(model.parameters()).data.clone()
+        for perturbation_seed, gradient in tqdm(
             seed_gradient_pairs, leave=False, desc="Applying weighted perturbations"
         ):
+            step_size = (
+                -1 * gradient * config.STEP_SIZE / (2 * config.NUM_PERTURBATIONS)
+            )
+            # print("Step", step_size)
             model: NeuralImplicitComputationGraph = apply_perturbation(
                 module=model,
                 seed=perturbation_seed,
-                step_size=-1 * (gradient / (2 * NUM_PERTURBATIONS)),
+                step_size=step_size,
                 device=DEVICE,
             )
 
+        print(
+            "mean absolute parameter update",
+            torch.mean(
+                torch.abs(next(model.parameters()).data - model_param_copy)
+            ).item(),
+        )
+
         model: NeuralImplicitComputationGraph
-        output = model.forward(position_encodings=position_encodings)
-        rmse = compute_rmse(output, image)
-
-        if rmse < best_rmse:
-            best_rmse = rmse
-            print(
-                f"RMSE: {best_rmse:.5f} | Step: {step:04} | Saved: {last_updated_at:.5f}"
+        sampled_rmses = []
+        num_to_sample = 10
+        for _ in range(num_to_sample):
+            output = model.forward(
+                position_encodings=position_encodings,
+                address_bitarrays=address_bitarrays,
+                output_shape=original_shape,
             )
+            sampled_rmses.append(np.sqrt(compute_mse(output, image)))
 
-            if best_rmse < last_updated_at * 0.995:
+        average_rmse = np.mean(sampled_rmses)
+        last_rmse = sampled_rmses[-1]
+        rmse_variance = np.std(sampled_rmses)
 
-                output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
-                output_pil.save(
-                    "dagnabbit/outputs/output.jpg",
-                    format="JPEG",
-                    subsampling=0,
-                    quality=100,
-                )
-                output_pil.save(
-                    f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
-                    format="JPEG",
-                    subsampling=0,
-                    quality=100,
-                )
+        output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
+        output_pil.save(
+            f"dagnabbit/outputs/all_outputs/{step:06}.jpg",
+            format="JPEG",
+            subsampling=0,
+            quality=100,
+        )
+        output_pil.save(
+            f"dagnabbit/outputs/latest.jpg",
+            format="JPEG",
+            subsampling=0,
+            quality=100,
+        )
 
-                last_updated_at = best_rmse
-                update_counter += 1
+        if last_rmse < best_rmse:
+            best_rmse = last_rmse
+
+            output_pil.save(
+                "dagnabbit/outputs/best.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
+            )
+            output_pil.save(
+                f"dagnabbit/outputs/timelapse/{update_counter:06}.jpg",
+                format="JPEG",
+                subsampling=0,
+                quality=100,
+            )
+            update_counter += 1
+
+        progress_bar.set_description(
+            f"Step: {step:06} | RMSE@{num_to_sample}: {average_rmse:.3f} ±{rmse_variance:.3f} | DiscRMSE: {last_rmse:.3f} | Best: {best_rmse:.3f}"
+        )
