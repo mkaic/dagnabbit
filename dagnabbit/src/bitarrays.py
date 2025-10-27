@@ -1,7 +1,6 @@
 from typing import Tuple
 
 import numpy as np
-from PIL import Image
 
 
 def calculate_address_bitdepth(shape: Tuple[int]):

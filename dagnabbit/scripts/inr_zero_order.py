@@ -1,4 +1,3 @@
-from random import sample
 import shutil
 from pathlib import Path
 
@@ -6,7 +5,6 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
-from collections import Counter
 
 from dagnabbit.src.bitarrays import (
     calculate_address_bitdepth,
