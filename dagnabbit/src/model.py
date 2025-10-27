@@ -31,8 +31,10 @@ class NeuralImplicitComputationGraph(nn.Module):
         num_compute_nodes,
         num_output_nodes,
         num_layers,
-        input_dim,
+        position_encoding_dim,
         hidden_dim,
+        recurrent_dim,
+        num_prior_gates_connectable,
     ):
 
         super().__init__()
@@ -41,11 +43,17 @@ class NeuralImplicitComputationGraph(nn.Module):
         self.num_compute_nodes = num_compute_nodes
         self.num_output_nodes = num_output_nodes
         self.num_layers = num_layers
-        self.input_dim = input_dim
+        self.position_encoding_dim = position_encoding_dim
         self.hidden_dim = hidden_dim
+        self.recurrent_dim = recurrent_dim
+        self.num_prior_gates_connectable = num_prior_gates_connectable
 
+        # one position encoding for the gate being chose
+        # one to represent the last edge choice
+        # one to represent the last function choice
+        #
         self.input_projection = nn.Linear(
-            self.input_dim + self.hidden_dim, self.hidden_dim
+            (self.position_encoding_dim * 3) + self.recurrent_dim, self.hidden_dim
         )
 
         self.mlp = nn.Sequential()
@@ -61,65 +69,76 @@ class NeuralImplicitComputationGraph(nn.Module):
             self.hidden_dim, len(gate_functions.AVAILABLE_FUNCTIONS)
         )
 
-        self.recurrent_projection = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.recurrent_projection = nn.Linear(self.hidden_dim, self.recurrent_dim)
 
         self.graph: ComputationGraph = None
 
-        self.initial_recurrent_logits = nn.Parameter(torch.randn(self.hidden_dim))
+        self.initial_recurrent_logits = nn.Parameter(torch.randn(self.recurrent_dim))
 
     # @torch.compile()
     def mlp_forward(self, position_encodings: Tensor) -> torch.LongTensor:
-        # [num_compute_nodes, num_input_nodes + num_compute_nodes]
+        # [num_compute_nodes * 2, num_input_nodes + num_compute_nodes]
 
-        edge_choice_logits = torch.empty(
-            self.num_compute_nodes * 2, self.num_compute_nodes + self.num_input_nodes
-        )
-        function_choice_logits = torch.empty(
-            self.num_compute_nodes, len(gate_functions.AVAILABLE_FUNCTIONS)
-        )
+        edge_choices = []
+        function_choices = []
+
+        last_edge_idx_chosen = 0
+        last_function_idx_chosen = 0
 
         recurrent_logits = self.initial_recurrent_logits
-        for idx in range(len(position_encodings)):
+        for compute_gate_idx in range(len(position_encodings)):
 
-            inputs = torch.cat([position_encodings[idx], recurrent_logits])
+            inputs = torch.cat(
+                [
+                    position_encodings[compute_gate_idx],
+                    position_encodings[last_edge_idx_chosen],
+                    position_encodings[last_function_idx_chosen],
+                    recurrent_logits,
+                ]
+            )
             inputs = self.input_projection(inputs)
 
             hidden_logits = self.mlp(inputs)
 
-            edge_choice_logits[idx] = self.edge_choice_projection(hidden_logits)
+            # Each compute node has two inputs, therefore the neural network outputs two consecutive
+            # decisions about which two *previous* nodes will be those inputs. Valid options
+            # include previous compute nodes and the input nodes.
+            # As a concrete example, compute node 3 will be able to be connect
+            # to the input nodes and computen nodes 0, 1, and 2.
 
-            # Every second step, we should also choose a gate function for the node.
-            if (idx % 2) == 1:
-                function_choice_logits[idx // 2] = self.function_choice_projection(
-                    hidden_logits
-                )
+            # We set invalid indices to -inf so that they end up as 0 after softmax
+            # We add address_bitdepth here to allow
 
-            recurrent_logits = torch.nn.functional.normalize(
-                self.recurrent_projection(hidden_logits), dim=0
-            )
-
-        # Each compute node has two inputs, therefore the neural network outputs two consecutive
-        # decisions about which two *previous* nodes will be those inputs. Valid options
-        # include previous compute nodes and the input nodes.
-        # As a concrete example, compute node 3 will be able to be connect
-        # to the input nodes and computen nodes 0, 1, and 2.
-
-        # We set invalid indices to -inf so that they end up as 0 after softmax
-        # We add address_bitdepth here to allow
-        for i in range(len(edge_choice_logits)):
-
-            # the i // 2 is because the neural net is evaluated twice for each node, so there are
+            # the idx // 2 is because the neural net is evaluated twice for each node, so there are
             # two output logits — one for each input to the node.
-            mask_after = self.num_input_nodes + (i // 2)
-            edge_choice_logits[i, mask_after:] = -torch.inf
+            edge_choice_logits = self.edge_choice_projection(hidden_logits)
 
-        # [num_compute_nodes * 2, num_input_nodes + num_compute_nodes] -> [num_compute_nodes * 2] torch.Long
-        edge_choices = torch.multinomial(
-            torch.softmax(edge_choice_logits, dim=-1), 1
-        ).squeeze(-1)
-        function_choices = torch.multinomial(
-            torch.softmax(function_choice_logits, dim=-1), 1
-        ).squeeze(-1)
+            mask_after = self.num_input_nodes + (compute_gate_idx // 2)
+            edge_choice_logits[mask_after:] = -torch.inf
+            mask_before = int(
+                max(0, (compute_gate_idx // 2) - self.num_prior_gates_connectable)
+            )
+            edge_choice_logits[:mask_before] = -torch.inf
+
+            edge_choice = torch.multinomial(
+                torch.softmax(edge_choice_logits, dim=-1), 1
+            ).squeeze(-1)
+            edge_choices.append(edge_choice)
+            last_edge_idx_chosen = edge_choice
+
+            # When we choose the first input for a gate, we should also choose its function.
+            if (compute_gate_idx % 2) == 0:
+                function_choice_logits = self.function_choice_projection(hidden_logits)
+                function_choice = torch.multinomial(
+                    torch.softmax(function_choice_logits, dim=-1), 1
+                ).squeeze(-1)
+                function_choices.append(function_choice)
+                last_function_idx_chosen = function_choice
+
+            #
+            recurrent_logits = torch.nn.functional.normalize(
+                recurrent_logits + self.recurrent_projection(hidden_logits), dim=0
+            )
 
         return edge_choices, function_choices
 

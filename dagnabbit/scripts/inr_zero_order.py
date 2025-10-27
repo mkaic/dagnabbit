@@ -60,8 +60,10 @@ with torch.no_grad():
         num_compute_nodes=config.NUM_COMPUTE_NODES,
         num_output_nodes=config.NUM_OUTPUT_NODES,
         num_layers=config.NUM_LAYERS,
-        input_dim=config.POSITION_ENCODING_DIM,
+        position_encoding_dim=config.POSITION_ENCODING_DIM,
         hidden_dim=config.HIDDEN_DIM,
+        recurrent_dim=config.RECURRENT_DIM,
+        num_prior_gates_connectable=config.NUM_PRIOR_GATES_CONNECTABLE,
     )
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of trainable parameters: {num_params:,}")
