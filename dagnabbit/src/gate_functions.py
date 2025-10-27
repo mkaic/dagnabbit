@@ -70,16 +70,18 @@ def NP_A_OR_NOT_B(
 
 
 AVAILABLE_FUNCTIONS = [
+    # NP_FALSE,
+    # NP_TRUE,
     NP_AND,
     NP_NAND,
     NP_OR,
     NP_NOR,
     NP_XOR,
     NP_XNOR,
-    NP_NOT_A,
-    NP_NOT_B,
-    NP_PASSTHROUGH_A,
-    NP_PASSTHROUGH_B,
+    # NP_NOT_A,
+    # NP_NOT_B,
+    # NP_PASSTHROUGH_A,
+    # NP_PASSTHROUGH_B,
     NP_NOT_A_AND_B,
     NP_A_AND_NOT_B,
     NP_NOT_A_OR_B,

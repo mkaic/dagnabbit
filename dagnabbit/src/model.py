@@ -1,10 +1,6 @@
-from turtle import position
-from typing import Any, List, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
 from torch import Tensor
 from dagnabbit.src.dag import ComputationGraph
 from dagnabbit.src import gate_functions
