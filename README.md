@@ -1,9 +1,14 @@
 ## dagnabbit
 This project is a continuation of [dagnabbit-nim](https://github.com/mkaic/dagnabbit-nim), a program I used to learn the [Nim programming language.](https://nim-lang.org). While it was very educational, I didn't feel like figuring out multithreading, so I'm just making a NumPy/PyTorch port/continuation of it.
 ## Environment
+You'll need to install `uv` if you don't already have it:
 ```
-conda env create -f environment.yaml
-conda activate dagnabbit
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+then create and activate the venv:
+```
+uv sync
+source .venv/bin/activate
 ```
 
 ## Profiling
