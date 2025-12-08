@@ -6,17 +6,17 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from dagnabbit.src.bitarrays import (
+from dagnabbit.bitarrays import (
     calculate_address_bitdepth,
     get_address_bitarrays,
 )
-from dagnabbit.src.model import (
+from dagnabbit.model import (
     NeuralImplicitComputationGraph,
     get_sinusoidal_position_encodings,
 )
-from dagnabbit.src.cd_rge import apply_perturbation
+from dagnabbit.cd_rge import apply_perturbation
 from dagnabbit.scripts import config
-from dagnabbit.src.gate_functions import AVAILABLE_FUNCTIONS
+from dagnabbit.gate_functions import AVAILABLE_FUNCTIONS
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = torch.device("cpu")

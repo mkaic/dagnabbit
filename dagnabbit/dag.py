@@ -167,3 +167,21 @@ class ComputationGraph:
             for c in cyclic:
                 print(c)
             print("\n")
+
+class BipartiteComputationGraphDescription:
+    def __init__(self, num_inputs: int, num_outputs: int, gate_functions: list[Callable]):
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.gate_functions = gate_functions
+
+        # [num_outputs, 2]
+        self.output_node_input_indices: Tensor
+
+class LayeredComputationGraph:
+    """Heavily restricted subcase of ComputationGraph where the adjacency matrix is nearly block-diagonal. Basically an MLP, but neurons are 2-sparse binary logic gates."""
+    def __init__(self):
+        self.num_inputs: int = None
+        self.num_outputs: int = None
+        self.num_layers: int = None
+        self.num_neurons_per_layer: int = None
+

@@ -2,9 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
-from dagnabbit.src.dag import ComputationGraph
-from dagnabbit.src import gate_functions
-from dagnabbit.src.bitarrays import output_to_image_array
+from dagnabbit.dag import ComputationGraph
+from dagnabbit import gate_functions
+from dagnabbit.bitarrays import output_to_image_array
 
 
 def get_sinusoidal_position_encodings(
