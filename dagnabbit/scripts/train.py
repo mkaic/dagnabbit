@@ -11,13 +11,13 @@ from dagnabbit.bitarrays import (
     get_address_bitarrays,
 )
 from dagnabbit.dag import (
-    LayeredComputationGraph,
+    LayeredNANDGraph,
 )
 from dagnabbit.cd_rge import apply_perturbation
 from dagnabbit.scripts import config
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda")
 print(f"Using device: {DEVICE}")
 
 
@@ -37,11 +37,17 @@ original_shape = image.shape
 print("image.shape", original_shape)
 
 address_bitdepth = calculate_address_bitdepth(original_shape)
-address_bitarrays = get_address_bitarrays(original_shape)
+address_bitarrays = torch.from_numpy(get_address_bitarrays(original_shape))
+address_bitarrays = address_bitarrays.to(DEVICE)
 
 with torch.no_grad():
 
-    model = LayeredComputationGraph()
+    model = LayeredNANDGraph(
+        num_inputs=address_bitdepth,
+        num_outputs=8,
+        num_layers=config.NUM_LAYERS,
+        num_neurons_per_layer=config.LAYER_WIDTH,
+    ).to(DEVICE)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of trainable parameters: {num_params:,}")
 
@@ -70,31 +76,40 @@ with torch.no_grad():
             perturbation_seed = torch.seed() + perturbation_idx
 
             # Apply positive step size perturbation
-            model: LayeredComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(
-                input_bitarrays=address_bitarrays,
-                output_shape=original_shape,
-            )
-            positive_step_loss = np.sqrt(compute_mse(output, image))
+
+            sampled_rmses = []
+            for _ in range(config.NUM_LAYER_SAMPLES):
+                output = model.forward(
+                    input_bitarrays=address_bitarrays,
+                    output_shape=original_shape,
+                )
+
+                sampled_rmses.append(np.sqrt(compute_mse(output, image)))
+            positive_step_loss = np.mean(sampled_rmses)
             # print("\nPos", positive_step_loss)
 
             # Undo positive step size perturbation and apply negative step size perturbation
-            model: LayeredComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(-2 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(
-                input_bitarrays=address_bitarrays,
-                output_shape=original_shape,
-            )
-            negative_step_loss = np.sqrt(compute_mse(output, image))
+            sampled_rmses = []
+            for _ in range(config.NUM_LAYER_SAMPLES):
+                output = model.forward(
+                    input_bitarrays=address_bitarrays,
+                    output_shape=original_shape,
+                )
+
+                sampled_rmses.append(np.sqrt(compute_mse(output, image)))
+            negative_step_loss = np.mean(sampled_rmses)
             # print("Neg", negative_step_loss)
 
             gradient = positive_step_loss - negative_step_loss
@@ -105,8 +120,8 @@ with torch.no_grad():
             seed_gradient_pairs.append((perturbation_seed, gradient))
 
             # Undo negative step size perturbation and restore model to original state.
-            model: LayeredComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
@@ -123,8 +138,8 @@ with torch.no_grad():
                 -1 * gradient * config.STEP_SIZE / (2 * config.NUM_PERTURBATIONS)
             )
             # print("Step", step_size)
-            model: LayeredComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=step_size,
                 device=DEVICE,
@@ -137,14 +152,13 @@ with torch.no_grad():
             ).item(),
         )
 
-        model: LayeredComputationGraph
         sampled_rmses = []
-        num_to_sample = 10
-        for _ in range(num_to_sample):
+        for _ in range(config.NUM_LAYER_SAMPLES):
             output = model.forward(
                 input_bitarrays=address_bitarrays,
                 output_shape=original_shape,
             )
+
             sampled_rmses.append(np.sqrt(compute_mse(output, image)))
 
         average_rmse = np.mean(sampled_rmses)
