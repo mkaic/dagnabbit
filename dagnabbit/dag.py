@@ -131,20 +131,24 @@ class BipartiteNANDGraphLayerLogits(nn.Module):
         self.num_outputs: int = num_outputs
 
         self.adjacency_probability_matrix: nn.Parameter = nn.Parameter(
-            torch.zeros(num_outputs, num_inputs, dtype=torch.float32)
+            torch.randn(num_outputs, num_inputs, dtype=torch.float32)
         )
+        
+        self.adjacency_temperature: float = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         self.nor_probability: nn.Parameter = nn.Parameter(
-            torch.zeros((num_outputs,), dtype=torch.float32)
+            torch.randn((num_outputs,), dtype=torch.float32)
         )
+
+        self.nor_temperature: float = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
     def sample_stochastic(self) -> LongTensor:
         # [num_outputs, 2]
         return (
             torch.multinomial(
-                torch.softmax(self.adjacency_probability_matrix, dim=-1),
+                torch.softmax(self.adjacency_probability_matrix * self.adjacency_temperature, dim=-1),
                 num_samples=2,
                 replacement=True,
             ),
-            torch.bernoulli(torch.sigmoid(self.nor_probability)),
+            torch.bernoulli(torch.sigmoid(self.nor_probability * self.nor_temperature)),
         )

@@ -131,7 +131,7 @@ with torch.no_grad():
         # Now we reapply each perturbation, but this timne we weight them by their estimated gradients.
         # This whole process is a zero-order optimization method called Central Difference Random Gradient Estimation.
         # I am basing my implementation on this paper by Francois Chaubard: https://arxiv.org/abs/2505.17852
-        model_param_copy = next(model.parameters()).data.clone()
+        model_param_copy = next(model.layer_logits.parameters()).data.clone()
         for perturbation_seed, gradient in tqdm(
             seed_gradient_pairs, leave=False, desc="Applying weighted perturbations"
         ):
@@ -149,7 +149,7 @@ with torch.no_grad():
         print(
             "mean absolute parameter update",
             torch.mean(
-                torch.abs(next(model.parameters()).data - model_param_copy)
+                torch.abs(next(model.layer_logits.parameters()).data - model_param_copy)
             ).item(),
         )
 
