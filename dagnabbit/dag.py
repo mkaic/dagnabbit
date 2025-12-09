@@ -25,7 +25,7 @@ class BipartiteNANDGraphLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.invert_mask: BoolTensor = nn.Parameter(
+        self.nor_mask: BoolTensor = nn.Parameter(
             torch.zeros(num_outputs, dtype=torch.bool), requires_grad=False
         )
 
@@ -37,16 +37,22 @@ class BipartiteNANDGraphLayer(nn.Module):
         function_inputs = input_bitarrays[self.output_node_input_indices]
 
         # [num_outputs, num_bytes]
-        function_outputs = torch.bitwise_and(
+        and_outputs = torch.bitwise_and(
+            function_inputs[:, 0, :], function_inputs[:, 1, :]
+        )
+
+        or_outputs = torch.bitwise_or(
             function_inputs[:, 0, :], function_inputs[:, 1, :]
         )
 
         # invert_mask: [num_outputs] -> [num_outputs, 1]
         # function_outputs: [num_outputs, num_bytes] -> [num_outputs, num_bytes]
-        function_outputs = torch.where(
-            self.invert_mask.unsqueeze(-1),
-            torch.bitwise_not(function_outputs),
-            function_outputs,
+        function_outputs = torch.bitwise_not(
+            torch.where(
+                self.nor_mask.unsqueeze(-1),
+                or_outputs,
+                and_outputs,
+            )
         )
 
         return function_outputs
@@ -89,24 +95,29 @@ class LayeredNANDGraph(nn.Module):
             BipartiteNANDGraphLayerLogits(num_neurons_per_layer, num_outputs)
         )
 
+    @torch.compile()
+    def _forward_compilable(self, input_bitarrays: BitTensor) -> BitTensor:
+        for layer in self.layers:
+            input_bitarrays = layer(input_bitarrays)
+        return input_bitarrays
+
     def forward(
         self, input_bitarrays: BitTensor, output_shape: Tuple[int]
     ) -> BitTensor:
 
         self.resample_layers_stochastic()
 
-        for layer in self.layers:
-            input_bitarrays = layer(input_bitarrays)
+        output = self._forward_compilable(input_bitarrays)
 
-        output = input_bitarrays.cpu().numpy()
+        output = output.cpu().numpy()
         output = output_to_image_array(output, output_shape)
         return output
 
     def resample_layers_stochastic(self) -> None:
         for i, (layer, layer_logits) in enumerate(zip(self.layers, self.layer_logits)):
-            indices, not_mask = layer_logits.sample_stochastic()
+            indices, nor_mask = layer_logits.sample_stochastic()
             layer.output_node_input_indices.data = indices
-            layer.invert_mask.data = not_mask.bool()
+            layer.nor_mask.data = nor_mask.bool()
 
 
 class BipartiteNANDGraphLayerLogits(nn.Module):
@@ -123,8 +134,8 @@ class BipartiteNANDGraphLayerLogits(nn.Module):
             torch.zeros(num_outputs, num_inputs, dtype=torch.float32)
         )
 
-        self.not_probability: nn.Parameter = nn.Parameter(
-            torch.full((num_outputs,), 0.5, dtype=torch.float32)
+        self.nor_probability: nn.Parameter = nn.Parameter(
+            torch.zeros((num_outputs,), dtype=torch.float32)
         )
 
     def sample_stochastic(self) -> LongTensor:
@@ -135,5 +146,5 @@ class BipartiteNANDGraphLayerLogits(nn.Module):
                 num_samples=2,
                 replacement=True,
             ),
-            torch.bernoulli(self.not_probability),
+            torch.bernoulli(torch.sigmoid(self.nor_probability)),
         )

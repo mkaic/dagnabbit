@@ -7,7 +7,6 @@ from PIL import Image
 from tqdm import tqdm
 
 from dagnabbit.bitarrays import (
-    calculate_address_bitdepth,
     get_address_bitarrays,
 )
 from dagnabbit.dag import (
@@ -36,9 +35,11 @@ original_shape = image.shape
 
 print("image.shape", original_shape)
 
-address_bitdepth = calculate_address_bitdepth(original_shape)
 address_bitarrays = torch.from_numpy(get_address_bitarrays(original_shape))
 address_bitarrays = address_bitarrays.to(DEVICE)
+
+address_bitdepth = address_bitarrays.shape[0]
+print("address_bitdepth", address_bitdepth)
 
 with torch.no_grad():
 
@@ -197,5 +198,5 @@ with torch.no_grad():
             update_counter += 1
 
         progress_bar.set_description(
-            f"Step: {step:06} | RMSE@{num_to_sample}: {average_rmse:.3f} ±{rmse_variance:.3f} | DiscRMSE: {last_rmse:.3f} | Best: {best_rmse:.3f}"
+            f"Step: {step:06} | RMSE@{config.NUM_LAYER_SAMPLES}: {average_rmse:.3f} ±{rmse_variance:.3f} | DiscRMSE: {last_rmse:.3f} | Best: {best_rmse:.3f}"
         )

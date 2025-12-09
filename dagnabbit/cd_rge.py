@@ -16,8 +16,9 @@ def apply_perturbation(
     for param in module.parameters():
         perturbation = (
             torch.zeros_like(param.data)
-            .normal_(generator=rng)
-            .clamp_(-3, 3)
+            .bernoulli_(0.5, generator=rng)
+            .mul_(2)
+            .sub_(1)
             .mul_(step_size)
         )
         param.data = param.data + perturbation
