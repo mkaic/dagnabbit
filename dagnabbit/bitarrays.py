@@ -6,6 +6,7 @@ import numpy as np
 def calculate_required_bitdepth(x: Tuple[int]):
     return int(np.ceil(np.log2(x + 1)))
 
+
 def printbin(x):
     for i in x:
         print("".join(str(j) for j in i))
@@ -14,7 +15,6 @@ def printbin(x):
 def get_address_bitarrays(shape: Tuple[int]):
     ndim = len(shape)
 
-    
     # dtype=">u8" means a big-endian 8-byte (64-bit) unsigned integer
     unpacked_address_bitarrays = []
     total_bitdepth = 0
@@ -27,11 +27,9 @@ def get_address_bitarrays(shape: Tuple[int]):
         # For a.view(some_dtype), if some_dtype has a different number of bytes per entry than the previous dtype (for example, converting a regular array to a structured array), then the last axis of a must be contiguous. This axis will be resized in the result.
         addresses = addresses.view(np.uint8)  # uint8 [total, 8]
 
-
         unpacked = np.unpackbits(addresses, axis=-1)  # {1, 0} uint8 [total, 64]
         unpacked = unpacked[..., -bitdepth:]  # {1, 0} uint8 [total, bitdepth]
         unpacked = unpacked.transpose()  # {1, 0} uint8 [bitdepth, dimension]
-
 
         # This reshape brought to you by my friend ChatGPT
         unpacked = unpacked.reshape(
@@ -45,12 +43,13 @@ def get_address_bitarrays(shape: Tuple[int]):
         total_bitdepth += bitdepth
         unpacked_address_bitarrays.append(unpacked)
 
-
     # (sum_bitdepths, *shape)
     concatenated = np.concatenate(unpacked_address_bitarrays, axis=0)
     concatenated = concatenated.reshape((total_bitdepth, -1))
 
-    repacked = np.packbits(concatenated, axis=-1)  # uint8 [sum_bitdepths, ceil(total / 8)]
+    repacked = np.packbits(
+        concatenated, axis=-1
+    )  # uint8 [sum_bitdepths, ceil(total / 8)]
 
     return repacked
 
