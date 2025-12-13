@@ -115,8 +115,8 @@ class LayeredNANDGraph(nn.Module):
 
     def resample_layers_stochastic(self) -> None:
         for i, (layer, layer_logits) in enumerate(zip(self.layers, self.layer_logits)):
-            indices, nor_mask = layer_logits.sample_stochastic()
-            layer.output_node_input_indices.data = indices
+            connection_indices, nor_mask = layer_logits.sample_stochastic()
+            layer.output_node_input_indices.data = connection_indices
             layer.nor_mask.data = nor_mask.bool()
 
 
@@ -131,7 +131,7 @@ class BipartiteNANDGraphLayerLogits(nn.Module):
         self.num_outputs: int = num_outputs
 
         self.adjacency_probability_matrix: nn.Parameter = nn.Parameter(
-            torch.randn(num_outputs, num_inputs, dtype=torch.float32)
+            torch.randn(2, num_outputs, num_inputs, dtype=torch.float32)
         )
         
         self.adjacency_temperature: float = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
@@ -144,11 +144,20 @@ class BipartiteNANDGraphLayerLogits(nn.Module):
 
     def sample_stochastic(self) -> LongTensor:
         # [num_outputs, 2]
-        return (
-            torch.multinomial(
-                torch.softmax(self.adjacency_probability_matrix * self.adjacency_temperature, dim=-1),
-                num_samples=2,
+
+        connection_probabilities = torch.softmax(self.adjacency_probability_matrix * self.adjacency_temperature, dim=1)
+
+        
+        # [2*num_outputs, num_inputs] -> [2*num_outputs, 1] 
+        connection_indices = torch.multinomial(
+                connection_probabilities.view(2*self.num_outputs, self.num_inputs),
+                num_samples=1,
                 replacement=True,
-            ),
-            torch.bernoulli(torch.sigmoid(self.nor_probability * self.nor_temperature)),
-        )
+            )
+
+        # [2*num_outputs, 1] -> [2, num_outputs] -> [num_outputs, 2]
+        connection_indices = connection_indices.view(2, self.num_outputs).moveaxis(0, -1)
+
+        nor_mask = torch.bernoulli(torch.sigmoid(self.nor_probability * self.nor_temperature))
+        
+        return connection_indices, nor_mask
