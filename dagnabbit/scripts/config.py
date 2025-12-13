@@ -1,8 +1,12 @@
+from torch.optim import Adam, AdamW, SGD, RMSprop
+
 IMAGE_PATH = "test_images/branos.png"
-RESIZE = 32
+RESIZE = 64
 LAYER_WIDTH = 64
 NUM_LAYERS = 64
 
-BATCH_SIZE = 256
+BATCH_SIZE = 1024
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-3
+
+OPTIMIZER = RMSprop

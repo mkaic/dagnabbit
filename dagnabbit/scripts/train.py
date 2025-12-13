@@ -1,5 +1,6 @@
 import shutil
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ from dagnabbit.dag import (
     LayeredNANDGraph,
 )
 from dagnabbit.scripts import config
+
+EPSILON = 1e-6
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = torch.device("cuda")
@@ -44,11 +47,16 @@ def compute_reward(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
 
     target_std = np.std(target) / 127.5
     prediction_std = np.std(prediction) / 127.5
-    std_error = np.abs(target_std - prediction_std)
-    std_accuracy = 1 - std_error
-    std_reward = std_accuracy
-    # std_reward = np.power(std_accuracy, 6) * 2
+    
 
+    if target_std > prediction_std:
+        std_ratio = target_std / (prediction_std + EPSILON)
+    else:
+        std_ratio = prediction_std / (target_std + EPSILON)
+
+    log_std_ratio = np.log(std_ratio)
+    std_reward = 1 / (1 + log_std_ratio * 5)
+    # print(f"std_reward: {std_reward}")
     return accuracy_reward + std_reward
 
 
@@ -75,11 +83,13 @@ model = LayeredNANDGraph(
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Number of trainable parameters: {num_params:,}")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+optimizer = config.OPTIMIZER(model.parameters(), lr=config.LEARNING_RATE)
 
 best_rmse = np.inf
 last_updated_at = best_rmse
 update_counter = 0
+
+last_latest_save_time = time.time()
 
 shutil.rmtree("dagnabbit/outputs/timelapse", ignore_errors=True)
 Path("dagnabbit/outputs/timelapse").mkdir(parents=True, exist_ok=True)
@@ -128,12 +138,14 @@ for step in progress_bar:
     #     subsampling=0,
     #     quality=100,
     # )
-    output_pil.save(
-        f"dagnabbit/outputs/latest.jpg",
-        format="JPEG",
-        subsampling=0,
-        quality=100,
-    )
+    if time.time() - last_latest_save_time > 1:
+        output_pil.save(
+            f"dagnabbit/outputs/latest.jpg",
+            format="JPEG",
+            subsampling=0,
+            quality=100,
+        )
+        last_latest_save_time = time.time()
 
     if deterministic_rmse < best_rmse:
         best_rmse = deterministic_rmse

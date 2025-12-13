@@ -88,9 +88,6 @@ class BipartiteNANDGraphLayer(nn.Module):
     ) -> Tuple[BitTensor, IndicesTensor, MaskTensor]:
         # input bitarrays: [num_inputs, num_bytes]
         # output bitarrays: [num_outputs, num_bytes]
-
-        if len(input_bitarrays.shape) == 2:
-            input_bitarrays = input_bitarrays.unsqueeze(0).expand(batch_size, -1, -1)
   
         # [batch_size, num_outputs, 2], [batch_size, num_outputs]
         connection_indices, invert_mask = self.sample_graph_parameters(
@@ -190,7 +187,7 @@ class LayeredNANDGraph(nn.Module):
         )
         for _ in range(num_layers - 1):
             self.layers.append(
-                BipartiteNANDGraphLayer(num_neurons_per_layer, num_neurons_per_layer)
+                BipartiteNANDGraphLayer(num_neurons_per_layer + num_inputs, num_neurons_per_layer)
             )
 
         self.layers.append(BipartiteNANDGraphLayer(num_neurons_per_layer, num_outputs))
@@ -202,9 +199,12 @@ class LayeredNANDGraph(nn.Module):
         connection_indices_list = []
         invert_masks_list = []
 
+        input_bitarrays = input_bitarrays.unsqueeze(0).expand(batch_size, -1, -1)
+        original_input_bitarrays = input_bitarrays
+
         for layer in self.layers:
             input_bitarrays, connection_indices, invert_masks = layer.forward(
-                input_bitarrays=input_bitarrays,
+                input_bitarrays=torch.cat([original_input_bitarrays, input_bitarrays], dim=1),
                 stochastic=stochastic,
                 batch_size=batch_size,
             )
