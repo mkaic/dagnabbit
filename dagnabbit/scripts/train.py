@@ -6,20 +6,17 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from dagnabbit.src.bitarrays import (
-    calculate_address_bitdepth,
+from dagnabbit.bitarrays import (
     get_address_bitarrays,
 )
-from dagnabbit.src.model import (
-    NeuralImplicitComputationGraph,
-    get_sinusoidal_position_encodings,
+from dagnabbit.dag import (
+    LayeredNANDGraph,
 )
-from dagnabbit.src.cd_rge import apply_perturbation
+from dagnabbit.cd_rge import apply_perturbation
 from dagnabbit.scripts import config
-from dagnabbit.src.gate_functions import AVAILABLE_FUNCTIONS
 
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda")
 print(f"Using device: {DEVICE}")
 
 
@@ -38,31 +35,20 @@ original_shape = image.shape
 
 print("image.shape", original_shape)
 
-address_bitdepth = calculate_address_bitdepth(original_shape)
-address_bitarrays = get_address_bitarrays(original_shape)
+address_bitarrays = torch.from_numpy(get_address_bitarrays(original_shape))
+address_bitarrays = address_bitarrays.to(DEVICE)
 
-position_encodings = (
-    get_sinusoidal_position_encodings(
-        length=config.NUM_COMPUTE_NODES * 2,
-        dim=config.POSITION_ENCODING_DIM,
-        base=10_000,
-    )
-    .float()
-    .to(DEVICE)
-)
+address_bitdepth = address_bitarrays.shape[0]
+print("address_bitdepth", address_bitdepth)
 
 with torch.no_grad():
 
-    model = NeuralImplicitComputationGraph(
-        num_input_nodes=address_bitdepth,
-        num_compute_nodes=config.NUM_COMPUTE_NODES,
-        num_output_nodes=config.NUM_OUTPUT_NODES,
+    model = LayeredNANDGraph(
+        num_inputs=address_bitdepth,
+        num_outputs=8,
         num_layers=config.NUM_LAYERS,
-        position_encoding_dim=config.POSITION_ENCODING_DIM,
-        hidden_dim=config.HIDDEN_DIM,
-        recurrent_dim=config.RECURRENT_DIM,
-        num_prior_gates_connectable=config.NUM_PRIOR_GATES_CONNECTABLE,
-    )
+        num_neurons_per_layer=config.LAYER_WIDTH,
+    ).to(DEVICE)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of trainable parameters: {num_params:,}")
 
@@ -91,33 +77,40 @@ with torch.no_grad():
             perturbation_seed = torch.seed() + perturbation_idx
 
             # Apply positive step size perturbation
-            model: NeuralImplicitComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(
-                position_encodings=position_encodings,
-                address_bitarrays=address_bitarrays,
-                output_shape=original_shape,
-            )
-            positive_step_loss = np.sqrt(compute_mse(output, image))
+
+            sampled_rmses = []
+            for _ in range(config.NUM_LAYER_SAMPLES):
+                output = model.forward(
+                    input_bitarrays=address_bitarrays,
+                    output_shape=original_shape,
+                )
+
+                sampled_rmses.append(np.sqrt(compute_mse(output, image)))
+            positive_step_loss = np.mean(sampled_rmses)
             # print("\nPos", positive_step_loss)
 
             # Undo positive step size perturbation and apply negative step size perturbation
-            model: NeuralImplicitComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(-2 * config.PERTURBATION_SIZE),
                 device=DEVICE,
             )
-            output = model.forward(
-                position_encodings=position_encodings,
-                address_bitarrays=address_bitarrays,
-                output_shape=original_shape,
-            )
-            negative_step_loss = np.sqrt(compute_mse(output, image))
+            sampled_rmses = []
+            for _ in range(config.NUM_LAYER_SAMPLES):
+                output = model.forward(
+                    input_bitarrays=address_bitarrays,
+                    output_shape=original_shape,
+                )
+
+                sampled_rmses.append(np.sqrt(compute_mse(output, image)))
+            negative_step_loss = np.mean(sampled_rmses)
             # print("Neg", negative_step_loss)
 
             gradient = positive_step_loss - negative_step_loss
@@ -128,8 +121,8 @@ with torch.no_grad():
             seed_gradient_pairs.append((perturbation_seed, gradient))
 
             # Undo negative step size perturbation and restore model to original state.
-            model: NeuralImplicitComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=(1 * config.PERTURBATION_SIZE),
                 device=DEVICE,
@@ -138,7 +131,7 @@ with torch.no_grad():
         # Now we reapply each perturbation, but this timne we weight them by their estimated gradients.
         # This whole process is a zero-order optimization method called Central Difference Random Gradient Estimation.
         # I am basing my implementation on this paper by Francois Chaubard: https://arxiv.org/abs/2505.17852
-        model_param_copy = next(model.parameters()).data.clone()
+        model_param_copy = next(model.layer_logits.parameters()).data.clone()
         for perturbation_seed, gradient in tqdm(
             seed_gradient_pairs, leave=False, desc="Applying weighted perturbations"
         ):
@@ -146,8 +139,8 @@ with torch.no_grad():
                 -1 * gradient * config.STEP_SIZE / (2 * config.NUM_PERTURBATIONS)
             )
             # print("Step", step_size)
-            model: NeuralImplicitComputationGraph = apply_perturbation(
-                module=model,
+            apply_perturbation(
+                module=model.layer_logits,
                 seed=perturbation_seed,
                 step_size=step_size,
                 device=DEVICE,
@@ -156,19 +149,17 @@ with torch.no_grad():
         print(
             "mean absolute parameter update",
             torch.mean(
-                torch.abs(next(model.parameters()).data - model_param_copy)
+                torch.abs(next(model.layer_logits.parameters()).data - model_param_copy)
             ).item(),
         )
 
-        model: NeuralImplicitComputationGraph
         sampled_rmses = []
-        num_to_sample = 10
-        for _ in range(num_to_sample):
+        for _ in range(config.NUM_LAYER_SAMPLES):
             output = model.forward(
-                position_encodings=position_encodings,
-                address_bitarrays=address_bitarrays,
+                input_bitarrays=address_bitarrays,
                 output_shape=original_shape,
             )
+
             sampled_rmses.append(np.sqrt(compute_mse(output, image)))
 
         average_rmse = np.mean(sampled_rmses)
@@ -207,5 +198,5 @@ with torch.no_grad():
             update_counter += 1
 
         progress_bar.set_description(
-            f"Step: {step:06} | RMSE@{num_to_sample}: {average_rmse:.3f} ±{rmse_variance:.3f} | DiscRMSE: {last_rmse:.3f} | Best: {best_rmse:.3f}"
+            f"Step: {step:06} | RMSE@{config.NUM_LAYER_SAMPLES}: {average_rmse:.3f} ±{rmse_variance:.3f} | DiscRMSE: {last_rmse:.3f} | Best: {best_rmse:.3f}"
         )
