@@ -59,15 +59,17 @@ def output_to_image_array(
 ) -> np.ndarray[np.uint8]:
     total = np.prod(shape)
 
-    # [num_output_bits, ceil(total / 8)] -> [num_output_bits, ceil(total / 8) * 8]
+    # output: [batch_size, num_output_bits, ceil(total / 8)]
+
+    # [batch_size, num_output_bits, ceil(total / 8)] -> [batch_size, num_output_bits, ceil(total / 8) * 8]
     output = np.unpackbits(output, axis=-1)
 
     # trim off any padding from if the address count is not a multiple of 8
-    output = output[:, :total]  # [num_output_bits, total]
-    output = output.transpose()  # [total, num_output_bits]
+    output = output[:,:, :total]  # [batch_size, num_output_bits, total]
+    output = output.transpose(0, 2, 1)  # [batch_size, total, num_output_bits]
 
     # for this project, num_output_bits will almost always be 8, so last dim will be 1 here.
-    output = np.packbits(output, axis=-1)  # [total, ceil(num_output_bits / 8)]
+    output = np.packbits(output, axis=2)  # [batch_size, total, ceil(num_output_bits / 8)]
     output = output.reshape(shape)  # original image shape
 
     return output

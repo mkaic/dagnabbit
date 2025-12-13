@@ -5,12 +5,18 @@ import torch
 import torch.nn as nn
 from torch import BoolTensor, LongTensor, Tensor
 from torch.nn import ModuleList
+from torch.nn.functional import cross_entropy, binary_cross_entropy_with_logits
 
 from dagnabbit.bitarrays import output_to_image_array
 
 BitTensor = Tensor
 IndicesTensor = LongTensor
 MaskTensor = BoolTensor
+
+def advanced_index(tensor: Tensor, indices: IndicesTensor) -> Tensor:
+    return tensor[indices]
+
+batched_advanced_index = torch.vmap(advanced_index)
 
 
 class BipartiteNANDGraphLayer(nn.Module):
@@ -58,7 +64,9 @@ class BipartiteNANDGraphLayer(nn.Module):
                 .moveaxis(1, 2)
             )
 
-            invert_mask = torch.bernoulli(torch.sigmoid(self.invert_logits))
+            invert_probabilities = torch.sigmoid(self.invert_logits)
+            invert_probabilities = invert_probabilities.unsqueeze(0).expand(batch_size, -1)
+            invert_mask = torch.bernoulli(invert_probabilities).bool()
 
         else:
             # [2, num_outputs]
@@ -81,13 +89,17 @@ class BipartiteNANDGraphLayer(nn.Module):
         # input bitarrays: [num_inputs, num_bytes]
         # output bitarrays: [num_outputs, num_bytes]
 
+        if len(input_bitarrays.shape) == 2:
+            input_bitarrays = input_bitarrays.unsqueeze(0).expand(batch_size, -1, -1)
+  
         # [batch_size, num_outputs, 2], [batch_size, num_outputs]
         connection_indices, invert_mask = self.sample_graph_parameters(
             batch_size=batch_size, stochastic=stochastic
         )
 
         # [batch_size, num_outputs, 2, num_bytes]
-        function_inputs = input_bitarrays[connection_indices]
+        function_inputs = batched_advanced_index(input_bitarrays, connection_indices)
+
 
         # [batch_size, num_outputs, num_bytes]
         and_outputs = torch.bitwise_and(
@@ -95,18 +107,67 @@ class BipartiteNANDGraphLayer(nn.Module):
         )
 
         # [batch_size, num_outputs, num_bytes]
-        nand_outputs = torch.bitwise_not(and_outputs)
+        or_outputs = torch.bitwise_or(
+            function_inputs[:, :, 0, :], function_inputs[:, :, 1, :]
+        )
 
         # invert_mask: [batch_size, num_outputs] -> [batch_size, num_outputs, 1]
-        function_outputs = torch.where(
+
+        function_outputs = torch.bitwise_not(torch.where(
             invert_mask.unsqueeze(-1),
-            nand_outputs,
+            or_outputs,
             and_outputs,
-        )
+        ))
 
         # [batch_size, num_outputs, num_bytes]
         return function_outputs, connection_indices, invert_mask
 
+    def calculate_gradients(
+        self,
+        connection_indices: IndicesTensor,
+        invert_mask: MaskTensor,
+        rewards: Tensor,
+        batch_size: int,
+    ) -> None:
+
+        # connection_indices: [batch_size, num_outputs, 2]
+        # invert_mask: [batch_size, num_outputs]
+        # rewards: [batch_size]
+    
+        # [2, num_outputs, num_inputs] -> [num_inputs, num_outputs, 2]
+        reshaped_adjacency_matrix_logits: Tensor = self.adjacency_matrix_logits.permute(2, 1, 0)
+        # [num_inputs, num_outputs, 2] -> [batch_size, num_inputs, num_outputs, 2]
+        reshaped_adjacency_matrix_logits = reshaped_adjacency_matrix_logits.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+        # input shape expected [batch_size, num_classes, ...] (unnormalized logits)
+        # target shape expected [batch_size, ...] (integer class indices)
+
+        # in this case, that means:
+        # reshaped_adjacency_matrix_logits: [batch_size, num_inputs, num_outputs, 2]
+        # connection_indices: [batch_size, num_outputs, 2]
+        # cross_entropy_with_actual_connections: [batch_size, num_outputs, 2]
+        cross_entropy_with_actual_connections = cross_entropy(
+            input=reshaped_adjacency_matrix_logits,
+            target=connection_indices,
+            reduction='none',
+        )
+
+        rewards = torch.from_numpy(rewards).to(self.adjacency_matrix_logits.device)
+        rewards = rewards.view(batch_size, 1, 1)
+        weighted_connections_loss = (cross_entropy_with_actual_connections * rewards).mean()
+
+        reshaped_inversion_logits: Tensor = self.invert_logits.unsqueeze(0).expand(batch_size, -1)
+        binary_cross_entropy_with_actual_inversion_masks = binary_cross_entropy_with_logits(
+            input=reshaped_inversion_logits,
+            target=invert_mask.float(),
+            reduction='none',
+        )
+        weighted_inversion_loss = (binary_cross_entropy_with_actual_inversion_masks * rewards).mean()
+
+        total_loss = weighted_connections_loss + weighted_inversion_loss
+
+        total_loss.backward()
+        
 
 class LayeredNANDGraph(nn.Module):
     """Heavily restricted subcase of ComputationGraph where the adjacency matrix is nearly block-diagonal. Basically an MLP, but neurons are 2-sparse NAND gates."""
@@ -160,7 +221,7 @@ class LayeredNANDGraph(nn.Module):
         batch_size: int = 1,
     ) -> np.ndarray[np.uint8]:
 
-        if not stochastic:
+        if not stochastic and batch_size > 1:
             print(
                 "Deterministically sampling graph parameters. Batch size overridden to 1."
             )
@@ -172,6 +233,18 @@ class LayeredNANDGraph(nn.Module):
             batch_size=batch_size,
         )
 
+        output_shape = (batch_size, *output_shape)
+
         output = output.cpu().numpy()
         output = output_to_image_array(output, output_shape)
         return output, connection_indices, invert_mask
+
+    def calculate_gradients(
+        self,
+        connection_indices: List[IndicesTensor],
+        invert_mask: List[MaskTensor],
+        rewards: Tensor,
+        batch_size: int,
+    ) -> None:
+        for layer, connection_indices, invert_mask in zip(self.layers, connection_indices, invert_mask):
+            layer.calculate_gradients(connection_indices, invert_mask, rewards, batch_size)

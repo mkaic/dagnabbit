@@ -4,7 +4,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from torch.nn.functional import binary_cross_entropy_with_logits, cross_entropy
 from tqdm import tqdm
 
 from dagnabbit.bitarrays import (
@@ -41,9 +40,16 @@ def compute_reward(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     accuracy = 1 - absolute_error
 
     # [batch_size]
-    reward = np.power(accuracy, 2)
+    accuracy_reward = np.power(accuracy, 6) * 2
 
-    return reward
+    target_std = np.std(target) / 127.5
+    prediction_std = np.std(prediction) / 127.5
+    std_error = np.abs(target_std - prediction_std)
+    std_accuracy = 1 - std_error
+    std_reward = std_accuracy
+    # std_reward = np.power(std_accuracy, 6) * 2
+
+    return accuracy_reward + std_reward
 
 
 target_image = Image.open(config.IMAGE_PATH).convert("RGB")
@@ -69,7 +75,7 @@ model = LayeredNANDGraph(
 num_params = sum(p.numel() for p in model.parameters())
 print(f"Number of trainable parameters: {num_params:,}")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
+optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
 
 best_rmse = np.inf
 last_updated_at = best_rmse
@@ -83,6 +89,7 @@ Path("dagnabbit/outputs/all_outputs").mkdir(parents=True, exist_ok=True)
 
 progress_bar = tqdm(range(100_000))
 for step in progress_bar:
+    optimizer.zero_grad()
     for _ in range(config.GRADIENT_ACCUMULATION_STEPS):
         with torch.no_grad():
             # [batch_size, *image_shape]
@@ -92,18 +99,25 @@ for step in progress_bar:
                 stochastic=True,
                 batch_size=config.BATCH_SIZE,
             )
+
             rewards = compute_reward(outputs, np.expand_dims(target_image, 0))
 
-            model.calculate_gradients(
-                connection_indices=connection_indices,
-                invert_mask=invert_mask,
-                rewards=rewards,
-            )
+        model.calculate_gradients(
+            connection_indices=connection_indices,
+            invert_mask=invert_mask,
+            rewards=rewards,
+            batch_size=config.BATCH_SIZE,
+        )
 
-    output = model.forward(
+    optimizer.step()
+
+    output, _, _ = model.forward(
         input_bitarrays=address_bitarrays,
         output_shape=original_shape,
+        stochastic=False,
+        batch_size=1
     )
+    output = output.squeeze(0)
 
     deterministic_rmse = compute_rmse(output, target_image)
 
@@ -139,5 +153,5 @@ for step in progress_bar:
         update_counter += 1
 
     progress_bar.set_description(
-        f"Step: {step:06} | RMSE: {deterministic_rmse:.3f} | Best: {best_rmse:.3f}"
+        f"Step: {step:06} | RMSE: {deterministic_rmse:.3f} | Best: {best_rmse:.3f} | RRMSE: {np.sqrt(deterministic_rmse):.3f}"
     )
