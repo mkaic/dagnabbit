@@ -29,7 +29,7 @@ class BipartiteNANDGraphLayer(nn.Module):
             torch.zeros(num_outputs, dtype=torch.bool), requires_grad=False
         )
 
-    def forward(self, input_bitarrays: BitTensor) -> BitTensor:
+    def forward(self, input_bitarrays: BitTensor, output_node_indices: LongTensor, nor_mask: BoolTensor) -> BitTensor:
         # input bitarrays: [num_inputs, num_bytes]
         # output bitarrays: [num_outputs, num_bytes]
 
