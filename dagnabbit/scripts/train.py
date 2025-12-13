@@ -132,15 +132,15 @@ for step in progress_bar:
     deterministic_rmse = compute_rmse(output, target_image)
 
     output_pil = Image.fromarray(np.moveaxis(output, 0, -1))
-    # output_pil.save(
-    #     f"dagnabbit/outputs/all_outputs/{step:06}.jpg",
-    #     format="JPEG",
-    #     subsampling=0,
-    #     quality=100,
-    # )
-    if time.time() - last_latest_save_time > 1:
+    if time.time() - last_latest_save_time > 5:
         output_pil.save(
             f"dagnabbit/outputs/latest.jpg",
+            format="JPEG",
+            subsampling=0,
+            quality=100,
+        )
+        output_pil.save(
+            f"dagnabbit/outputs/all_outputs/{step:06}.jpg",
             format="JPEG",
             subsampling=0,
             quality=100,
