@@ -47,7 +47,6 @@ def compute_reward(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
 
     target_std = np.std(target) / 127.5
     prediction_std = np.std(prediction) / 127.5
-    
 
     if target_std > prediction_std:
         std_ratio = target_std / (prediction_std + EPSILON)
@@ -75,7 +74,7 @@ address_bitdepth = address_bitarrays.shape[0]
 print("address_bitdepth", address_bitdepth)
 
 model = LayeredNANDGraph(
-    num_inputs=address_bitdepth,
+    num_root_nodes=address_bitdepth,
     num_outputs=8,
     num_layers=config.NUM_LAYERS,
     num_neurons_per_layer=config.LAYER_WIDTH,
@@ -104,7 +103,7 @@ for step in progress_bar:
         with torch.no_grad():
             # [batch_size, *image_shape]
             outputs, connection_indices, invert_mask = model.forward(
-                input_bitarrays=address_bitarrays,
+                root_node_bitarrays=address_bitarrays,
                 output_shape=original_shape,
                 stochastic=True,
                 batch_size=config.BATCH_SIZE,
@@ -122,10 +121,10 @@ for step in progress_bar:
     optimizer.step()
 
     output, _, _ = model.forward(
-        input_bitarrays=address_bitarrays,
+        root_node_bitarrays=address_bitarrays,
         output_shape=original_shape,
         stochastic=False,
-        batch_size=1
+        batch_size=1,
     )
     output = output.squeeze(0)
 

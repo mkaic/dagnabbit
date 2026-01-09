@@ -11,5 +11,8 @@ dependencies = [
     "snakeviz==2.2",
     "black",
     "isort",
+    "jaxtyping",
 ]
 
+[tool.setuptools.packages.find]
+include = ["dagnabbit*"]
