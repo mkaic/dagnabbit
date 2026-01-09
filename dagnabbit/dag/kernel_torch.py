@@ -1,13 +1,14 @@
 import torch
 from torch import Tensor
 from jaxtyping import UInt16, UInt8
-from time import sleep
+from time import sleep, perf_counter
 
 from dagnabbit.bitarrays import output_to_image_array, get_address_bitarrays
 from dagnabbit.dag.description import BinaryLogicGateDAGDescription
 from dagnabbit.dag.gates import AVAILABLE_GATE_TYPES
 
-BitpackedTensor = UInt8[Tensor, "address_bitcount num_packed_bytes"]
+BitpackedInputTensor = UInt8[Tensor, "address_bitcount num_packed_bytes"]
+BitpackedOutputTensor = UInt8[Tensor, "num_outputs num_packed_bytes"]
 
 gate_functions = {
     "NAND": lambda x, y: torch.bitwise_not(torch.bitwise_and(x, y)),
@@ -17,9 +18,12 @@ gate_functions = {
 
 def evaluate_dag_torch(
     dag: BinaryLogicGateDAGDescription,
-    root_node_values: BitpackedTensor,
+    root_node_values: BitpackedInputTensor,
     num_outputs: int,
-) -> BitpackedTensor:
+) -> BitpackedOutputTensor:
+
+    dag = dag.to(root_node_values.device)
+    root_node_values = root_node_values.to(root_node_values.device)
 
     address_bitcount, num_packed_bytes = root_node_values.shape
 
@@ -29,7 +33,7 @@ def evaluate_dag_torch(
 
     for gate_idx in range(dag.num_gates):
         # print("\n\n")
-        # sleep(5)
+        # sleep(0.1)
         # print(buffer[:address_bitcount].numpy())
         # print(buffer[address_bitcount:].numpy())
         # print("\n")
@@ -69,7 +73,7 @@ if __name__ == "__main__":
     import numpy as np
     from PIL import Image
 
-    shape = (128, 128, 3)
+    shape = (76, 45, 3)
     num_outputs = 8
 
     # Get address bitarrays for the image shape
@@ -81,16 +85,23 @@ if __name__ == "__main__":
     # Convert to torch tensor
     root_node_values = torch.from_numpy(address_bitarrays)
 
-    # Generate a random DAG
-    num_gates = 4096
-    lookback = 256
-    dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
-    # print(dag)
+    
+    num_iterations = 1000
+    start_time = perf_counter()
+    for _ in range(num_iterations):
+        # Generate a random DAG
+        num_gates = 1024
+        lookback = 64
+        dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
+        # print(dag)
 
-    # Evaluate the DAG
-    output = evaluate_dag_torch(
-        dag, root_node_values, num_outputs
-    )  # [num_outputs, num_packed_bytes]
+        # Evaluate the DAG
+        output = evaluate_dag_torch(
+            dag, root_node_values, num_outputs
+        )  # [num_outputs, num_packed_bytes]
+    elapsed = perf_counter() - start_time
+    print(f"{num_iterations} iterations in {elapsed:.3f}s ({elapsed / num_iterations * 1000:.3f}ms per iteration)")
+    print(f"{num_iterations / elapsed:.0f} iterations/second")
 
     # Convert to numpy and add batch dimension for output_to_image_array
     output_np = output.numpy()[None, ...]  # [1, num_outputs, num_packed_bytes]
