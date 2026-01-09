@@ -15,7 +15,7 @@ gate_functions = {
     "NOR": lambda x, y: torch.bitwise_not(torch.bitwise_or(x, y)),
 }
 
-
+# @torch.compile()
 def evaluate_dag_torch(
     dag: BinaryLogicGateDAGDescription,
     root_node_values: BitpackedInputTensor,
@@ -85,8 +85,19 @@ if __name__ == "__main__":
     # Convert to torch tensor
     root_node_values = torch.from_numpy(address_bitarrays)
 
+    #warmup
+    for _ in range(10):
+        num_gates = 1024
+        lookback = 64
+        dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
+        output = evaluate_dag_torch(
+            dag, root_node_values, num_outputs
+        )
     
-    num_iterations = 1000
+    print("Warmup complete")
+    # print(dag)
+    
+    num_iterations = 100
     start_time = perf_counter()
     for _ in range(num_iterations):
         # Generate a random DAG
