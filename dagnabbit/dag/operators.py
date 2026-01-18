@@ -1,8 +1,6 @@
 import torch
 
-AVAILABLE_GATE_TYPES = ["NAND", "NOR"]
-
-BITWISE_GATE_FUNCTIONS = {
+VALID_OPERATORS = {
     "NAND": lambda x, y: torch.bitwise_not(torch.bitwise_and(x, y)),
     "NOR": lambda x, y: torch.bitwise_not(torch.bitwise_or(x, y)),
 }

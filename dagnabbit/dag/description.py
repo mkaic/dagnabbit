@@ -2,9 +2,9 @@ import torch
 from jaxtyping import UInt16, UInt8
 from torch import Tensor
 
-from dagnabbit.dag.gates import AVAILABLE_GATE_TYPES
+from dagnabbit.dag.operators import VALID_OPERATORS
 
-NUM_GATE_TYPES = len(AVAILABLE_GATE_TYPES)
+NUM_GATE_TYPES = len(VALID_OPERATORS.keys())
 
 
 def format_list_with_n_digits(lst: list, n: int) -> str:
@@ -36,6 +36,30 @@ class BinaryLogicGateDAGDescription:
         assert self.gate_inputs_array_indices.is_contiguous()
         assert self.gate_types.is_contiguous()
         assert self.lookback > 0
+
+        self.leaf_node_indices = self.identify_leaf_nodes()
+
+    def identify_leaf_nodes(self) -> list[int]:
+        """
+        Identify all leaf nodes in the DAG.
+
+        A leaf node is a node whose output is not referenced as an input to any gate.
+        Returns array indices of all leaf nodes as a list of integers.
+        """
+        total_nodes = self.num_root_nodes + self.num_gates
+        all_node_indices = torch.arange(total_nodes, dtype=torch.int32)
+
+        # Get all referenced indices (flatten the 2 x num_gates tensor)
+        referenced_indices = self.gate_inputs_array_indices.flatten().to(torch.int32)
+
+        # Mark which nodes are referenced
+        is_referenced = torch.zeros(total_nodes, dtype=torch.bool)
+        is_referenced[referenced_indices] = True
+
+        # Leaf nodes are those NOT referenced by any gate
+        leaf_node_indices = all_node_indices[~is_referenced].tolist()
+
+        return leaf_node_indices
 
     def __str__(self) -> str:
         return f"""
