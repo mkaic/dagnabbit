@@ -12,6 +12,7 @@ dependencies = [
     "black",
     "isort",
     "jaxtyping",
+    "matplotlib>=3.10.8",
 ]
 
 [tool.setuptools.packages.find]

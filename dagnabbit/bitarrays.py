@@ -75,3 +75,45 @@ def output_to_image_array(
     output = output.reshape(shape)  # original image shape
 
     return output
+
+
+def get_8bit_adder_truth_table(return_intermediates: bool = False):
+    input_a = np.arange(256, dtype=np.uint8)
+    input_b = np.arange(256, dtype=np.uint8)
+
+    grid = np.stack(np.meshgrid(input_a, input_b), axis=-1)
+
+    sums = grid.sum(axis=-1, dtype=np.uint8, keepdims=True)
+
+    unpacked_inputs = np.unpackbits(grid, axis=-1)
+    unpacked_inputs = np.moveaxis(unpacked_inputs, -1, 0)
+    # (16, 256, 256) - bit planes before flattening
+    unpacked_inputs_2d = unpacked_inputs
+    unpacked_inputs = unpacked_inputs.reshape(16, -1)
+    packed_inputs = np.packbits(unpacked_inputs, axis=-1)
+
+    unpacked_sums = np.unpackbits(sums, axis=-1)
+    unpacked_sums = np.moveaxis(unpacked_sums, -1, 0)
+    # (8, 256, 256) - bit planes before flattening
+    unpacked_sums_2d = unpacked_sums
+    unpacked_sums = unpacked_sums.reshape(8, -1)
+    packed_sums = np.packbits(unpacked_sums, axis=-1)
+
+    if return_intermediates:
+        return {
+            "grid": grid,  # (256, 256, 2)
+            "sums": sums,  # (256, 256, 1)
+            "unpacked_inputs_2d": unpacked_inputs_2d,  # (16, 256, 256)
+            "unpacked_sums_2d": unpacked_sums_2d,  # (8, 256, 256)
+            "unpacked_inputs": unpacked_inputs,  # (16, 65536)
+            "unpacked_sums": unpacked_sums,  # (8, 65536)
+            "packed_inputs": packed_inputs,  # (16, 8192)
+            "packed_sums": packed_sums,  # (8, 8192)
+        }
+    else:
+        return packed_inputs, packed_sums
+
+
+if __name__ == "__main__":
+    intermediates = get_8bit_adder_truth_table(return_intermediates=True)
+    print(intermediates)

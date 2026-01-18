@@ -16,7 +16,7 @@ gate_functions = {
 }
 
 # @torch.compile()
-def evaluate_dag_torch(
+def torch_bitwise_kernel(
     dag: BinaryLogicGateDAGDescription,
     root_node_values: BitpackedInputTensor,
     num_outputs: int,
@@ -90,7 +90,7 @@ if __name__ == "__main__":
         num_gates = 1024
         lookback = 64
         dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
-        output = evaluate_dag_torch(
+        output = torch_bitwise_kernel(
             dag, root_node_values, num_outputs
         )
     
@@ -107,7 +107,7 @@ if __name__ == "__main__":
         # print(dag)
 
         # Evaluate the DAG
-        output = evaluate_dag_torch(
+        output = torch_bitwise_kernel(
             dag, root_node_values, num_outputs
         )  # [num_outputs, num_packed_bytes]
     elapsed = perf_counter() - start_time
