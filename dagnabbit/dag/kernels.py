@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from jaxtyping import UInt16, UInt8
 from time import sleep, perf_counter
+from typing import Callable
 
 from dagnabbit.bitarrays import output_to_image_array, get_address_bitarrays
 from dagnabbit.dag.description import BinaryLogicGateDAGDescription
@@ -10,18 +11,15 @@ from dagnabbit.dag.gates import AVAILABLE_GATE_TYPES
 BitpackedInputTensor = UInt8[Tensor, "address_bitcount num_packed_bytes"]
 BitpackedOutputTensor = UInt8[Tensor, "num_outputs num_packed_bytes"]
 
-gate_functions = {
-    "NAND": lambda x, y: torch.bitwise_not(torch.bitwise_and(x, y)),
-    "NOR": lambda x, y: torch.bitwise_not(torch.bitwise_or(x, y)),
-}
 
 # @torch.compile()
-def torch_bitwise_kernel(
+def evaluate_dag_with_bitwise_kernel(
     dag: BinaryLogicGateDAGDescription,
+    operators: list[Callable[[Tensor, Tensor], Tensor]],
     root_node_values: BitpackedInputTensor,
     num_outputs: int,
+    reduce_leaf_nodes: bool = False,
 ) -> BitpackedOutputTensor:
-
     dag = dag.to(root_node_values.device)
     root_node_values = root_node_values.to(root_node_values.device)
 
@@ -85,18 +83,16 @@ if __name__ == "__main__":
     # Convert to torch tensor
     root_node_values = torch.from_numpy(address_bitarrays)
 
-    #warmup
+    # warmup
     for _ in range(10):
         num_gates = 1024
         lookback = 64
         dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
-        output = torch_bitwise_kernel(
-            dag, root_node_values, num_outputs
-        )
-    
+        output = evaluate_dag_with_bitwise_kernel(dag, root_node_values, num_outputs)
+
     print("Warmup complete")
     # print(dag)
-    
+
     num_iterations = 100
     start_time = perf_counter()
     for _ in range(num_iterations):
@@ -107,11 +103,13 @@ if __name__ == "__main__":
         # print(dag)
 
         # Evaluate the DAG
-        output = torch_bitwise_kernel(
+        output = evaluate_dag_with_bitwise_kernel(
             dag, root_node_values, num_outputs
         )  # [num_outputs, num_packed_bytes]
     elapsed = perf_counter() - start_time
-    print(f"{num_iterations} iterations in {elapsed:.3f}s ({elapsed / num_iterations * 1000:.3f}ms per iteration)")
+    print(
+        f"{num_iterations} iterations in {elapsed:.3f}s ({elapsed / num_iterations * 1000:.3f}ms per iteration)"
+    )
     print(f"{num_iterations / elapsed:.0f} iterations/second")
 
     # Convert to numpy and add batch dimension for output_to_image_array

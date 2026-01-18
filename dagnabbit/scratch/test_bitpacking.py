@@ -23,9 +23,9 @@ def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
         shape: Shape of the array to test
         verbose: If True, print detailed information
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Testing shape: {shape}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Step 1: Pack addresses into bit arrays
     packed = get_address_bitarrays(shape)
@@ -263,9 +263,9 @@ def test_roundtrip_correctness(shape: Tuple[int]) -> bool:
     total_bitdepth = sum(bitdepths)
 
     # Verify bitdepth matches
-    assert (
-        unpacked_bits.shape[0] == total_bitdepth
-    ), f"Bitdepth mismatch: expected {total_bitdepth}, got {unpacked_bits.shape[0]}"
+    assert unpacked_bits.shape[0] == total_bitdepth, (
+        f"Bitdepth mismatch: expected {total_bitdepth}, got {unpacked_bits.shape[0]}"
+    )
 
     # Test a few specific coordinates
     test_coords = []
@@ -344,9 +344,9 @@ def main():
             results.append((shape, False))
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Test Summary")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for shape, passed in results:
         status = "PASS" if passed else "FAIL"
         print(f"  {shape}: {status}")

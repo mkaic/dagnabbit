@@ -28,7 +28,10 @@ def visualize_grid(grid: np.ndarray):
     Shows input_a values and input_b values as separate heatmaps.
     """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("Input Grid (256×256×2)\nEach cell contains [a, b] where sum = a + b", fontsize=14)
+    fig.suptitle(
+        "Input Grid (256×256×2)\nEach cell contains [a, b] where sum = a + b",
+        fontsize=14,
+    )
 
     # Input A (varies along columns due to meshgrid)
     im0 = axes[0].imshow(grid[:, :, 0], cmap="viridis", aspect="equal")
@@ -53,7 +56,9 @@ def visualize_sums(sums: np.ndarray):
     Shows the raw uint8 sum values (with overflow wrapping).
     """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("Sum Output (256×256)\nsum = (a + b) mod 256 (uint8 overflow)", fontsize=14)
+    fig.suptitle(
+        "Sum Output (256×256)\nsum = (a + b) mod 256 (uint8 overflow)", fontsize=14
+    )
 
     # Raw sum values
     im0 = axes[0].imshow(sums.squeeze(), cmap="magma", aspect="equal")
@@ -94,9 +99,9 @@ def visualize_unpacked_inputs(unpacked_inputs: np.ndarray):
         ax.imshow(plane, cmap="binary", aspect="equal", vmin=0, vmax=1)
 
         if bit_idx < 8:
-            label = f"Bit {bit_idx}\nInput A bit {7-bit_idx}"
+            label = f"Bit {bit_idx}\nInput A bit {7 - bit_idx}"
         else:
-            label = f"Bit {bit_idx}\nInput B bit {15-bit_idx}"
+            label = f"Bit {bit_idx}\nInput B bit {15 - bit_idx}"
 
         ax.set_title(label, fontsize=10)
         ax.set_xticks([])
@@ -123,7 +128,7 @@ def visualize_unpacked_sums(unpacked_sums: np.ndarray):
         plane = unpacked_sums[bit_idx]
 
         ax.imshow(plane, cmap="binary", aspect="equal", vmin=0, vmax=1)
-        ax.set_title(f"Bit {bit_idx} (weight={2**(7-bit_idx)})", fontsize=10)
+        ax.set_title(f"Bit {bit_idx} (weight={2 ** (7 - bit_idx)})", fontsize=10)
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -142,14 +147,18 @@ def visualize_packed_data(packed_inputs: np.ndarray, packed_sums: np.ndarray):
 
     # Packed inputs
     im0 = axes[0].imshow(packed_inputs, cmap="viridis", aspect="auto")
-    axes[0].set_title(f"Packed Inputs: shape {packed_inputs.shape}\n16 bitvectors × 8192 bytes = 65536 samples")
+    axes[0].set_title(
+        f"Packed Inputs: shape {packed_inputs.shape}\n16 bitvectors × 8192 bytes = 65536 samples"
+    )
     axes[0].set_xlabel("Byte index (0-8191)")
     axes[0].set_ylabel("Bit index (0-15)")
     plt.colorbar(im0, ax=axes[0], label="Byte value (0-255)")
 
     # Packed sums
     im1 = axes[1].imshow(packed_sums, cmap="plasma", aspect="auto")
-    axes[1].set_title(f"Packed Sums: shape {packed_sums.shape}\n8 bitvectors × 8192 bytes = 65536 samples")
+    axes[1].set_title(
+        f"Packed Sums: shape {packed_sums.shape}\n8 bitvectors × 8192 bytes = 65536 samples"
+    )
     axes[1].set_xlabel("Byte index (0-8191)")
     axes[1].set_ylabel("Bit index (0-7)")
     plt.colorbar(im1, ax=axes[1], label="Byte value (0-255)")
@@ -164,7 +173,9 @@ def visualize_sample_correspondence(grid, sums, unpacked_inputs, unpacked_sums):
     Pick a few specific samples and verify the bits match.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle("Sample Correspondence Check\nVerifying input/output alignment", fontsize=14)
+    fig.suptitle(
+        "Sample Correspondence Check\nVerifying input/output alignment", fontsize=14
+    )
 
     # Show sample index mapping
     ax = axes[0, 0]
@@ -202,15 +213,26 @@ def visualize_sample_correspondence(grid, sums, unpacked_inputs, unpacked_sums):
         b_reconstructed = sum(input_bits[k + 8] * (2 ** (7 - k)) for k in range(8))
         s_reconstructed = sum(sum_bits[k] * (2 ** (7 - k)) for k in range(8))
 
-        status = "✓" if (a == a_reconstructed and b == b_reconstructed and s == s_reconstructed) else "✗"
+        status = (
+            "✓"
+            if (a == a_reconstructed and b == b_reconstructed and s == s_reconstructed)
+            else "✗"
+        )
         text_lines.append(
             f"{status} ({i:3d},{j:3d}): a={a:3d}, b={b:3d}, sum={s:3d} "
             f"(reconstructed: a={a_reconstructed}, b={b_reconstructed}, s={s_reconstructed})"
         )
 
-    ax.text(0.05, 0.95, "\n".join(text_lines), transform=ax.transAxes, fontsize=9,
-            verticalalignment="top", fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    ax.text(
+        0.05,
+        0.95,
+        "\n".join(text_lines),
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        fontfamily="monospace",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
@@ -225,9 +247,13 @@ def visualize_sample_correspondence(grid, sums, unpacked_inputs, unpacked_sums):
 
     ax.barh(range(16), input_bits, color=["tab:blue"] * 8 + ["tab:orange"] * 8)
     ax.set_yticks(range(16))
-    ax.set_yticklabels([f"A bit {7-k}" for k in range(8)] + [f"B bit {7-k}" for k in range(8)])
+    ax.set_yticklabels(
+        [f"A bit {7 - k}" for k in range(8)] + [f"B bit {7 - k}" for k in range(8)]
+    )
     ax.set_xlabel("Bit value (0 or 1)")
-    ax.set_title(f"Input bits for sample ({i}, {j})\na={a} (0b{a:08b}), b={b} (0b{b:08b})")
+    ax.set_title(
+        f"Input bits for sample ({i}, {j})\na={a} (0b{a:08b}), b={b} (0b{b:08b})"
+    )
     ax.invert_yaxis()
 
     # Sum bits for same example
@@ -237,7 +263,7 @@ def visualize_sample_correspondence(grid, sums, unpacked_inputs, unpacked_sums):
 
     ax.barh(range(8), sum_bits, color="tab:green")
     ax.set_yticks(range(8))
-    ax.set_yticklabels([f"Sum bit {7-k}" for k in range(8)])
+    ax.set_yticklabels([f"Sum bit {7 - k}" for k in range(8)])
     ax.set_xlabel("Bit value (0 or 1)")
     ax.set_title(f"Sum bits for sample ({i}, {j})\nsum={s} (0b{s:08b})")
     ax.invert_yaxis()

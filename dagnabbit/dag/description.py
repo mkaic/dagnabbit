@@ -138,7 +138,7 @@ BinaryLogicGateDAGDescription(
             lookback=lookback,
             num_root_nodes=num_root_nodes,
         )
-    
+
     def to(self, device: torch.device) -> "BinaryLogicGateDAGDescription":
         self.gate_inputs_array_indices = self.gate_inputs_array_indices.to(device)
         self.gate_types = self.gate_types.to(device)
@@ -173,9 +173,9 @@ if __name__ == "__main__":
         dag = BinaryLogicGateDAGDescription.random(num_root_nodes, num_gates, lookback)
 
         # Check gate_types are valid
-        assert (
-            dag.gate_types.max() < NUM_GATE_TYPES
-        ), f"DAG {dag_idx}: gate_type out of range"
+        assert dag.gate_types.max() < NUM_GATE_TYPES, (
+            f"DAG {dag_idx}: gate_type out of range"
+        )
 
         # Check each gate's inputs are valid references
         for gate_idx in range(num_gates):
