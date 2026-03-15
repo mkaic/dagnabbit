@@ -2,8 +2,8 @@ import torch
 from jaxtyping import UInt16, UInt8
 from torch import Tensor
 
-class FixedInDegreeDAGDescription:
 
+class FixedInDegreeDAGDescription:
     def __init__(
         self,
         num_root_nodes: int,
@@ -38,21 +38,25 @@ class FixedInDegreeDAGDescription:
 
     @classmethod
     def random(
-        cls, num_root_nodes: int, num_trunk_nodes: int, in_degree: int, num_node_types: int
+        cls,
+        num_root_nodes: int,
+        num_trunk_nodes: int,
+        in_degree: int,
+        num_node_types: int,
     ) -> "FixedInDegreeDAGDescription":
         """
         Generate a random DAG where each node can reference any previous node.
         Each node can reference up to `in_degree` previous nodes, including the same node more than once.
         """
 
-        max_allowed_node_indices = torch.arange(num_trunk_nodes, dtype=torch.int32) + num_root_nodes
+        max_allowed_node_indices = (
+            torch.arange(num_trunk_nodes, dtype=torch.int32) + num_root_nodes
+        )
 
         # Sample uniformly from [0, num_valid_references - 1] for each node.
         # Since noise is in [0, 1), (noise * n).int() gives integers in [0, n-1].
         noise = torch.rand(in_degree, num_trunk_nodes, dtype=torch.float32)
-        node_inputs_indices = (
-            (noise * max_allowed_node_indices.float()).floor().int()
-        )
+        node_inputs_indices = (noise * max_allowed_node_indices.float()).floor().int()
 
         node_types = torch.randint(
             0, num_node_types, (num_trunk_nodes,), dtype=torch.uint8
@@ -64,7 +68,7 @@ class FixedInDegreeDAGDescription:
             num_node_types=num_node_types,
             in_degree=in_degree,
             node_inputs_indices=node_inputs_indices,
-            node_types=node_types,  
+            node_types=node_types,
         )
 
     def to(self, device: torch.device) -> "FixedInDegreeDAGDescription":
