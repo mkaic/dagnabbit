@@ -39,4 +39,11 @@ class FixedInDegreeNodeAutoEncoder(nn.Module):
         return self.decoder(node_embedding)
 
 
-class 
+class NodeAECollection(nn.Module):
+    def __init__(self, node_embedding_dim: int, in_degree: int, num_node_types: int):
+        super().__init__()
+
+        self.node_aes = nn.ModuleList([
+            FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
+            for _ in range(num_node_types)
+        ])
