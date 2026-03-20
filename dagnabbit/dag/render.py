@@ -23,6 +23,8 @@ PALETTE = [
 
 ROOT_COLOR = "#d3d3d3"
 ROOT_FONT_COLOR = "#333333"
+LEAF_COLOR = "#2ecc71"
+LEAF_FONT_COLOR = "#ffffff"
 EDGE_COLOR = "#888888"
 BG_COLOR = "#ffffff"
 
@@ -80,17 +82,29 @@ def render_dag(
                 fontcolor=ROOT_FONT_COLOR,
             )
 
+    leaf_set = set(dag.leaf_node_indices)
+
     for i in range(dag.num_trunk_nodes):
         global_idx = i + dag.num_root_nodes
         node_type = dag.trunk_node_types[i].item()
-        color = PALETTE[node_type % len(PALETTE)]
-        dot.node(
-            str(global_idx),
-            label=str(global_idx),
-            shape="square",
-            fillcolor=color,
-            fontcolor="white",
-        )
+
+        if global_idx in leaf_set:
+            dot.node(
+                str(global_idx),
+                label=str(global_idx),
+                shape="diamond",
+                fillcolor=LEAF_COLOR,
+                fontcolor=LEAF_FONT_COLOR,
+            )
+        else:
+            color = PALETTE[node_type % len(PALETTE)]
+            dot.node(
+                str(global_idx),
+                label=str(global_idx),
+                shape="square",
+                fillcolor=color,
+                fontcolor="white",
+            )
 
     for i in range(dag.num_trunk_nodes):
         target = i + dag.num_root_nodes
