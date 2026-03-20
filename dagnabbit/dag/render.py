@@ -46,23 +46,26 @@ def render_dag(
         graph_attr={
             "rankdir": "LR",
             "bgcolor": BG_COLOR,
-            "splines": "ortho",
+            "splines": "polyline",
             "dpi": "150",
             "pad": "0.5",
-            "nodesep": "0.3",
-            "ranksep": "0.6",
+            "nodesep": "0.25",
+            "ranksep": "2.0",
+            "sep": "+8",
         },
         node_attr={
             "style": "filled",
             "fontname": "Helvetica",
-            "fontsize": "10",
-            "width": "0.4",
-            "height": "0.4",
+            "fontsize": "8",
+            "width": "0.3",
+            "height": "0.3",
             "fixedsize": "true",
         },
         edge_attr={
             "color": EDGE_COLOR,
-            "arrowsize": "0.5",
+            "arrowsize": "0.4",
+            "tailport": "e",
+            "headport": "w",
         },
     )
 
@@ -84,7 +87,7 @@ def render_dag(
         dot.node(
             str(global_idx),
             label=str(global_idx),
-            shape="circle",
+            shape="square",
             fillcolor=color,
             fontcolor="white",
         )
