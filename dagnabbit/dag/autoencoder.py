@@ -1,8 +1,6 @@
-from re import I
 import torch
 from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Iterable
 
 from dagnabbit.dag.description import FixedInDegreeDAGDescription
@@ -21,8 +19,11 @@ class MLP(nn.Module):
         self.activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = self.activation(layer(x))
+        for i, layer in enumerate[nn.Module](self.layers):
+            x = layer(x)
+            if i + 1 < len(self.layers):
+                x = self.activation(x)
+
         return x
 
 
@@ -53,11 +54,11 @@ class NodeDecoder(nn.Module):
 
 
 class FixedInDegreeNodeAutoEncoder(nn.Module):
-    def __init__(self, node_embedding_dim: int, in_degree: int):
+    def __init__(self, node_embedding_dim: int, in_degree):
         super().__init__()
 
         self.node_embedding_dim = node_embedding_dim
-        input_dim = node_embedding_dim * in_degree
+
         self.encoder = NodeEncoder(node_embedding_dim, in_degree)
         self.decoder = NodeDecoder(node_embedding_dim, in_degree)
 
@@ -72,18 +73,47 @@ class FixedInDegreeNodeAutoEncoder(nn.Module):
 
 
 class DagnabbitAutoEncoder(nn.Module):
-    def __init__(self, node_embedding_dim: int, in_degree: int, num_node_types: int):
+    def __init__(
+        self,
+        node_embedding_dim: int,
+        trunk_node_in_degrees: int | list[int],
+        num_trunk_node_types: int,
+        condenser_node_in_degree: int,
+        num_root_nodes: int,
+    ):
         super().__init__()
 
-        self.node_autoencoders = nn.ModuleList(
+        self.node_embedding_dim = node_embedding_dim
+
+        if isinstance(trunk_node_in_degrees, int):
+            self.trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
+        else:
+            self.trunk_node_in_degrees = trunk_node_in_degrees
+
+        assert len(self.trunk_node_in_degrees) == num_trunk_node_types
+
+        self.num_trunk_node_types = num_trunk_node_types
+        self.condenser_node_in_degree = condenser_node_in_degree
+        self.num_root_nodes = num_root_nodes
+
+        self.node_autoencoders = nn.ModuleList()
+
+        for _ in range(num_trunk_node_types + 1):  # +1 for condenser nodes
+            pass
+
+        self.node_type_predictor = MLP(
             [
-                FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
-                for _ in range(num_node_types)
+                self.node_embedding_dim,
+                self.node_embedding_dim * 2,
+                self.num_trunk_node_types,
             ]
         )
-
-        self.condenser_autoencoder = FixedInDegreeNodeAutoEncoder(
-            node_embedding_dim, in_degree
+        self.node_is_roots_predictor = MLP(
+            [
+                self.node_embedding_dim,
+                self.node_embedding_dim * 2,
+                self.num_root_nodes,
+            ]
         )
 
     def encode(
@@ -91,4 +121,4 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_graph: FixedInDegreeDAGDescription,
         condenser_graph: FixedInDegreeDAGDescription,
     ) -> Tensor:
-        return self.node_autoencoders[graph.node_types](graph.node_embeddings)
+        pass
