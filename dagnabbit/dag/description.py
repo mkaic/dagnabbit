@@ -51,7 +51,7 @@ class FixedInDegreeDAGDescription:
 def make_random_graph_description(
     num_root_nodes: int,
     num_trunk_nodes: int,
-    in_degree: int | list[int],
+    trunk_node_in_degrees: list[int],
     num_node_types: int,
 ) -> FixedInDegreeDAGDescription:
     """
@@ -59,10 +59,10 @@ def make_random_graph_description(
     Each node can reference up to its type's in_degree previous nodes,
     including the same node more than once.
     """
-    if isinstance(in_degree, int):
-        in_degrees = [in_degree] * num_node_types
+    if isinstance(trunk_node_in_degrees, int):
+        in_degrees = [trunk_node_in_degrees] * num_node_types
     else:
-        in_degrees = in_degree
+        in_degrees = trunk_node_in_degrees
 
     node_types = torch.randint(0, num_node_types, (num_trunk_nodes,), dtype=torch.uint8)
 

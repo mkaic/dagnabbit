@@ -14,7 +14,8 @@ dependencies = [
     "jaxtyping",
     "matplotlib>=3.10.8",
     "ruff>=0.14.13",
-]
+    "graphviz==0.21",
+    ]
 
 [tool.setuptools.packages.find]
 include = ["dagnabbit*"]
