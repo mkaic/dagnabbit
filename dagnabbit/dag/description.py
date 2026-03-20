@@ -160,8 +160,7 @@ def graft_condenser_graph_onto_primary_graph(
     return FixedInDegreeDAGDescription(
         num_root_nodes=primary_graph.num_root_nodes,
         num_trunk_nodes=primary_graph.num_trunk_nodes + condenser_graph.num_trunk_nodes,
-        num_trunk_node_types=primary_graph.num_trunk_node_types
-        + condenser_graph.num_trunk_node_types,
+        num_trunk_node_types=primary_graph.num_trunk_node_types + 1,
         trunk_node_in_degree=combined_in_degrees,
         trunk_node_inputs_indices=combined_indices,
         trunk_node_types=combined_types,
