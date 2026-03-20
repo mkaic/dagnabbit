@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Iterable
 
+from dagnabbit.dag.description import FixedInDegreeDAGDescription
+
 
 class MLP(nn.Module):
     def __init__(self, vector_dims: Iterable[int], activation: nn.Module = nn.GELU()):
@@ -83,3 +85,6 @@ class DagnabbitAutoEncoder(nn.Module):
         self.condenser_autoencoder = FixedInDegreeNodeAutoEncoder(
             node_embedding_dim, in_degree
         )
+
+    def encode(self, primary_graph: FixedInDegreeDAGDescription, condenser_graph: FixedInDegreeDAGDescription) -> Tensor:
+        return self.node_autoencoders[graph.node_types](graph.node_embeddings)
