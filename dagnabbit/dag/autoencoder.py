@@ -86,5 +86,9 @@ class DagnabbitAutoEncoder(nn.Module):
             node_embedding_dim, in_degree
         )
 
-    def encode(self, primary_graph: FixedInDegreeDAGDescription, condenser_graph: FixedInDegreeDAGDescription) -> Tensor:
+    def encode(
+        self,
+        primary_graph: FixedInDegreeDAGDescription,
+        condenser_graph: FixedInDegreeDAGDescription,
+    ) -> Tensor:
         return self.node_autoencoders[graph.node_types](graph.node_embeddings)
