@@ -96,9 +96,7 @@ def make_condenser_graph_description(
         shuffled = [leaf_node_indices[i] for i in perm]
 
         if len(shuffled) % 2 == 0:
-            odd_node_out = shuffled.pop()
-        else:
-            odd_node_out = None
+            shuffled.pop()
         
         for i in range(0, len(shuffled), 2):
             input_a = shuffled[i]
@@ -109,7 +107,6 @@ def make_condenser_graph_description(
             leaf_node_indices.add(len(trunk_node_input_indices) - 1 + n_roots)
 
 
-
     return FixedInDegreeDAGDescription(
         num_root_nodes=n_roots,
         num_trunk_nodes=len(trunk_node_input_indices),
@@ -117,4 +114,40 @@ def make_condenser_graph_description(
         trunk_node_inputs_indices=torch.tensor(trunk_node_input_indices, dtype=torch.int),
         trunk_node_types=torch.zeros(len(trunk_node_input_indices), dtype=torch.uint8),
         trunk_node_in_degree=2,
+    )
+
+
+def graft_condenser_graph_onto_primary_graph(
+    primary_graph: FixedInDegreeDAGDescription,
+    condenser_graph: FixedInDegreeDAGDescription,
+) -> FixedInDegreeDAGDescription:
+    primary_total = primary_graph.num_root_nodes + primary_graph.num_trunk_nodes
+
+    leaf_indices = torch.tensor(primary_graph.leaf_node_indices, dtype=torch.int32)
+    remapped = condenser_graph.trunk_node_inputs_indices.clone().to(torch.int32)
+
+    is_root = remapped < condenser_graph.num_root_nodes
+    root_mapped = leaf_indices[remapped.clamp(max=len(leaf_indices) - 1)]
+    trunk_mapped = remapped - condenser_graph.num_root_nodes + primary_total
+    remapped = torch.where(is_root, root_mapped, trunk_mapped)
+
+    combined_indices = torch.cat(
+        [primary_graph.trunk_node_inputs_indices.to(torch.int32), remapped], dim=1
+    )
+
+    max_primary_type = primary_graph.trunk_node_types.max().item()
+    condenser_types = torch.full(
+        (condenser_graph.num_trunk_nodes,),
+        max_primary_type + 1,
+        dtype=torch.uint8,
+    )
+    combined_types = torch.cat([primary_graph.trunk_node_types, condenser_types])
+
+    return FixedInDegreeDAGDescription(
+        num_root_nodes=primary_graph.num_root_nodes,
+        num_trunk_nodes=primary_graph.num_trunk_nodes + condenser_graph.num_trunk_nodes,
+        num_trunk_node_types=int(max_primary_type) + 2,
+        trunk_node_in_degree=2,
+        trunk_node_inputs_indices=combined_indices,
+        trunk_node_types=combined_types,
     )
