@@ -5,7 +5,11 @@ from torch import Tensor
 import torch.nn as nn
 from typing import Iterable
 
-from dagnabbit.dag.description import FixedInDegreeDAGDescription, make_condenser_graph_description, graft_condenser_graph_onto_primary_graph
+from dagnabbit.dag.description import (
+    FixedInDegreeDAGDescription,
+    make_condenser_graph_description,
+    graft_condenser_graph_onto_primary_graph,
+)
 
 
 class MLP(nn.Module):
@@ -39,7 +43,10 @@ class NodeEncoder(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.encoder(x)
+        x = x.flatten()
+        x = self.encoder(x)
+
+        return x
 
 
 class NodeDecoder(nn.Module):
@@ -52,7 +59,10 @@ class NodeDecoder(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.decoder(x)
+        x = self.decoder(x)
+        x = torch.chunk(x, self.in_degree, dim=0)
+
+        return x
 
 
 class FixedInDegreeNodeAutoEncoder(nn.Module):
@@ -119,38 +129,57 @@ class DagnabbitAutoEncoder(nn.Module):
             ]
         )
 
-        self.root_node_embeddings = torch.randn(self.num_root_nodes, self.node_embedding_dim, dtype=torch.float32)
+        self.root_node_embeddings = torch.randn(
+            self.num_root_nodes, self.node_embedding_dim, dtype=torch.float32
+        )
 
     def encode(
         self,
         primary_graph: FixedInDegreeDAGDescription,
     ) -> tuple[Tensor, FixedInDegreeDAGDescription]:
-
-        if len(primary_graph.leaf_node_indices) !- 1:
+        if len(primary_graph.leaf_node_indices) != 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
-            graph = graft_condenser_graph_onto_primary_graph(primary_graph=primary_graph, condenser_graph=condenser_graph)
+            graph = graft_condenser_graph_onto_primary_graph(
+                primary_graph=primary_graph, condenser_graph=condenser_graph
+            )
         else:
             graph = primary_graph
 
-        trunk_node_embeddings = torch.empty((graph.num_trunk_nodes, self.node_embedding_dim), dtype=torch.float32)
+        trunk_node_embeddings = torch.empty(
+            (graph.num_trunk_nodes, self.node_embedding_dim), dtype=torch.float32
+        )
 
-        embeddings_buffer = torch.cat([self.root_node_embeddings, trunk_node_embeddings], dim=0)
+        embeddings_buffer = torch.cat(
+            [self.root_node_embeddings, trunk_node_embeddings], dim=0
+        )
 
         for i in range(graph.num_trunk_nodes):
-           
             buffer_read_indices = graph.trunk_node_inputs_indices[i]
 
             node_type = graph.trunk_node_types[i]
             node_autoencoder = self.node_autoencoders[node_type]
 
-            inputs = embeddings_buffer[buffer_read_indices, :]
+            parent_embeddings = embeddings_buffer[buffer_read_indices, :]
 
-            node_embedding = node_autoencoder.encode(inputs.flatten())
+            node_embedding = node_autoencoder.encode(parent_embeddings)
 
             buffer_write_index = i + self.num_root_nodes
             embeddings_buffer[buffer_write_index] = node_embedding
 
         return embeddings_buffer, graph
 
-    def decode_autoregressive(self, graph_embedding, graph):
+    def decode_guided_autoregressive(
+        self, graph_embedding: Tensor, graph: FixedInDegreeDAGDescription
+    ) -> dict[int, list[tuple[Tensor, Tensor]]]:
+        pass
+
+    def decode_blind_autoregressive(
+        self,
+        graph_embedding: Tensor,
+    ):
+        pass
+
+    def decode_teacher_forcing(
+        self, graph_embeddings_buffer, graph: FixedInDegreeDAGDescription
+    ) -> tuple[Tensor, Tensor]:
         pass

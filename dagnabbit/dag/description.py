@@ -63,7 +63,9 @@ def make_random_graph_description(
     else:
         trunk_node_in_degrees = trunk_node_in_degrees
 
-    trunk_node_types = torch.randint(0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8).tolist()
+    trunk_node_types = torch.randint(
+        0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8
+    ).tolist()
 
     max_in_degree = max(trunk_node_in_degrees)
     max_allowed_node_indices = (
