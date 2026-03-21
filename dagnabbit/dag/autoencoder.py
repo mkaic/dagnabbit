@@ -1,9 +1,11 @@
+from torch._tensor import Tensor
+from torch._tensor import Tensor
 import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Iterable
 
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
+from dagnabbit.dag.description import FixedInDegreeDAGDescription, make_condenser_graph_description, graft_condenser_graph_onto_primary_graph
 
 
 class MLP(nn.Module):
@@ -86,39 +88,69 @@ class DagnabbitAutoEncoder(nn.Module):
         self.node_embedding_dim = node_embedding_dim
 
         if isinstance(trunk_node_in_degrees, int):
-            self.trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
+            trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
         else:
-            self.trunk_node_in_degrees = trunk_node_in_degrees
+            trunk_node_in_degrees = trunk_node_in_degrees
 
-        assert len(self.trunk_node_in_degrees) == num_trunk_node_types
+        assert len(trunk_node_in_degrees) == num_trunk_node_types
 
-        self.num_trunk_node_types = num_trunk_node_types
-        self.condenser_node_in_degree = condenser_node_in_degree
+        self.trunk_node_in_degrees = trunk_node_in_degrees + [condenser_node_in_degree]
+
+        self.num_trunk_node_types = num_trunk_node_types + 1
+
         self.num_root_nodes = num_root_nodes
 
-        self.node_autoencoders = nn.ModuleList()
+        self.node_autoencoders: list[FixedInDegreeNodeAutoEncoder] = nn.ModuleList()
 
-        for _ in range(num_trunk_node_types + 1):  # +1 for condenser nodes
-            pass
+        for node_type_idx, in_degree in zip[tuple[int, int]](
+            range(num_trunk_node_types), self.trunk_node_in_degrees
+        ):  # +1 for condenser nodes
+            self.node_autoencoders.append(
+                FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
+            )
 
+        # For the purposes of this aux loss, here each input node has it's own unique "type"
+        # Meaning we need to add num_root_nodes neurons to the output
         self.node_type_predictor = MLP(
             [
                 self.node_embedding_dim,
                 self.node_embedding_dim * 2,
-                self.num_trunk_node_types,
+                self.num_trunk_node_types + self.num_root_nodes,
             ]
         )
-        self.node_is_roots_predictor = MLP(
-            [
-                self.node_embedding_dim,
-                self.node_embedding_dim * 2,
-                self.num_root_nodes,
-            ]
-        )
+
+        self.root_node_embeddings = torch.randn(self.num_root_nodes, self.node_embedding_dim, dtype=torch.float32)
 
     def encode(
         self,
         primary_graph: FixedInDegreeDAGDescription,
-        condenser_graph: FixedInDegreeDAGDescription,
-    ) -> Tensor:
+    ) -> tuple[Tensor, FixedInDegreeDAGDescription]:
+
+        if len(primary_graph.leaf_node_indices) !- 1:
+            condenser_graph = make_condenser_graph_description(primary_graph)
+            graph = graft_condenser_graph_onto_primary_graph(primary_graph=primary_graph, condenser_graph=condenser_graph)
+        else:
+            graph = primary_graph
+
+        trunk_node_embeddings = torch.empty((graph.num_trunk_nodes, self.node_embedding_dim), dtype=torch.float32)
+
+        embeddings_buffer = torch.cat([self.root_node_embeddings, trunk_node_embeddings], dim=0)
+
+        for i in range(graph.num_trunk_nodes):
+           
+            buffer_read_indices = graph.trunk_node_inputs_indices[i]
+
+            node_type = graph.trunk_node_types[i]
+            node_autoencoder = self.node_autoencoders[node_type]
+
+            inputs = embeddings_buffer[buffer_read_indices, :]
+
+            node_embedding = node_autoencoder.encode(inputs.flatten())
+
+            buffer_write_index = i + self.num_root_nodes
+            embeddings_buffer[buffer_write_index] = node_embedding
+
+        return embeddings_buffer, graph
+
+    def decode_autoregressive(self, graph_embedding, graph):
         pass

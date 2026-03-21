@@ -11,7 +11,7 @@ def main():
         num_root_nodes=8,
         num_trunk_nodes=128,
         trunk_node_in_degrees=2,
-        num_node_types=2,
+        num_trunk_node_types=2,
     )
 
     output = render_dag(primary, output_path="dag_primary", fmt="png")

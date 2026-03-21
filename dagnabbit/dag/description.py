@@ -9,27 +9,26 @@ class FixedInDegreeDAGDescription:
         num_root_nodes: int,
         num_trunk_nodes: int,
         num_trunk_node_types: int,
-        trunk_node_in_degree: int | list[int],
+        trunk_node_in_degrees: int | list[int],
         trunk_node_inputs_indices: list[list[int]],
-        trunk_node_types: UInt8[Tensor, "num_trunk_nodes"],
+        trunk_node_types: list[int],
     ):
-        if isinstance(trunk_node_in_degree, int):
-            trunk_node_in_degree = [trunk_node_in_degree] * num_trunk_node_types
+        if isinstance(trunk_node_in_degrees, int):
+            trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
 
-        assert len(trunk_node_in_degree) == num_trunk_node_types
+        assert len(trunk_node_in_degrees) == num_trunk_node_types
 
         self.trunk_node_inputs_indices = trunk_node_inputs_indices
-        self.trunk_node_types = trunk_node_types.to(torch.uint8)
+        self.trunk_node_types = trunk_node_types
         self.num_trunk_nodes = num_trunk_nodes
         self.num_root_nodes = num_root_nodes
         self.num_trunk_node_types = num_trunk_node_types
-        self.trunk_node_in_degrees = trunk_node_in_degree
+        self.trunk_node_in_degrees = trunk_node_in_degrees
 
-        assert self.trunk_node_types.is_contiguous()
         assert all(d > 0 for d in self.trunk_node_in_degrees)
         assert len(self.trunk_node_inputs_indices) == num_trunk_nodes
-        for i, inputs in enumerate(self.trunk_node_inputs_indices):
-            expected = self.trunk_node_in_degrees[self.trunk_node_types[i].item()]
+        for i, inputs in enumerate[list[int]](self.trunk_node_inputs_indices):
+            expected = self.trunk_node_in_degrees[self.trunk_node_types[i]]
             assert len(inputs) == expected
 
         self.leaf_node_indices = self.identify_leaf_nodes()
@@ -52,7 +51,7 @@ def make_random_graph_description(
     num_root_nodes: int,
     num_trunk_nodes: int,
     trunk_node_in_degrees: list[int],
-    num_node_types: int,
+    num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
     """
     Generate a random DAG where each node can reference any previous node.
@@ -60,13 +59,13 @@ def make_random_graph_description(
     including the same node more than once.
     """
     if isinstance(trunk_node_in_degrees, int):
-        in_degrees = [trunk_node_in_degrees] * num_node_types
+        trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
     else:
-        in_degrees = trunk_node_in_degrees
+        trunk_node_in_degrees = trunk_node_in_degrees
 
-    node_types = torch.randint(0, num_node_types, (num_trunk_nodes,), dtype=torch.uint8)
+    trunk_node_types = torch.randint(0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8).tolist()
 
-    max_in_degree = max(in_degrees)
+    max_in_degree = max(trunk_node_in_degrees)
     max_allowed_node_indices = (
         torch.arange(num_trunk_nodes, dtype=torch.int32) + num_root_nodes
     )
@@ -76,16 +75,16 @@ def make_random_graph_description(
 
     trunk_node_inputs_indices: list[list[int]] = []
     for i in range(num_trunk_nodes):
-        node_in_degree = in_degrees[node_types[i].item()]
+        node_in_degree = trunk_node_in_degrees[trunk_node_types[i]]
         trunk_node_inputs_indices.append(all_indices[:node_in_degree, i].tolist())
 
     return FixedInDegreeDAGDescription(
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
-        num_trunk_node_types=num_node_types,
-        trunk_node_in_degree=in_degrees,
+        num_trunk_node_types=num_trunk_node_types,
+        trunk_node_in_degrees=trunk_node_in_degrees,
         trunk_node_inputs_indices=trunk_node_inputs_indices,
-        trunk_node_types=node_types,
+        trunk_node_types=trunk_node_types,
     )
 
 
@@ -120,8 +119,8 @@ def make_condenser_graph_description(
         num_trunk_nodes=len(trunk_node_input_indices),
         num_trunk_node_types=1,
         trunk_node_inputs_indices=trunk_node_input_indices,
-        trunk_node_types=torch.zeros(len(trunk_node_input_indices), dtype=torch.uint8),
-        trunk_node_in_degree=2,
+        trunk_node_types=[0] * len(trunk_node_input_indices),
+        trunk_node_in_degrees=2,
     )
 
 
@@ -161,7 +160,7 @@ def graft_condenser_graph_onto_primary_graph(
         num_root_nodes=primary_graph.num_root_nodes,
         num_trunk_nodes=primary_graph.num_trunk_nodes + condenser_graph.num_trunk_nodes,
         num_trunk_node_types=primary_graph.num_trunk_node_types + 1,
-        trunk_node_in_degree=combined_in_degrees,
+        trunk_node_in_degrees=combined_in_degrees,
         trunk_node_inputs_indices=combined_indices,
         trunk_node_types=combined_types,
     )
