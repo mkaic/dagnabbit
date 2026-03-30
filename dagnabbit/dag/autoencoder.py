@@ -127,9 +127,7 @@ class DagnabbitAutoEncoder(nn.Module):
             ]
         )
 
-        self.root_node_embeddings = torch.randn(
-            self.num_root_nodes, self.node_embedding_dim, dtype=torch.float32
-        )
+        self.root_node_embeddings = nn.Embedding(self.num_root_nodes)
 
     def encode(
         self,
@@ -148,7 +146,7 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         embeddings_buffer = torch.cat(
-            [self.root_node_embeddings, trunk_node_embeddings], dim=0
+            [self.root_node_embeddings.weight, trunk_node_embeddings], dim=0
         )
 
         for i in range(graph.num_trunk_nodes):
@@ -168,16 +166,37 @@ class DagnabbitAutoEncoder(nn.Module):
 
     def decode_guided_autoregressive(
         self, graph_embedding: Tensor, graph: FixedInDegreeDAGDescription
-    ) -> dict[int, list[tuple[Tensor, Tensor]]]:
-        pass
+    ) -> tuple[dict[int, list[Tensor]], dict[int, list[Tensor]]]:
+        assert len(graph.leaf_node_indices) == 1
+
+        predicted_embeddings: dict[int, list[Tensor]] = {
+            i: [] for i in range(graph.num_root_nodes + graph.num_trunk_nodes)
+        }
+        predicted_node_type_logits: dict[int, list[Tensor]] = {
+            i: [] for i in range(graph.num_root_nodes + graph.num_trunk_nodes)
+        }
+
+        predicted_embeddings[graph.num_trunk_nodes - 1] = [graph_embedding]
+
+        for trunk_node_index in reversed[int](range(graph.num_trunk_nodes)):
+            previously_predicted_child_node_embeddings = predicted_embeddings[
+                trunk_node_index
+            ]
+
+            child_node_embedding = torch.mean(
+                torch.stack(previously_predicted_child_node_embeddings, dim=0), dim=0
+            )
+
+            canonical_child_node_type = graph.trunk_node_types[trunk_node_index]
+
+            autoencoder = self.node_autoencoders[canonical_child_node_type]
+
+            predicted_parent_node_embeddings = autoencoder.decode(child_node_embedding)
+
+            parent_node_indices = graph.trunk_node_inputs_indices[trunk_node_index]
 
     def decode_blind_autoregressive(
         self,
         graph_embedding: Tensor,
     ):
-        pass
-
-    def decode_teacher_forcing(
-        self, graph_embeddings_buffer, graph: FixedInDegreeDAGDescription
-    ) -> tuple[Tensor, Tensor]:
         pass
