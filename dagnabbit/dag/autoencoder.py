@@ -195,6 +195,10 @@ class DagnabbitAutoEncoder(nn.Module):
 
             parent_node_indices = graph.trunk_node_inputs_indices[trunk_node_index]
 
+            for embedding, index in zip(predicted_parent_node_embeddings, parent_node_indices):
+                predicted_embeddings[index].append(embedding)
+
+
     def decode_blind_autoregressive(
         self,
         graph_embedding: Tensor,
