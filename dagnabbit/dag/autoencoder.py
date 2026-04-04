@@ -6,7 +6,6 @@ from typing import Iterable
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_condenser_graph_description,
-    graft_condenser_graph_onto_primary_graph,
 )
 
 
@@ -129,24 +128,17 @@ class DagnabbitAutoEncoder(nn.Module):
 
         self.root_node_embeddings = nn.Embedding(self.num_root_nodes)
 
-    def encode(
+    def evaluate_graph(
         self,
-        primary_graph: FixedInDegreeDAGDescription,
-    ) -> tuple[Tensor, FixedInDegreeDAGDescription]:
-        if len(primary_graph.leaf_node_indices) != 1:
-            condenser_graph = make_condenser_graph_description(primary_graph)
-            graph = graft_condenser_graph_onto_primary_graph(
-                primary_graph=primary_graph, condenser_graph=condenser_graph
-            )
-        else:
-            graph = primary_graph
-
+        graph: FixedInDegreeDAGDescription,
+        root_node_embeddings: Tensor,
+    ) -> Tensor:
         trunk_node_embeddings = torch.empty(
             (graph.num_trunk_nodes, self.node_embedding_dim), dtype=torch.float32
         )
 
         embeddings_buffer = torch.cat(
-            [self.root_node_embeddings.weight, trunk_node_embeddings], dim=0
+            [root_node_embeddings, trunk_node_embeddings], dim=0
         )
 
         for i in range(graph.num_trunk_nodes):
@@ -159,10 +151,30 @@ class DagnabbitAutoEncoder(nn.Module):
 
             node_embedding = node_autoencoder.encode(parent_embeddings)
 
-            buffer_write_index = i + self.num_root_nodes
+            buffer_write_index = i + graph.num_root_nodes
             embeddings_buffer[buffer_write_index] = node_embedding
 
-        return embeddings_buffer, graph
+        return embeddings_buffer
+
+    def encode(
+        self,
+        primary_graph: FixedInDegreeDAGDescription,
+    ) -> tuple[Tensor, Tensor | None, FixedInDegreeDAGDescription | None]:
+        primary_buffer = self.evaluate_graph(
+            primary_graph, self.root_node_embeddings.weight
+        )
+
+        if len(primary_graph.leaf_node_indices) > 1:
+            condenser_graph = make_condenser_graph_description(primary_graph)
+            leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
+            condenser_buffer = self.evaluate_graph(condenser_graph, leaf_embeddings)
+            graph_embedding = condenser_buffer[-1]
+        else:
+            condenser_graph = None
+            condenser_buffer = None
+            graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
+
+        return primary_buffer, condenser_buffer, condenser_graph, graph_embedding
 
     def decode_guided_autoregressive(
         self, graph_embedding: Tensor, graph: FixedInDegreeDAGDescription
