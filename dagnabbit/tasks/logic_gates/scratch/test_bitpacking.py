@@ -136,9 +136,7 @@ def visualize_unpacked_array(unpacked: np.ndarray, shape: Tuple[int]):
         print(f"   Mean: {unpacked.mean():.2f}, Std: {unpacked.std():.2f}")
 
 
-def create_visualization_plots(
-    shape, packed: np.ndarray, unpacked: np.ndarray
-):
+def create_visualization_plots(shape, packed: np.ndarray, unpacked: np.ndarray):
     """
     Create matplotlib visualizations of the packing/unpacking process.
     """

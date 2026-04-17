@@ -126,7 +126,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.trunk_node_in_degrees = trunk_node_type_in_degrees
         self.condenser_node_in_degree = condenser_node_type_in_degree
 
-        # ---- Trunk + condenser node autoencoders (one per node type) ----
+        # ---- Trunk node autoencoders (one per node type) ----
         self.node_autoencoders: dict[int, FixedInDegreeNodeAutoEncoder] = (
             nn.ModuleList()
         )
@@ -148,6 +148,11 @@ class DagnabbitAutoEncoder(nn.Module):
             self.node_autoencoders[type_idx] = partial(
                 self.output_autoencoder.encode, output_slot_idx=output_slot_idx
             )
+
+        # ---- Condenser node autoencoder (shared across all condenser nodes) ----
+        self.condenser_node_autoencoder = FixedInDegreeNodeAutoEncoder(
+            node_embedding_dim, in_degree=condenser_node_type_in_degree
+        )
 
         # ---- Root node embeddings ----
         self.root_node_embeddings = nn.Embedding(self.num_root_nodes)
@@ -171,28 +176,24 @@ class DagnabbitAutoEncoder(nn.Module):
         # Encode
 
         primary_buffer = evaluate_graph(
-            primary_graph,
-            self.root_node_embeddings.weight,
-            self.node_autoencoders,
-            self.output_autoencoder,
-            self.output_node_embeddings,
-            self.node_embedding_dim,
+            graph=primary_graph,
+            root_node_embeddings=self.root_node_embeddings.weight,
+            node_autoencoders=self.node_autoencoders,
+            node_embedding_dim=self.node_embedding_dim, 
         )
 
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
             leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
             condenser_buffer = evaluate_graph(
-                condenser_graph,
-                leaf_embeddings,
-                self.node_autoencoders,
-                self.output_autoencoder,
-                self.output_node_embeddings,
-                self.node_embedding_dim,
+                graph=condenser_graph,
+                root_node_embeddings=leaf_embeddings,
+                node_autoencoders={0: self.condenser_node_autoencoder},
+                node_embedding_dim=self.node_embedding_dim,
             )
             graph_embedding = condenser_buffer[-1]
         else:
-            graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
+            graph_embedding = primary_buffer[-1]
 
         # Guided Autoregressive Decode
 
@@ -213,14 +214,22 @@ class DagnabbitAutoEncoder(nn.Module):
         self,
         primary_graph: FixedInDegreeDAGDescription,
     ) -> tuple[Tensor, Tensor | None, FixedInDegreeDAGDescription | None]:
-        primary_buffer = self.evaluate_graph(
-            primary_graph, self.root_node_embeddings.weight
+        primary_buffer = evaluate_graph(
+            graph=primary_graph,
+            root_node_embeddings=self.root_node_embeddings.weight,
+            node_autoencoders=self.node_autoencoders,
+            node_embedding_dim=self.node_embedding_dim,
         )
 
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
             leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
-            condenser_buffer = self.evaluate_graph(condenser_graph, leaf_embeddings)
+            condenser_buffer = evaluate_graph(
+                graph=condenser_graph,
+                root_node_embeddings=leaf_embeddings,
+                node_autoencoders={0: self.condenser_node_autoencoder},
+                node_embedding_dim=self.node_embedding_dim,
+            )
             graph_embedding = condenser_buffer[-1]
         else:
             graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
