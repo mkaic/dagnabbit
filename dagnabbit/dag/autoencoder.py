@@ -156,7 +156,30 @@ class DagnabbitAutoEncoder(nn.Module):
 
         return embeddings_buffer
 
-    def encode(
+    def training_forward(
+        self,
+        primary_graph: FixedInDegreeDAGDescription,
+    ):
+
+        # Encode
+
+        primary_buffer = self.embed_graph(primary_graph)
+
+        if len(primary_graph.leaf_node_indices) > 1:
+            condenser_graph = make_condenser_graph_description(primary_graph)
+            leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
+            condenser_buffer = self.evaluate_graph(condenser_graph, leaf_embeddings)
+            graph_embedding = condenser_buffer[-1]
+        else:
+            graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
+
+        # Guided Autoregressive Decode
+
+        
+        
+
+
+    def inference_embed_graph(
         self,
         primary_graph: FixedInDegreeDAGDescription,
     ) -> tuple[Tensor, Tensor | None, FixedInDegreeDAGDescription | None]:
@@ -170,48 +193,12 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_buffer = self.evaluate_graph(condenser_graph, leaf_embeddings)
             graph_embedding = condenser_buffer[-1]
         else:
-            condenser_graph = None
-            condenser_buffer = None
             graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
 
-        return primary_buffer, condenser_buffer, condenser_graph, graph_embedding
-
-    def decode_guided_autoregressive(
-        self, graph_embedding: Tensor, graph: FixedInDegreeDAGDescription
-    ) -> tuple[dict[int, list[Tensor]], dict[int, list[Tensor]]]:
-        assert len(graph.leaf_node_indices) == 1
-
-        predicted_embeddings: dict[int, list[Tensor]] = {
-            i: [] for i in range(graph.num_root_nodes + graph.num_trunk_nodes)
-        }
-        predicted_node_type_logits: dict[int, list[Tensor]] = {
-            i: [] for i in range(graph.num_root_nodes + graph.num_trunk_nodes)
-        }
-
-        predicted_embeddings[graph.num_trunk_nodes - 1] = [graph_embedding]
-
-        for trunk_node_index in reversed[int](range(graph.num_trunk_nodes)):
-            previously_predicted_child_node_embeddings = predicted_embeddings[
-                trunk_node_index
-            ]
-
-            child_node_embedding = torch.mean(
-                torch.stack(previously_predicted_child_node_embeddings, dim=0), dim=0
-            )
-
-            canonical_child_node_type = graph.trunk_node_types[trunk_node_index]
-
-            autoencoder = self.node_autoencoders[canonical_child_node_type]
-
-            predicted_parent_node_embeddings = autoencoder.decode(child_node_embedding)
-
-            parent_node_indices = graph.trunk_node_inputs_indices[trunk_node_index]
-
-            for embedding, index in zip(predicted_parent_node_embeddings, parent_node_indices):
-                predicted_embeddings[index].append(embedding)
+        return graph_embedding
 
 
-    def decode_blind_autoregressive(
+    def inference_decode_blind_autoregressive(
         self,
         graph_embedding: Tensor,
     ):
