@@ -8,28 +8,48 @@ class FixedInDegreeDAGDescription:
         self,
         num_root_nodes: int,
         num_trunk_nodes: int,
+        num_output_nodes: int,
         num_trunk_node_types: int,
         trunk_node_in_degrees: int | list[int],
-        trunk_node_inputs_indices: list[list[int]],
-        trunk_node_types: list[int],
+        node_inputs_indices: list[list[int]],
+        node_types: list[int],
     ):
         if isinstance(trunk_node_in_degrees, int):
             trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
 
         assert len(trunk_node_in_degrees) == num_trunk_node_types
 
-        self.trunk_node_inputs_indices = trunk_node_inputs_indices
-        self.trunk_node_types = trunk_node_types
+        self.node_inputs_indices = node_inputs_indices
+        self.node_types = node_types
         self.num_trunk_nodes = num_trunk_nodes
         self.num_root_nodes = num_root_nodes
+        self.num_output_nodes = num_output_nodes
         self.num_trunk_node_types = num_trunk_node_types
         self.trunk_node_in_degrees = trunk_node_in_degrees
+        self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
 
-        assert all(d > 0 for d in self.trunk_node_in_degrees)
-        assert len(self.trunk_node_inputs_indices) == num_trunk_nodes
-        for i, inputs in enumerate[list[int]](self.trunk_node_inputs_indices):
-            expected = self.trunk_node_in_degrees[self.trunk_node_types[i]]
-            assert len(inputs) == expected
+        # Reserved type indices that come after the trunk type indices.
+        self.root_node_type = num_trunk_node_types
+        self.output_node_type = num_trunk_node_types + 1
+        self.num_node_types = num_trunk_node_types + 2
+
+        assert len(self.node_types) == self.num_nodes
+
+        for i in range(num_root_nodes):
+            assert len(self.node_inputs_indices[i]) == 0
+            assert self.node_types[i] == self.root_node_type
+
+        for i in range(num_trunk_nodes):
+            node_idx = num_root_nodes + i
+            trunk_type = self.node_types[node_idx]
+            assert 0 <= trunk_type < num_trunk_node_types
+            expected = self.trunk_node_in_degrees[trunk_type]
+            assert len(self.node_inputs_indices[node_idx]) == expected
+
+        for i in range(num_output_nodes):
+            node_idx = num_root_nodes + num_trunk_nodes + i
+            assert len(self.node_inputs_indices[node_idx]) == 1
+            assert self.node_types[node_idx] == self.output_node_type
 
         self.leaf_node_indices = self.identify_leaf_nodes()
 
@@ -37,31 +57,31 @@ class FixedInDegreeDAGDescription:
         """
         Identify all leaf nodes in the DAG.
 
-        A leaf node is a node whose output is not referenced as an input to any other node.
-        Returns array indices of all leaf nodes as a list of integers.
+        A leaf node is a node whose output is not referenced as an input to any
+        other node. Output nodes are guaranteed to be leaves. Returns array
+        indices of all leaf nodes as a sorted list of integers.
         """
-        num_nodes = self.num_root_nodes + self.num_trunk_nodes
         referenced: set[int] = set()
-        for inputs in self.trunk_node_inputs_indices:
+        for inputs in self.node_inputs_indices:
             referenced.update(inputs)
-        return sorted(n for n in range(num_nodes) if n not in referenced)
+        return sorted(n for n in range(self.num_nodes) if n not in referenced)
 
 
 def make_random_graph_description(
     num_root_nodes: int,
     num_trunk_nodes: int,
-    trunk_node_in_degrees: list[int],
+    num_output_nodes: int,
+    trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
     """
-    Generate a random DAG where each node can reference any previous node.
-    Each node can reference up to its type's in_degree previous nodes,
-    including the same node more than once.
+    Generate a random DAG where each trunk node can reference any previous
+    node (root or trunk). Each output node is guaranteed to be a leaf and
+    has exactly one input sampled from any previously emitted node (root or
+    trunk).
     """
     if isinstance(trunk_node_in_degrees, int):
         trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
-    else:
-        trunk_node_in_degrees = trunk_node_in_degrees
 
     trunk_node_types = torch.randint(
         0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8
@@ -73,20 +93,42 @@ def make_random_graph_description(
     )
 
     noise = torch.rand(max_in_degree, num_trunk_nodes, dtype=torch.float32)
-    all_indices = (noise * max_allowed_node_indices.float()).floor().int()
+    trunk_all_indices = (noise * max_allowed_node_indices.float()).floor().int()
 
-    trunk_node_inputs_indices: list[list[int]] = []
+    node_inputs_indices: list[list[int]] = []
+
+    for _ in range(num_root_nodes):
+        node_inputs_indices.append([])
+
     for i in range(num_trunk_nodes):
         node_in_degree = trunk_node_in_degrees[trunk_node_types[i]]
-        trunk_node_inputs_indices.append(all_indices[:node_in_degree, i].tolist())
+        node_inputs_indices.append(trunk_all_indices[:node_in_degree, i].tolist())
+
+    num_candidate_inputs = num_root_nodes + num_trunk_nodes
+    if num_output_nodes > 0:
+        assert num_candidate_inputs > 0
+        output_inputs = torch.randint(
+            0, num_candidate_inputs, (num_output_nodes,), dtype=torch.int32
+        ).tolist()
+        for idx in output_inputs:
+            node_inputs_indices.append([idx])
+
+    root_node_type = num_trunk_node_types
+    output_node_type = num_trunk_node_types + 1
+    node_types: list[int] = (
+        [root_node_type] * num_root_nodes
+        + trunk_node_types
+        + [output_node_type] * num_output_nodes
+    )
 
     return FixedInDegreeDAGDescription(
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
         num_trunk_node_types=num_trunk_node_types,
         trunk_node_in_degrees=trunk_node_in_degrees,
-        trunk_node_inputs_indices=trunk_node_inputs_indices,
-        trunk_node_types=trunk_node_types,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
     )
 
 
@@ -116,53 +158,25 @@ def make_condenser_graph_description(
             leaf_node_indices.remove(input_b)
             leaf_node_indices.add(len(trunk_node_input_indices) - 1 + n_roots)
 
+    num_trunk_nodes = len(trunk_node_input_indices)
+
+    node_inputs_indices: list[list[int]] = []
+    for _ in range(n_roots):
+        node_inputs_indices.append([])
+    node_inputs_indices.extend(trunk_node_input_indices)
+
+    num_trunk_node_types = 1
+    root_node_type = num_trunk_node_types
+    node_types: list[int] = (
+        [root_node_type] * n_roots + [0] * num_trunk_nodes
+    )
+
     return FixedInDegreeDAGDescription(
         num_root_nodes=n_roots,
-        num_trunk_nodes=len(trunk_node_input_indices),
-        num_trunk_node_types=1,
-        trunk_node_inputs_indices=trunk_node_input_indices,
-        trunk_node_types=[0] * len(trunk_node_input_indices),
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=0,
+        num_trunk_node_types=num_trunk_node_types,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
         trunk_node_in_degrees=2,
-    )
-
-
-def graft_condenser_graph_onto_primary_graph(
-    primary_graph: FixedInDegreeDAGDescription,
-    condenser_graph: FixedInDegreeDAGDescription,
-) -> FixedInDegreeDAGDescription:
-    primary_total = primary_graph.num_root_nodes + primary_graph.num_trunk_nodes
-    leaf_indices = primary_graph.leaf_node_indices
-
-    remapped_condenser_indices: list[list[int]] = []
-    for inputs in condenser_graph.trunk_node_inputs_indices:
-        remapped: list[int] = []
-        for idx in inputs:
-            if idx < condenser_graph.num_root_nodes:
-                remapped.append(leaf_indices[idx])
-            else:
-                remapped.append(idx - condenser_graph.num_root_nodes + primary_total)
-        remapped_condenser_indices.append(remapped)
-
-    combined_indices = (
-        primary_graph.trunk_node_inputs_indices + remapped_condenser_indices
-    )
-
-    max_primary_type = primary_graph.trunk_node_types.max().item()
-    condenser_types = torch.full(
-        (condenser_graph.num_trunk_nodes,),
-        max_primary_type + 1,
-        dtype=torch.uint8,
-    )
-    combined_types = torch.cat([primary_graph.trunk_node_types, condenser_types])
-    combined_in_degrees = (
-        primary_graph.trunk_node_in_degrees + condenser_graph.trunk_node_in_degrees
-    )
-
-    return FixedInDegreeDAGDescription(
-        num_root_nodes=primary_graph.num_root_nodes,
-        num_trunk_nodes=primary_graph.num_trunk_nodes + condenser_graph.num_trunk_nodes,
-        num_trunk_node_types=primary_graph.num_trunk_node_types + 1,
-        trunk_node_in_degrees=combined_in_degrees,
-        trunk_node_inputs_indices=combined_indices,
-        trunk_node_types=combined_types,
     )

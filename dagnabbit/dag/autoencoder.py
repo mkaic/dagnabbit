@@ -89,6 +89,7 @@ class DagnabbitAutoEncoder(nn.Module):
         num_trunk_node_types: int,
         condenser_node_in_degree: int,
         num_root_nodes: int,
+        num_output_nodes: int,
     ):
         super().__init__()
 
@@ -106,6 +107,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.num_trunk_node_types = num_trunk_node_types + 1
 
         self.num_root_nodes = num_root_nodes
+        self.num_output_nodes = num_output_nodes
 
         self.node_autoencoders: list[FixedInDegreeNodeAutoEncoder] = nn.ModuleList()
 
@@ -115,6 +117,16 @@ class DagnabbitAutoEncoder(nn.Module):
             self.node_autoencoders.append(
                 FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
             )
+
+        # Single shared autoencoder for all output nodes. Its in_degree is 2:
+        # one slot for the output node's single graph-parent embedding, and
+        # one slot for a learnable per-output-slot embedding.
+        self.output_autoencoder = FixedInDegreeNodeAutoEncoder(
+            node_embedding_dim, in_degree=2
+        )
+        self.output_node_embeddings = nn.Embedding(
+            self.num_output_nodes, node_embedding_dim
+        )
 
         # For the purposes of this aux loss, here each input node has it's own unique "type"
         # Meaning we need to add num_root_nodes neurons to the output
@@ -133,26 +145,37 @@ class DagnabbitAutoEncoder(nn.Module):
         graph: FixedInDegreeDAGDescription,
         root_node_embeddings: Tensor,
     ) -> Tensor:
-        trunk_node_embeddings = torch.empty(
-            (graph.num_trunk_nodes, self.node_embedding_dim), dtype=torch.float32
+        assert graph.num_output_nodes <= self.num_output_nodes
+
+        embeddings_buffer = torch.empty(
+            (graph.num_nodes, self.node_embedding_dim),
+            dtype=torch.float32,
         )
+        embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
 
-        embeddings_buffer = torch.cat(
-            [root_node_embeddings, trunk_node_embeddings], dim=0
-        )
+        trunk_end = graph.num_root_nodes + graph.num_trunk_nodes
 
-        for i in range(graph.num_trunk_nodes):
-            buffer_read_indices = graph.trunk_node_inputs_indices[i]
-
-            node_type = graph.trunk_node_types[i]
-            node_autoencoder = self.node_autoencoders[node_type]
-
+        for node_idx in range(graph.num_root_nodes, graph.num_nodes):
+            buffer_read_indices = graph.node_inputs_indices[node_idx]
             parent_embeddings = embeddings_buffer[buffer_read_indices, :]
 
-            node_embedding = node_autoencoder.encode(parent_embeddings)
+            node_type = graph.node_types[node_idx]
 
-            buffer_write_index = i + graph.num_root_nodes
-            embeddings_buffer[buffer_write_index] = node_embedding
+            if node_type == graph.output_node_type:
+                # Output nodes are guaranteed leaves with a single graph-parent.
+                # The shared in-degree-2 output autoencoder combines the parent
+                # embedding with a learnable per-slot embedding.
+                output_local_idx = node_idx - trunk_end
+                slot_embedding = self.output_node_embeddings.weight[
+                    output_local_idx
+                ].unsqueeze(0)
+                node_autoencoder = self.output_autoencoder
+                encode_input = torch.cat([parent_embeddings, slot_embedding], dim=0)
+            else:
+                node_autoencoder = self.node_autoencoders[node_type]
+                encode_input = parent_embeddings
+
+            embeddings_buffer[node_idx] = node_autoencoder.encode(encode_input)
 
         return embeddings_buffer
 
@@ -175,7 +198,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # Guided Autoregressive Decode
 
-        
+
         
 
 

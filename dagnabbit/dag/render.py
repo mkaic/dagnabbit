@@ -25,6 +25,8 @@ ROOT_COLOR = "#d3d3d3"
 ROOT_FONT_COLOR = "#333333"
 LEAF_COLOR = "#2ecc71"
 LEAF_FONT_COLOR = "#ffffff"
+OUTPUT_COLOR = "#e74c3c"
+OUTPUT_FONT_COLOR = "#ffffff"
 EDGE_COLOR = "#888888"
 BG_COLOR = "#ffffff"
 
@@ -86,7 +88,10 @@ def render_dag(
 
     for i in range(dag.num_trunk_nodes):
         global_idx = i + dag.num_root_nodes
-        node_type = dag.trunk_node_types[i].item()
+        node_type_raw = dag.node_types[global_idx]
+        node_type = (
+            node_type_raw.item() if hasattr(node_type_raw, "item") else node_type_raw
+        )
 
         if global_idx in leaf_set:
             dot.node(
@@ -106,9 +111,20 @@ def render_dag(
                 fontcolor="white",
             )
 
-    for i in range(dag.num_trunk_nodes):
-        target = i + dag.num_root_nodes
-        for source in dag.trunk_node_inputs_indices[i]:
+    with dot.subgraph() as outputs:
+        outputs.attr(rank="max")
+        for i in range(dag.num_output_nodes):
+            global_idx = dag.num_root_nodes + dag.num_trunk_nodes + i
+            outputs.node(
+                str(global_idx),
+                label=f"O{i}",
+                shape="doublecircle",
+                fillcolor=OUTPUT_COLOR,
+                fontcolor=OUTPUT_FONT_COLOR,
+            )
+
+    for target in range(dag.num_nodes):
+        for source in dag.node_inputs_indices[target]:
             dot.edge(str(source), str(target))
 
     rendered_path = dot.render(output_path, format=fmt, cleanup=True)
