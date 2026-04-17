@@ -5,6 +5,7 @@ from dagnabbit.dag.description import (
 )
 from dagnabbit.dag.render import render_dag
 
+
 def graft_condenser_graph_onto_primary_graph(
     primary_graph: FixedInDegreeDAGDescription,
     condenser_graph: FixedInDegreeDAGDescription,
@@ -53,9 +54,10 @@ def graft_condenser_graph_onto_primary_graph(
     condenser_trunk_type = num_primary_trunk_types + 1
     grafted_num_trunk_node_types = num_primary_trunk_types + 2
 
-    grafted_trunk_in_degrees: list[int] = (
-        list(primary_graph.trunk_node_in_degrees) + [1, 2]
-    )
+    grafted_trunk_in_degrees: list[int] = list(primary_graph.trunk_node_in_degrees) + [
+        1,
+        2,
+    ]
 
     root_types_start = grafted_num_trunk_node_types
     output_types_start = grafted_num_trunk_node_types + n_root
@@ -104,7 +106,6 @@ def graft_condenser_graph_onto_primary_graph(
         node_inputs_indices=node_inputs_indices,
         node_types=node_types,
     )
-
 
 
 def main():

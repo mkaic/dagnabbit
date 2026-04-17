@@ -1,4 +1,4 @@
-from torch.optim import Adam, AdamW, SGD, RMSprop
+from torch.optim import RMSprop
 
 IMAGE_PATH = "test_images/branos.png"
 RESIZE = 64

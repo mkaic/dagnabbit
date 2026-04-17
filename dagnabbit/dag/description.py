@@ -1,6 +1,4 @@
 import torch
-from jaxtyping import UInt8
-from torch import Tensor
 
 
 class FixedInDegreeDAGDescription:
@@ -35,9 +33,7 @@ class FixedInDegreeDAGDescription:
         #   [output_node_types_start, num_node_types)                    -> one type per output slot
         self.root_node_types_start = num_trunk_node_types
         self.output_node_types_start = num_trunk_node_types + num_root_nodes
-        self.num_node_types = (
-            num_trunk_node_types + num_root_nodes + num_output_nodes
-        )
+        self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
 
         assert len(self.node_types) == self.num_nodes
 
@@ -173,10 +169,9 @@ def make_condenser_graph_description(
 
     num_trunk_node_types = 1
     root_node_types_start = num_trunk_node_types
-    node_types: list[int] = (
-        [root_node_types_start + i for i in range(n_roots)]
-        + [0] * num_trunk_nodes
-    )
+    node_types: list[int] = [root_node_types_start + i for i in range(n_roots)] + [
+        0
+    ] * num_trunk_nodes
 
     return FixedInDegreeDAGDescription(
         num_root_nodes=n_roots,
