@@ -137,7 +137,7 @@ def visualize_unpacked_array(unpacked: np.ndarray, shape: Tuple[int]):
 
 
 def create_visualization_plots(
-    shape: Tuple[int], packed: np.ndarray, unpacked: np.ndarray
+    shape, packed: np.ndarray, unpacked: np.ndarray
 ):
     """
     Create matplotlib visualizations of the packing/unpacking process.
