@@ -153,21 +153,21 @@ class DagnabbitAutoEncoder(nn.Module):
         )
         embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
 
-        trunk_end = graph.num_root_nodes + graph.num_trunk_nodes
-
         for node_idx in range(graph.num_root_nodes, graph.num_nodes):
             buffer_read_indices = graph.node_inputs_indices[node_idx]
             parent_embeddings = embeddings_buffer[buffer_read_indices, :]
 
             node_type = graph.node_types[node_idx]
 
-            if node_type == graph.output_node_type:
+            if node_type >= graph.output_node_types_start:
                 # Output nodes are guaranteed leaves with a single graph-parent.
-                # The shared in-degree-2 output autoencoder combines the parent
-                # embedding with a learnable per-slot embedding.
-                output_local_idx = node_idx - trunk_end
+                # Every output slot has its own unique type index, so the slot
+                # identity is derived from the node type. All output nodes
+                # share a single in-degree-2 autoencoder that combines the
+                # parent embedding with a learnable per-slot embedding.
+                output_slot_idx = node_type - graph.output_node_types_start
                 slot_embedding = self.output_node_embeddings.weight[
-                    output_local_idx
+                    output_slot_idx
                 ].unsqueeze(0)
                 node_autoencoder = self.output_autoencoder
                 encode_input = torch.cat([parent_embeddings, slot_embedding], dim=0)
@@ -186,7 +186,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # Encode
 
-        primary_buffer = self.embed_graph(primary_graph)
+        primary_buffer = self.evaluate_graph(primary_graph, self.root_node_embeddings.weight)
 
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
@@ -198,8 +198,13 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # Guided Autoregressive Decode
 
+        condenser_decode_buffer = [{'predicted_node_type': None, 'predicted_parent_embeddings': [], } for _ in range(condenser_graph.num_nodes)]
 
-        
+        condenser_decode_buffer[-1] = graph_embedding
+
+        for node_idx in reversed(range(condenser_graph.num_nodes)):
+            pass
+
 
 
     def inference_embed_graph(

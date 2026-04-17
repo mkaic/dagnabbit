@@ -28,16 +28,22 @@ class FixedInDegreeDAGDescription:
         self.trunk_node_in_degrees = trunk_node_in_degrees
         self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
 
-        # Reserved type indices that come after the trunk type indices.
-        self.root_node_type = num_trunk_node_types
-        self.output_node_type = num_trunk_node_types + 1
-        self.num_node_types = num_trunk_node_types + 2
+        # Each root and output gets its own unique type index, laid out in a
+        # single type-index space immediately after the trunk types:
+        #   [0, num_trunk_node_types)                                    -> trunk types
+        #   [root_node_types_start, output_node_types_start)             -> one type per root slot
+        #   [output_node_types_start, num_node_types)                    -> one type per output slot
+        self.root_node_types_start = num_trunk_node_types
+        self.output_node_types_start = num_trunk_node_types + num_root_nodes
+        self.num_node_types = (
+            num_trunk_node_types + num_root_nodes + num_output_nodes
+        )
 
         assert len(self.node_types) == self.num_nodes
 
         for i in range(num_root_nodes):
             assert len(self.node_inputs_indices[i]) == 0
-            assert self.node_types[i] == self.root_node_type
+            assert self.node_types[i] == self.root_node_types_start + i
 
         for i in range(num_trunk_nodes):
             node_idx = num_root_nodes + i
@@ -49,7 +55,7 @@ class FixedInDegreeDAGDescription:
         for i in range(num_output_nodes):
             node_idx = num_root_nodes + num_trunk_nodes + i
             assert len(self.node_inputs_indices[node_idx]) == 1
-            assert self.node_types[node_idx] == self.output_node_type
+            assert self.node_types[node_idx] == self.output_node_types_start + i
 
         self.leaf_node_indices = self.identify_leaf_nodes()
 
@@ -113,12 +119,12 @@ def make_random_graph_description(
         for idx in output_inputs:
             node_inputs_indices.append([idx])
 
-    root_node_type = num_trunk_node_types
-    output_node_type = num_trunk_node_types + 1
+    root_node_types_start = num_trunk_node_types
+    output_node_types_start = num_trunk_node_types + num_root_nodes
     node_types: list[int] = (
-        [root_node_type] * num_root_nodes
+        [root_node_types_start + i for i in range(num_root_nodes)]
         + trunk_node_types
-        + [output_node_type] * num_output_nodes
+        + [output_node_types_start + i for i in range(num_output_nodes)]
     )
 
     return FixedInDegreeDAGDescription(
@@ -166,9 +172,10 @@ def make_condenser_graph_description(
     node_inputs_indices.extend(trunk_node_input_indices)
 
     num_trunk_node_types = 1
-    root_node_type = num_trunk_node_types
+    root_node_types_start = num_trunk_node_types
     node_types: list[int] = (
-        [root_node_type] * n_roots + [0] * num_trunk_nodes
+        [root_node_types_start + i for i in range(n_roots)]
+        + [0] * num_trunk_nodes
     )
 
     return FixedInDegreeDAGDescription(
