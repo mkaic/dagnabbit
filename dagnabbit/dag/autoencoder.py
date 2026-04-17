@@ -168,6 +168,34 @@ class DagnabbitAutoEncoder(nn.Module):
             ]
         )
 
+    @staticmethod
+    def evaluate_graph(
+        graph: FixedInDegreeDAGDescription,
+        root_node_embeddings: Tensor,
+        node_autoencoders: dict[int, Callable[[Tensor], Tensor]],
+        node_embedding_dim: int,
+    ) -> Tensor:
+        assert graph.num_output_nodes <= graph.num_output_nodes
+
+        embeddings_buffer = torch.empty(
+            (graph.num_nodes, node_embedding_dim),
+            dtype=torch.float32,
+        )
+        embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
+
+        for node_idx in range(graph.num_root_nodes, graph.num_nodes):
+            buffer_read_indices = graph.node_inputs_indices[node_idx]
+            parent_embeddings = embeddings_buffer[buffer_read_indices, :]
+
+            node_type = graph.node_types[node_idx]
+
+            node_autoencoder = node_autoencoders[node_type]
+
+            embeddings_buffer[node_idx] = node_autoencoder.encode(parent_embeddings)
+
+        return embeddings_buffer
+
+
     def training_forward(
         self,
         primary_graph: FixedInDegreeDAGDescription,
@@ -175,7 +203,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # Encode
 
-        primary_buffer = evaluate_graph(
+        primary_buffer = self.evaluate_graph(
             graph=primary_graph,
             root_node_embeddings=self.root_node_embeddings.weight,
             node_autoencoders=self.node_autoencoders,
@@ -185,7 +213,7 @@ class DagnabbitAutoEncoder(nn.Module):
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
             leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
-            condenser_buffer = evaluate_graph(
+            condenser_buffer = self.evaluate_graph(
                 graph=condenser_graph,
                 root_node_embeddings=leaf_embeddings,
                 node_autoencoders={0: self.condenser_node_autoencoder},
@@ -214,7 +242,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self,
         primary_graph: FixedInDegreeDAGDescription,
     ) -> tuple[Tensor, Tensor | None, FixedInDegreeDAGDescription | None]:
-        primary_buffer = evaluate_graph(
+        primary_buffer = self.evaluate_graph(
             graph=primary_graph,
             root_node_embeddings=self.root_node_embeddings.weight,
             node_autoencoders=self.node_autoencoders,
@@ -224,7 +252,7 @@ class DagnabbitAutoEncoder(nn.Module):
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
             leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
-            condenser_buffer = evaluate_graph(
+            condenser_buffer = self.evaluate_graph(
                 graph=condenser_graph,
                 root_node_embeddings=leaf_embeddings,
                 node_autoencoders={0: self.condenser_node_autoencoder},
@@ -241,30 +269,3 @@ class DagnabbitAutoEncoder(nn.Module):
         graph_embedding: Tensor,
     ):
         pass
-
-
-def evaluate_graph(
-    graph: FixedInDegreeDAGDescription,
-    root_node_embeddings: Tensor,
-    node_autoencoders: list[Callable[[Tensor], Tensor]],
-    node_embedding_dim: int,
-) -> Tensor:
-    assert graph.num_output_nodes <= graph.num_output_nodes
-
-    embeddings_buffer = torch.empty(
-        (graph.num_nodes, node_embedding_dim),
-        dtype=torch.float32,
-    )
-    embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
-
-    for node_idx in range(graph.num_root_nodes, graph.num_nodes):
-        buffer_read_indices = graph.node_inputs_indices[node_idx]
-        parent_embeddings = embeddings_buffer[buffer_read_indices, :]
-
-        node_type = graph.node_types[node_idx]
-
-        node_autoencoder = node_autoencoders[node_type]
-
-        embeddings_buffer[node_idx] = node_autoencoder.encode(parent_embeddings)
-
-    return embeddings_buffer
