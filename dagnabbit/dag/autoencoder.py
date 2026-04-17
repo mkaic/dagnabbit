@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor
 import torch.nn as nn
-from typing import Iterable
-
+from typing import Iterable, Callable, Optional
+from functools import partial
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_condenser_graph_description,
@@ -81,103 +81,83 @@ class FixedInDegreeNodeAutoEncoder(nn.Module):
         return self.decoder(node_embedding)
 
 
+class OutputNodeAutoEncoder(nn.Module):
+    def __init__(self, node_embedding_dim: int, num_output_nodes: int):
+        super().__init__()
+        self.node_embedding_dim = node_embedding_dim
+        self.encoder = NodeEncoder(node_embedding_dim, in_degree=2)
+        self.decoder = NodeDecoder(node_embedding_dim, in_degree=1)
+        self.output_node_embeddings = nn.Embedding(num_output_nodes, node_embedding_dim)
+
+    def encode(self, input_node_embeddings: Tensor, output_slot_idx: int) -> Tensor:
+
+        output_slot_embedding = self.output_node_embeddings.weight[output_slot_idx]
+        x = torch.cat([input_node_embeddings, output_slot_embedding], dim=0)
+        
+        return self.encoder(x)
+
+
+    def decode(self, node_embedding: Tensor) -> Tensor:
+
+        return self.decoder(node_embedding)
+
+
 class DagnabbitAutoEncoder(nn.Module):
     def __init__(
         self,
         node_embedding_dim: int,
-        trunk_node_in_degrees: int | list[int],
+        trunk_node_type_in_degrees: int | list[int],
         num_trunk_node_types: int,
-        condenser_node_in_degree: int,
+        condenser_node_type_in_degree: int,
         num_root_nodes: int,
         num_output_nodes: int,
     ):
         super().__init__()
 
+        if isinstance(trunk_node_type_in_degrees, int):
+            trunk_node_type_in_degrees = [trunk_node_type_in_degrees] * num_trunk_node_types
+        assert len(trunk_node_type_in_degrees) == num_trunk_node_types
+
         self.node_embedding_dim = node_embedding_dim
-
-        if isinstance(trunk_node_in_degrees, int):
-            trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
-        else:
-            trunk_node_in_degrees = trunk_node_in_degrees
-
-        assert len(trunk_node_in_degrees) == num_trunk_node_types
-
-        self.trunk_node_in_degrees = trunk_node_in_degrees + [condenser_node_in_degree]
-
-        self.num_trunk_node_types = num_trunk_node_types + 1
-
+        self.num_trunk_node_types = num_trunk_node_types
         self.num_root_nodes = num_root_nodes
         self.num_output_nodes = num_output_nodes
+        self.trunk_node_in_degrees = trunk_node_type_in_degrees
+        self.condenser_node_in_degree = condenser_node_type_in_degree
 
-        self.node_autoencoders: list[FixedInDegreeNodeAutoEncoder] = nn.ModuleList()
-
-        for node_type_idx, in_degree in zip[tuple[int, int]](
+        # ---- Trunk + condenser node autoencoders (one per node type) ----
+        self.node_autoencoders: dict[int, FixedInDegreeNodeAutoEncoder] = nn.ModuleList()
+        for node_type_idx, in_degree in (
             range(num_trunk_node_types), self.trunk_node_in_degrees
-        ):  # +1 for condenser nodes
-            self.node_autoencoders.append(
+        ):
+            self.node_autoencoders[node_type_idx] = (
                 FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
             )
 
-        # Single shared autoencoder for all output nodes. Its in_degree is 2:
-        # one slot for the output node's single graph-parent embedding, and
-        # one slot for a learnable per-output-slot embedding.
-        self.output_autoencoder = FixedInDegreeNodeAutoEncoder(
+        # ---- Output autoencoder (shared across all output slots) ----
+        # in_degree is 2: one slot for the output node's single graph-parent
+        # embedding, and one slot for a learnable per-output-slot embedding.
+        self.output_autoencoder = OutputNodeAutoEncoder(
             node_embedding_dim, in_degree=2
         )
-        self.output_node_embeddings = nn.Embedding(
-            self.num_output_nodes, node_embedding_dim
-        )
 
-        # For the purposes of this aux loss, here each input node has it's own unique "type"
-        # Meaning we need to add num_root_nodes neurons to the output
+        for output_slot_idx in range(num_output_nodes):
+            type_idx = output_slot_idx + num_trunk_node_types + num_root_nodes
+            self.node_autoencoders[type_idx] = partial(self.output_autoencoder.encode, output_slot_idx=output_slot_idx)
+
+        # ---- Root node embeddings ----
+        self.root_node_embeddings = nn.Embedding(self.num_root_nodes)
+
+        # ---- Auxiliary node-type prediction head ----
+        # For the purposes of this aux loss, each root node has its own unique
+        # "type", so num_root_nodes extra output neurons are appended.
         self.node_type_predictor = MLP(
             [
                 self.node_embedding_dim,
                 self.node_embedding_dim * 2,
-                self.num_trunk_node_types + self.num_root_nodes,
+                self.num_node_types,
             ]
         )
-
-        self.root_node_embeddings = nn.Embedding(self.num_root_nodes)
-
-    def evaluate_graph(
-        self,
-        graph: FixedInDegreeDAGDescription,
-        root_node_embeddings: Tensor,
-    ) -> Tensor:
-        assert graph.num_output_nodes <= self.num_output_nodes
-
-        embeddings_buffer = torch.empty(
-            (graph.num_nodes, self.node_embedding_dim),
-            dtype=torch.float32,
-        )
-        embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
-
-        for node_idx in range(graph.num_root_nodes, graph.num_nodes):
-            buffer_read_indices = graph.node_inputs_indices[node_idx]
-            parent_embeddings = embeddings_buffer[buffer_read_indices, :]
-
-            node_type = graph.node_types[node_idx]
-
-            if node_type >= graph.output_node_types_start:
-                # Output nodes are guaranteed leaves with a single graph-parent.
-                # Every output slot has its own unique type index, so the slot
-                # identity is derived from the node type. All output nodes
-                # share a single in-degree-2 autoencoder that combines the
-                # parent embedding with a learnable per-slot embedding.
-                output_slot_idx = node_type - graph.output_node_types_start
-                slot_embedding = self.output_node_embeddings.weight[
-                    output_slot_idx
-                ].unsqueeze(0)
-                node_autoencoder = self.output_autoencoder
-                encode_input = torch.cat([parent_embeddings, slot_embedding], dim=0)
-            else:
-                node_autoencoder = self.node_autoencoders[node_type]
-                encode_input = parent_embeddings
-
-            embeddings_buffer[node_idx] = node_autoencoder.encode(encode_input)
-
-        return embeddings_buffer
 
     def training_forward(
         self,
@@ -186,12 +166,12 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # Encode
 
-        primary_buffer = self.evaluate_graph(primary_graph, self.root_node_embeddings.weight)
+        primary_buffer = evaluate_graph(primary_graph, self.root_node_embeddings.weight, self.node_autoencoders, self.output_autoencoder, self.output_node_embeddings, self.node_embedding_dim)
 
         if len(primary_graph.leaf_node_indices) > 1:
             condenser_graph = make_condenser_graph_description(primary_graph)
             leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
-            condenser_buffer = self.evaluate_graph(condenser_graph, leaf_embeddings)
+            condenser_buffer = evaluate_graph(condenser_graph, leaf_embeddings, self.node_autoencoders, self.output_autoencoder, self.output_node_embeddings, self.node_embedding_dim)
             graph_embedding = condenser_buffer[-1]
         else:
             graph_embedding = primary_buffer[primary_graph.leaf_node_indices]
@@ -231,3 +211,30 @@ class DagnabbitAutoEncoder(nn.Module):
         graph_embedding: Tensor,
     ):
         pass
+
+
+def evaluate_graph(
+    graph: FixedInDegreeDAGDescription,
+    root_node_embeddings: Tensor,
+    node_autoencoders: list[Callable[[Tensor], Tensor]],
+    node_embedding_dim: int,
+) -> Tensor:
+    assert graph.num_output_nodes <= graph.num_output_nodes
+
+    embeddings_buffer = torch.empty(
+        (graph.num_nodes, node_embedding_dim),
+        dtype=torch.float32,
+    )
+    embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
+
+    for node_idx in range(graph.num_root_nodes, graph.num_nodes):
+        buffer_read_indices = graph.node_inputs_indices[node_idx]
+        parent_embeddings = embeddings_buffer[buffer_read_indices, :]
+
+        node_type = graph.node_types[node_idx]
+
+        node_autoencoder = node_autoencoders[node_type]
+
+        embeddings_buffer[node_idx] = node_autoencoder.encode(parent_embeddings)
+
+    return embeddings_buffer
