@@ -1,5 +1,6 @@
 import torch
 
+NodeInputIndices = list[int]
 
 class FixedInDegreeDAGDescription:
     def __init__(
@@ -136,12 +137,13 @@ def make_random_graph_description(
 
 def make_condenser_graph_description(
     primary_graph: FixedInDegreeDAGDescription,
-) -> FixedInDegreeDAGDescription | None:
+) -> FixedInDegreeDAGDescription:
     n_roots = len(primary_graph.leaf_node_indices)
-    if n_roots == 1:
-        return None
+    assert n_roots > 1, (
+        "condenser graph requires more than one leaf in the primary graph"
+    )
 
-    trunk_node_input_indices: list[list[int]] = []
+    trunk_node_input_indices: list[NodeInputIndices] = []
     leaf_node_indices: set[int] = set(range(n_roots))
 
     while len(leaf_node_indices) > 1:
@@ -162,7 +164,7 @@ def make_condenser_graph_description(
 
     num_trunk_nodes = len(trunk_node_input_indices)
 
-    node_inputs_indices: list[list[int]] = []
+    node_inputs_indices: list[NodeInputIndices] = []
     for _ in range(n_roots):
         node_inputs_indices.append([])
     node_inputs_indices.extend(trunk_node_input_indices)

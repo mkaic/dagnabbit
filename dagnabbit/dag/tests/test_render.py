@@ -121,14 +121,10 @@ def main():
     print(f"Rendered primary graph to {output}")
 
     condenser = make_condenser_graph_description(primary)
-    if condenser is not None:
-        output = render_dag(condenser, output_path="dag_condenser", fmt="png")
-        print(f"Rendered condenser graph to {output}")
+    output = render_dag(condenser, output_path="dag_condenser", fmt="png")
+    print(f"Rendered condenser graph to {output}")
 
-        dag = graft_condenser_graph_onto_primary_graph(primary, condenser)
-    else:
-        dag = primary
-
+    dag = graft_condenser_graph_onto_primary_graph(primary, condenser)
     output = render_dag(dag, output_path="dag_render", fmt="png")
     print(f"Rendered combined DAG to {output}")
 
