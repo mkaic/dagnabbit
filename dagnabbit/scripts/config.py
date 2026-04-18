@@ -1,23 +1,27 @@
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 4
 CONDENSER_NODE_TYPE_IN_DEGREE = 2
-NUM_ROOT_NODES = 8
-NUM_OUTPUT_NODES = 8
+NUM_ROOT_NODES = 4
+NUM_OUTPUT_NODES = 4
+# Number of hidden layers in every MLP (encoders, decoders, type predictor).
+MLP_DEPTH = 2
+# Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
+MLP_EXPANSION_FACTOR = 2.0
 
 # --- DAG sampling ---
-NUM_TRUNK_NODES = 32
+NUM_TRUNK_NODES = 128
 
 # --- training ---
 NUM_STEPS = 10_000
 LEARNING_RATE = 1e-3
-LOG_EVERY = 100
+LOG_EVERY = 10
 DEVICE = "cpu"
 SEED = 0
 
 # --- loss weights ---
-W_CONDENSER_CLASSIFICATION = 0.5
+W_CONDENSER_CLASSIFICATION = 0.1
 W_CONDENSER_SIMILARITY = 0.1
 W_PRIMARY_CLASSIFICATION = 1.0
 W_PRIMARY_SIMILARITY = 0.1

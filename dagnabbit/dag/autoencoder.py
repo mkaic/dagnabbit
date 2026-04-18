@@ -31,13 +31,39 @@ class MLP(nn.Module):
         return x
 
 
+def _mlp_dims(
+    in_dim: int,
+    out_dim: int,
+    mlp_depth: int,
+    mlp_expansion_factor: float,
+) -> list[int]:
+    """Build an MLP layer-size list with ``mlp_depth`` hidden layers between
+    ``in_dim`` and ``out_dim``. Each hidden layer's width is
+    ``round(in_dim * mlp_expansion_factor)`` (and at least 1)."""
+    assert mlp_depth >= 0
+    assert mlp_expansion_factor > 0
+    hidden_width = max(1, round(in_dim * mlp_expansion_factor))
+    return [in_dim] + [hidden_width] * mlp_depth + [out_dim]
+
+
 class NodeEncoder(nn.Module):
-    def __init__(self, node_embedding_dim: int, in_degree: int):
+    def __init__(
+        self,
+        node_embedding_dim: int,
+        in_degree: int,
+        mlp_depth: int,
+        mlp_expansion_factor: float,
+    ):
         super().__init__()
         self.node_embedding_dim = node_embedding_dim
         self.in_degree = in_degree
         self.encoder = MLP(
-            [node_embedding_dim * in_degree, node_embedding_dim * 2, node_embedding_dim]
+            _mlp_dims(
+                node_embedding_dim * in_degree,
+                node_embedding_dim,
+                mlp_depth,
+                mlp_expansion_factor,
+            )
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -48,12 +74,23 @@ class NodeEncoder(nn.Module):
 
 
 class NodeDecoder(nn.Module):
-    def __init__(self, node_embedding_dim: int, in_degree: int):
+    def __init__(
+        self,
+        node_embedding_dim: int,
+        in_degree: int,
+        mlp_depth: int,
+        mlp_expansion_factor: float,
+    ):
         super().__init__()
         self.node_embedding_dim = node_embedding_dim
         self.in_degree = in_degree
         self.decoder = MLP(
-            [node_embedding_dim, node_embedding_dim * 2, node_embedding_dim * in_degree]
+            _mlp_dims(
+                node_embedding_dim,
+                node_embedding_dim * in_degree,
+                mlp_depth,
+                mlp_expansion_factor,
+            )
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -80,13 +117,23 @@ class NodeAutoEncoder(nn.Module):
 
 
 class FixedInDegreeNodeAutoEncoder(NodeAutoEncoder):
-    def __init__(self, node_embedding_dim: int, in_degree):
+    def __init__(
+        self,
+        node_embedding_dim: int,
+        in_degree,
+        mlp_depth: int,
+        mlp_expansion_factor: float,
+    ):
         super().__init__()
 
         self.node_embedding_dim = node_embedding_dim
 
-        self.encoder = NodeEncoder(node_embedding_dim, in_degree)
-        self.decoder = NodeDecoder(node_embedding_dim, in_degree)
+        self.encoder = NodeEncoder(
+            node_embedding_dim, in_degree, mlp_depth, mlp_expansion_factor
+        )
+        self.decoder = NodeDecoder(
+            node_embedding_dim, in_degree, mlp_depth, mlp_expansion_factor
+        )
 
     def encode(
         self,
@@ -107,12 +154,24 @@ class OutputNodeAutoEncoder(NodeAutoEncoder):
         node_embedding_dim: int,
         num_output_nodes: int,
         output_node_types_start: int,
+        mlp_depth: int,
+        mlp_expansion_factor: float,
     ):
         super().__init__()
         self.node_embedding_dim = node_embedding_dim
         self.output_node_types_start = output_node_types_start
-        self.encoder = NodeEncoder(node_embedding_dim, in_degree=2)
-        self.decoder = NodeDecoder(node_embedding_dim, in_degree=1)
+        self.encoder = NodeEncoder(
+            node_embedding_dim,
+            in_degree=2,
+            mlp_depth=mlp_depth,
+            mlp_expansion_factor=mlp_expansion_factor,
+        )
+        self.decoder = NodeDecoder(
+            node_embedding_dim,
+            in_degree=1,
+            mlp_depth=mlp_depth,
+            mlp_expansion_factor=mlp_expansion_factor,
+        )
         self.output_node_embeddings = nn.Embedding(num_output_nodes, node_embedding_dim)
 
     def encode(self, input_node_embeddings: Tensor, node_type: int) -> Tensor:
@@ -137,6 +196,7 @@ class TrainingDecodeBufferEntry:
     embeddings_predicted_by_children: list[Tensor]
     classification_loss: Tensor | None
     child_predicted_embeddings_similarity_loss: Tensor | None
+    predicted_type_logits: Tensor | None
 
 
 @dataclass
@@ -145,6 +205,13 @@ class TrainingStepLossReturnType:
     condenser_node_predicted_embeddings_similarity_losses: list[Tensor]
     primary_node_classification_losses: list[Tensor]
     primary_node_predicted_embeddings_similarity_losses: list[Tensor]
+    # Raw per-node logits and true type labels for downstream diagnostics
+    # (e.g. per-node-type classification AUCs). One entry per classified node,
+    # in the same order as the corresponding *_classification_losses lists.
+    condenser_node_predicted_type_logits: list[Tensor]
+    condenser_node_true_types: list[int]
+    primary_node_predicted_type_logits: list[Tensor]
+    primary_node_true_types: list[int]
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -156,6 +223,8 @@ class DagnabbitAutoEncoder(nn.Module):
         condenser_node_type_in_degree: int,
         num_root_nodes: int,
         num_output_nodes: int,
+        mlp_depth: int,
+        mlp_expansion_factor: float,
     ):
         super().__init__()
 
@@ -172,11 +241,18 @@ class DagnabbitAutoEncoder(nn.Module):
         self.trunk_node_in_degrees = trunk_node_type_in_degrees
         self.condenser_node_in_degree = condenser_node_type_in_degree
         self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
+        self.mlp_depth = mlp_depth
+        self.mlp_expansion_factor = mlp_expansion_factor
 
         # ---- Trunk node autoencoders (one per node type) ----
         self.trunk_node_autoencoders = nn.ModuleList(
             [
-                FixedInDegreeNodeAutoEncoder(node_embedding_dim, in_degree)
+                FixedInDegreeNodeAutoEncoder(
+                    node_embedding_dim,
+                    in_degree,
+                    mlp_depth=mlp_depth,
+                    mlp_expansion_factor=mlp_expansion_factor,
+                )
                 for in_degree in self.trunk_node_in_degrees
             ]
         )
@@ -191,11 +267,16 @@ class DagnabbitAutoEncoder(nn.Module):
             node_embedding_dim,
             num_output_nodes=num_output_nodes,
             output_node_types_start=output_node_types_start,
+            mlp_depth=mlp_depth,
+            mlp_expansion_factor=mlp_expansion_factor,
         )
 
         # ---- Condenser node autoencoder (shared across all condenser nodes) ----
         self.condenser_node_autoencoder = FixedInDegreeNodeAutoEncoder(
-            node_embedding_dim, in_degree=condenser_node_type_in_degree
+            node_embedding_dim,
+            in_degree=condenser_node_type_in_degree,
+            mlp_depth=mlp_depth,
+            mlp_expansion_factor=mlp_expansion_factor,
         )
 
         # ---- Root node embeddings ----
@@ -219,11 +300,12 @@ class DagnabbitAutoEncoder(nn.Module):
         # For the purposes of this aux loss, each root node has its own unique
         # "type", so num_root_nodes extra output neurons are appended.
         self.node_type_predictor = MLP(
-            [
-                self.node_embedding_dim,
-                self.node_embedding_dim * 2,
-                self.num_node_types,
-            ]
+            _mlp_dims(
+                in_dim=self.node_embedding_dim,
+                out_dim=self.num_node_types,
+                mlp_depth=mlp_depth,
+                mlp_expansion_factor=mlp_expansion_factor,
+            )
         )
 
     @staticmethod
@@ -300,6 +382,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 embeddings_predicted_by_children=[],
                 child_predicted_embeddings_similarity_loss=None,
                 classification_loss=None,
+                predicted_type_logits=None,
             )
             for _ in range(condenser_graph.num_nodes)
         ]
@@ -310,6 +393,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph_embedding, dim=0
             ),
             classification_loss=None,
+            predicted_type_logits=None,
         )
 
         for node_idx in reversed(
@@ -333,6 +417,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 embeddings_predicted_by_children=[],
                 child_predicted_embeddings_similarity_loss=None,
                 classification_loss=None,
+                predicted_type_logits=None,
             )
             for _ in range(primary_graph.num_nodes)
         ]
@@ -357,6 +442,10 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_graph.num_root_nodes :
         ]
 
+        condenser_trunk_true_types = condenser_graph.node_types[
+            condenser_graph.num_root_nodes :
+        ]
+
         return TrainingStepLossReturnType(
             condenser_node_classification_losses=[
                 e.classification_loss for e in condenser_trunk_entries
@@ -372,6 +461,14 @@ class DagnabbitAutoEncoder(nn.Module):
                 e.child_predicted_embeddings_similarity_loss
                 for e in primary_decode_buffer
             ],
+            condenser_node_predicted_type_logits=[
+                e.predicted_type_logits for e in condenser_trunk_entries
+            ],
+            condenser_node_true_types=list(condenser_trunk_true_types),
+            primary_node_predicted_type_logits=[
+                e.predicted_type_logits for e in primary_decode_buffer
+            ],
+            primary_node_true_types=list(primary_graph.node_types),
         )
 
     def _decode_step(
@@ -397,6 +494,7 @@ class DagnabbitAutoEncoder(nn.Module):
         predicted_type_logits: Tensor = self.node_type_predictor(
             average_predicted_embeddings
         )
+        decode_buffer_entry.predicted_type_logits = predicted_type_logits
 
         decode_buffer_entry.classification_loss = F.cross_entropy(
             predicted_type_logits,
