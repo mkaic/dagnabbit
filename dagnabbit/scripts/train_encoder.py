@@ -13,15 +13,27 @@ def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     cc_mean = torch.stack(losses.condenser_node_classification_losses).mean()
-    cs_mean = torch.stack(losses.condenser_node_predicted_embeddings_similarity_losses).mean()
+    cs_mean = torch.stack(
+        losses.condenser_node_predicted_embeddings_similarity_losses
+    ).mean()
     pc_mean = torch.stack(losses.primary_node_classification_losses).mean()
-    ps_mean = torch.stack(losses.primary_node_predicted_embeddings_similarity_losses).mean()
+    ps_mean = torch.stack(
+        losses.primary_node_predicted_embeddings_similarity_losses
+    ).mean()
+    cm_mean = torch.stack(losses.condenser_node_encoded_vs_decoded_mse_losses).mean()
+    pm_mean = torch.stack(losses.primary_node_encoded_vs_decoded_mse_losses).mean()
+    cec_mean = torch.stack(losses.condenser_node_encoded_classification_losses).mean()
+    pec_mean = torch.stack(losses.primary_node_encoded_classification_losses).mean()
 
     total = (
-        cfg.W_CONDENSER_CLASSIFICATION * cc_mean
-        + cfg.W_CONDENSER_SIMILARITY * cs_mean
-        + cfg.W_PRIMARY_CLASSIFICATION * pc_mean
-        + cfg.W_PRIMARY_SIMILARITY * ps_mean
+        cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean
+        + cfg.W_CONDENSER_DECODED_SIMILARITY * cs_mean
+        + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
+        + cfg.W_PRIMARY_DECODED_SIMILARITY * ps_mean
+        + cfg.W_CONDENSER_TEACHER_FORCING * cm_mean
+        + cfg.W_PRIMARY_TEACHER_FORCING * pm_mean
+        + cfg.W_CONDENSER_ENCODED_CLASSIFICATION * cec_mean
+        + cfg.W_PRIMARY_ENCODED_CLASSIFICATION * pec_mean
     )
 
     components = {
@@ -29,6 +41,10 @@ def combine_losses(
         "condenser_similarity": cs_mean.item(),
         "primary_classification": pc_mean.item(),
         "primary_similarity": ps_mean.item(),
+        "condenser_mse": cm_mean.item(),
+        "primary_mse": pm_mean.item(),
+        "condenser_encoded_classification": cec_mean.item(),
+        "primary_encoded_classification": pec_mean.item(),
     }
     return total, components
 
@@ -66,8 +82,7 @@ def format_aucs_by_group(aucs: dict[int, float]) -> str:
 
     def fmt_group(start: int, end: int) -> str:
         return ", ".join(
-            "nan" if np.isnan(aucs[i]) else f"{aucs[i]:.3f}"
-            for i in range(start, end)
+            "nan" if np.isnan(aucs[i]) else f"{aucs[i]:.3f}" for i in range(start, end)
         )
 
     return (

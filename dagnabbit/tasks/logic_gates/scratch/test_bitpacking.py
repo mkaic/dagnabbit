@@ -32,7 +32,7 @@ def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
     total_elements = np.prod(shape)
     total_bitdepth = packed.shape[0]
 
-    print(f"\n1. Packing addresses:")
+    print("\n1. Packing addresses:")
     print(f"   Shape: {shape}")
     print(f"   Total elements: {total_elements}")
     print(f"   Total bitdepth: {total_bitdepth}")
@@ -46,14 +46,14 @@ def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
     # Step 2: Unpack back to image array
     unpacked = output_to_image_array(packed, shape)
 
-    print(f"\n2. Unpacking:")
+    print("\n2. Unpacking:")
     print(f"   Unpacked shape: {unpacked.shape}")
     print(f"   Unpacked dtype: {unpacked.dtype}")
 
     # Step 3: Verify correctness
     # We expect the unpacked array to contain the original addresses
     # For a 2D array, we can reconstruct coordinates
-    print(f"\n3. Verification:")
+    print("\n3. Verification:")
 
     # Create expected values by reconstructing coordinates
     expected = np.zeros(shape, dtype=np.uint8)
@@ -64,18 +64,18 @@ def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
     # the address encoding back
 
     if verbose:
-        print(f"\n   Sample values (first 10 elements):")
+        print("\n   Sample values (first 10 elements):")
         flat_unpacked = unpacked.flatten()
         for i in range(min(10, total_elements)):
             coord = np.unravel_index(i, shape)
             print(f"   Element {i} at {coord}: unpacked={flat_unpacked[i]}")
 
     # Visualize the packed bits
-    print(f"\n4. Visualizing packed bits:")
+    print("\n4. Visualizing packed bits:")
     visualize_packed_bits(packed, shape, bitdepths)
 
     # Visualize the unpacked array
-    print(f"\n5. Visualizing unpacked array:")
+    print("\n5. Visualizing unpacked array:")
     visualize_unpacked_array(unpacked, shape)
 
     return packed, unpacked
@@ -93,7 +93,7 @@ def visualize_packed_bits(packed: np.ndarray, shape: Tuple[int], bitdepths: list
     unpacked_bits = unpacked_bits[:, :total_elements]  # Trim padding
 
     print(f"   Packed bits shape: {unpacked_bits.shape}")
-    print(f"   (bitdepth, num_elements)")
+    print("   (bitdepth, num_elements)")
 
     # Show bit breakdown by dimension
     bit_offset = 0
@@ -106,12 +106,12 @@ def visualize_packed_bits(packed: np.ndarray, shape: Tuple[int], bitdepths: list
 
         # Show a sample for small arrays
         if total_elements <= 20:
-            print(f"   Bits for this dimension:")
+            print("   Bits for this dimension:")
             for bit_idx in range(bitdepth):
                 bit_slice = dim_bits_reshaped[bit_idx]
                 print(f"     Bit {bit_idx}: {bit_slice.flatten()}")
         else:
-            print(f"   (too large to print, showing summary)")
+            print("   (too large to print, showing summary)")
             print(f"     Bit patterns: min={dim_bits.min()}, max={dim_bits.max()}")
 
         bit_offset += bitdepth
@@ -125,13 +125,13 @@ def visualize_unpacked_array(unpacked: np.ndarray, shape: Tuple[int]):
     print(f"   Value range: [{unpacked.min()}, {unpacked.max()}]")
 
     if len(shape) == 2 and shape[0] <= 20 and shape[1] <= 20:
-        print(f"\n   Full array:")
+        print("\n   Full array:")
         print(unpacked)
     elif len(shape) == 1 and shape[0] <= 50:
-        print(f"\n   Full array:")
+        print("\n   Full array:")
         print(unpacked)
     else:
-        print(f"\n   Array too large to print, showing summary:")
+        print("\n   Array too large to print, showing summary:")
         print(f"   Shape: {unpacked.shape}")
         print(f"   Mean: {unpacked.mean():.2f}, Std: {unpacked.std():.2f}")
 
