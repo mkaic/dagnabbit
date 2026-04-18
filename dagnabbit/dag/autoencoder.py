@@ -65,10 +65,15 @@ class NodeEncoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+        # Bound encoder output magnitudes so that iterated composition (e.g.,
+        # the binary condenser tree) cannot produce geometrically-growing
+        # embeddings, which otherwise destabilizes the teacher-forcing loss.
+        self.output_norm = nn.LayerNorm(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
         x = self.encoder(x)
+        x = self.output_norm(x)
 
         return x
 
@@ -92,10 +97,19 @@ class NodeDecoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+        # Normalize each of the `in_degree` predicted parent embeddings to the
+        # same scale the encoder outputs at. The TF loss is cosine (so it
+        # doesn't tether decoder magnitudes on its own), and the shared
+        # `node_type_predictor` is trained on LayerNormed encoder inputs as
+        # well — so without this, the decoded-side classifier sees a
+        # different input distribution from the encoded-side classifier.
+        self.output_norm = nn.LayerNorm(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)
-        x = torch.chunk(x, self.in_degree, dim=0)
+        x = x.view(self.in_degree, self.node_embedding_dim)
+        x = self.output_norm(x)
+        x = torch.unbind(x, dim=0)
 
         return x
 
@@ -197,7 +211,7 @@ class TrainingDecodeBufferEntry:
     classification_loss: Tensor | None
     child_predicted_embeddings_similarity_loss: Tensor | None
     predicted_type_logits: Tensor | None
-    encoded_vs_decoded_mse_loss: Tensor | None
+    teacher_forcing_loss: Tensor | None
 
 
 @dataclass
@@ -206,22 +220,28 @@ class TrainingStepLossReturnType:
     condenser_node_predicted_embeddings_similarity_losses: list[Tensor]
     primary_node_classification_losses: list[Tensor]
     primary_node_predicted_embeddings_similarity_losses: list[Tensor]
-    # MSE between the mean of child-predicted embeddings for a node and its
-    # encoder-side embedding. Tied (not detached): gradients flow into both
-    # the decode path and the encode path.
-    condenser_node_encoded_vs_decoded_mse_losses: list[Tensor]
-    primary_node_encoded_vs_decoded_mse_losses: list[Tensor]
+    # Cosine-distance (1 - cos_sim) between the mean of child-predicted
+    # embeddings for a node and its encoder-side embedding. Target is NOT
+    # detached: gradients flow into both the decode path and the encode path.
+    # Bounded in [0, 2], so magnitude changes in the underlying embeddings
+    # can't cause the loss to explode.
+    condenser_node_teacher_forcing_losses: list[Tensor]
+    primary_node_teacher_forcing_losses: list[Tensor]
     # Classification losses evaluated directly on the encoder-side embedding
     # (i.e., the node's entry in the encode buffer), providing a direct
     # gradient to the encoders for type-separable outputs.
     condenser_node_encoded_classification_losses: list[Tensor]
     primary_node_encoded_classification_losses: list[Tensor]
     # Raw per-node logits and true type labels for downstream diagnostics
-    # (e.g. per-node-type classification AUCs). One entry per classified node,
-    # in the same order as the corresponding *_classification_losses lists.
+    # (e.g. per-node-type classification AUCs). `*_predicted_type_logits` are
+    # from the decode-side classifier (mean of child-predicted embeddings);
+    # `*_encoded_type_logits` are from the encode-side classifier (the node's
+    # own encoder embedding).
     condenser_node_predicted_type_logits: list[Tensor]
+    condenser_node_encoded_type_logits: list[Tensor]
     condenser_node_true_types: list[int]
     primary_node_predicted_type_logits: list[Tensor]
+    primary_node_encoded_type_logits: list[Tensor]
     primary_node_true_types: list[int]
 
 
@@ -399,7 +419,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 child_predicted_embeddings_similarity_loss=None,
                 classification_loss=None,
                 predicted_type_logits=None,
-                encoded_vs_decoded_mse_loss=None,
+                teacher_forcing_loss=None,
             )
             for _ in range(condenser_graph.num_nodes)
         ]
@@ -411,7 +431,7 @@ class DagnabbitAutoEncoder(nn.Module):
             ),
             classification_loss=None,
             predicted_type_logits=None,
-            encoded_vs_decoded_mse_loss=None,
+            teacher_forcing_loss=None,
         )
 
         for node_idx in reversed(
@@ -437,7 +457,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 child_predicted_embeddings_similarity_loss=None,
                 classification_loss=None,
                 predicted_type_logits=None,
-                encoded_vs_decoded_mse_loss=None,
+                teacher_forcing_loss=None,
             )
             for _ in range(primary_graph.num_nodes)
         ]
@@ -472,10 +492,12 @@ class DagnabbitAutoEncoder(nn.Module):
         # just copies of primary leaf encodings and already supervised on the
         # primary side) to match the existing decode-side condenser scheme.
         condenser_encoded_classification_losses: list[Tensor] = []
+        condenser_encoded_type_logits: list[Tensor] = []
         for node_idx in range(
             condenser_graph.num_root_nodes, condenser_graph.num_nodes
         ):
             logits = self.node_type_predictor(condenser_buffer[node_idx])
+            condenser_encoded_type_logits.append(logits)
             condenser_encoded_classification_losses.append(
                 F.cross_entropy(
                     logits,
@@ -488,8 +510,10 @@ class DagnabbitAutoEncoder(nn.Module):
             )
 
         primary_encoded_classification_losses: list[Tensor] = []
+        primary_encoded_type_logits: list[Tensor] = []
         for node_idx in range(primary_graph.num_nodes):
             logits = self.node_type_predictor(primary_buffer[node_idx])
+            primary_encoded_type_logits.append(logits)
             primary_encoded_classification_losses.append(
                 F.cross_entropy(
                     logits,
@@ -516,21 +540,23 @@ class DagnabbitAutoEncoder(nn.Module):
                 e.child_predicted_embeddings_similarity_loss
                 for e in primary_decode_buffer
             ],
-            condenser_node_encoded_vs_decoded_mse_losses=[
-                e.encoded_vs_decoded_mse_loss for e in condenser_trunk_entries
+            condenser_node_teacher_forcing_losses=[
+                e.teacher_forcing_loss for e in condenser_trunk_entries
             ],
-            primary_node_encoded_vs_decoded_mse_losses=[
-                e.encoded_vs_decoded_mse_loss for e in primary_decode_buffer
+            primary_node_teacher_forcing_losses=[
+                e.teacher_forcing_loss for e in primary_decode_buffer
             ],
             condenser_node_encoded_classification_losses=condenser_encoded_classification_losses,
             primary_node_encoded_classification_losses=primary_encoded_classification_losses,
             condenser_node_predicted_type_logits=[
                 e.predicted_type_logits for e in condenser_trunk_entries
             ],
+            condenser_node_encoded_type_logits=condenser_encoded_type_logits,
             condenser_node_true_types=list(condenser_trunk_true_types),
             primary_node_predicted_type_logits=[
                 e.predicted_type_logits for e in primary_decode_buffer
             ],
+            primary_node_encoded_type_logits=primary_encoded_type_logits,
             primary_node_true_types=list(primary_graph.node_types),
         )
 
@@ -575,9 +601,14 @@ class DagnabbitAutoEncoder(nn.Module):
         # Tie the decode path to the encode path: the mean of child-predicted
         # embeddings for this node is pulled toward the encoder's embedding for
         # this node. The encoder-side target is NOT detached, so this loss
-        # backpropagates into both paths.
-        decode_buffer_entry.encoded_vs_decoded_mse_loss = F.mse_loss(
-            average_predicted_embeddings, encoder_buffer[node_idx]
+        # backpropagates into both paths. Using cosine distance (rather than
+        # MSE) keeps this loss bounded in [0, 2] regardless of embedding
+        # magnitudes, which matters here because encoder magnitudes can shift
+        # during training and would otherwise let an MSE term explode.
+        decode_buffer_entry.teacher_forcing_loss = 1.0 - F.cosine_similarity(
+            average_predicted_embeddings,
+            encoder_buffer[node_idx],
+            dim=0,
         )
 
         node_parent_indices = graph.node_inputs_indices[node_idx]
