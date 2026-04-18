@@ -1,12 +1,15 @@
+from abc import ABC, abstractmethod
 import torch
 from torch import Tensor
 import torch.nn as nn
 from typing import Iterable, Callable
 from functools import partial
+from dataclasses import dataclass
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_condenser_graph_description,
 )
+import torch.nn.functional as F
 
 
 class MLP(nn.Module):
@@ -62,7 +65,15 @@ class NodeDecoder(nn.Module):
         return x
 
 
-class FixedInDegreeNodeAutoEncoder(nn.Module):
+class NodeAutoEncoder(nn.Module):
+    def encode(self, input_node_embeddings: Tensor) -> Tensor:
+        raise NotImplementedError
+
+    def decode(self, node_embedding: Tensor) -> Tensor:
+        raise NotImplementedError
+
+
+class FixedInDegreeNodeAutoEncoder(NodeAutoEncoder):
     def __init__(self, node_embedding_dim: int, in_degree):
         super().__init__()
 
@@ -81,7 +92,7 @@ class FixedInDegreeNodeAutoEncoder(nn.Module):
         return self.decoder(node_embedding)
 
 
-class OutputNodeAutoEncoder(nn.Module):
+class OutputNodeAutoEncoder(NodeAutoEncoder):
     def __init__(self, node_embedding_dim: int, num_output_nodes: int):
         super().__init__()
         self.node_embedding_dim = node_embedding_dim
@@ -99,6 +110,21 @@ class OutputNodeAutoEncoder(nn.Module):
     def decode(self, node_embedding: Tensor) -> Tensor:
 
         return self.decoder(node_embedding)
+
+
+@dataclass
+class TrainingDecodeBufferEntry:
+    embeddings_predicted_by_children: list[Tensor]
+    classification_loss: Tensor | None
+    child_predicted_embeddings_similarity_loss: Tensor | None
+
+
+@dataclass
+class TrainingStepLossReturnType:
+    condenser_node_classification_losses: list[Tensor]
+    condenser_node_predicted_embeddings_similarity_losses: list[Tensor]
+    primary_node_classification_losses: list[Tensor]
+    primary_node_predicted_embeddings_similarity_losses: list[Tensor]
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -172,7 +198,7 @@ class DagnabbitAutoEncoder(nn.Module):
     def evaluate_graph(
         graph: FixedInDegreeDAGDescription,
         root_node_embeddings: Tensor,
-        node_autoencoders: dict[int, Callable[[Tensor], Tensor]],
+        node_autoencoders: dict[int, NodeAutoEncoder],
         node_embedding_dim: int,
     ) -> Tensor:
         assert graph.num_output_nodes <= graph.num_output_nodes
@@ -220,32 +246,147 @@ class DagnabbitAutoEncoder(nn.Module):
     def training_forward(
         self,
         primary_graph: FixedInDegreeDAGDescription,
-    ):
+    ) -> TrainingStepLossReturnType:
+        """Returns losses for the training step."""
 
         # Encode
-        condenser_graph, graph_embedding = (
-            self.encode_graph_with_condenser(primary_graph)
+        condenser_graph, graph_embedding = self.encode_graph_with_condenser(
+            primary_graph
         )
 
         # Guided Autoregressive Decode
 
         condenser_decode_buffer = [
-            {
-                "predicted_node_type": None,
-                "predicted_parent_embeddings": [],
-            }
+            TrainingDecodeBufferEntry(
+                embeddings_predicted_by_children=[],
+                child_predicted_embeddings_similarity_loss=None,
+                classification_loss=None,
+            )
             for _ in range(condenser_graph.num_nodes)
         ]
 
-        condenser_decode_buffer[-1] = {
-            "predicted_node_type": None,
-            "predicted_parent_embeddings": [graph_embedding],
-        }
+        condenser_decode_buffer[-1] = TrainingDecodeBufferEntry(
+            embeddings_predicted_by_children=[graph_embedding],
+            child_predicted_embeddings_similarity_loss=torch.std(
+                graph_embedding, dim=0
+            ),
+            classification_loss=None,
+        )
 
-        for node_idx in reversed(range(condenser_graph.num_nodes)):
-            this_node_predicted_embeddings = condenser_decode_buffer[node_idx][
-                "predicted_parent_embeddings"
-            ]
+        for node_idx in reversed(
+            range(condenser_graph.num_root_nodes, condenser_graph.num_nodes)
+        ):
+            self._decode_step(
+                node_idx=node_idx,
+                graph=condenser_graph,
+                decode_buffer=condenser_decode_buffer,
+                node_autoencoders={0: self.condenser_node_autoencoder},
+            )
+
+        # Transplant the decoder buffer entries for the condenser graph inputs
+        # into their corresponding primary graph leaf node spots. Condenser
+        # root `i` is the same semantic node as primary node
+        # `primary_graph.leaf_node_indices[i]` (see `encode_graph_with_condenser`),
+        # so predictions accumulated at condenser-root entries are predictions
+        # of those primary leaves.
+        primary_decode_buffer = [
+            TrainingDecodeBufferEntry(
+                embeddings_predicted_by_children=[],
+                child_predicted_embeddings_similarity_loss=None,
+                classification_loss=None,
+            )
+            for _ in range(primary_graph.num_nodes)
+        ]
+
+        for condenser_root_idx in range(condenser_graph.num_root_nodes):
+            primary_leaf_idx = primary_graph.leaf_node_indices[condenser_root_idx]
+            primary_decode_buffer[
+                primary_leaf_idx
+            ].embeddings_predicted_by_children = condenser_decode_buffer[
+                condenser_root_idx
+            ].embeddings_predicted_by_children
+
+        for node_idx in reversed(range(primary_graph.num_nodes)):
+            self._decode_step(
+                node_idx=node_idx,
+                graph=primary_graph,
+                decode_buffer=primary_decode_buffer,
+                node_autoencoders=self.node_autoencoders,
+            )
+
+        condenser_trunk_entries = condenser_decode_buffer[
+            condenser_graph.num_root_nodes :
+        ]
+
+        return TrainingStepLossReturnType(
+            condenser_node_classification_losses=[
+                e.classification_loss for e in condenser_trunk_entries
+            ],
+            condenser_node_predicted_embeddings_similarity_losses=[
+                e.child_predicted_embeddings_similarity_loss
+                for e in condenser_trunk_entries
+            ],
+            primary_node_classification_losses=[
+                e.classification_loss for e in primary_decode_buffer
+            ],
+            primary_node_predicted_embeddings_similarity_losses=[
+                e.child_predicted_embeddings_similarity_loss
+                for e in primary_decode_buffer
+            ],
+        )
+
+    def _decode_step(
+        self,
+        node_idx: int,
+        graph: FixedInDegreeDAGDescription,
+        decode_buffer: list[TrainingDecodeBufferEntry],
+        node_autoencoders: dict[int, Callable[[Tensor], Tensor]],
+    ) -> None:
+        """Populate `decode_buffer[node_idx]`'s losses and push this node's
+        predicted parent embeddings into its parents' buffer entries."""
+
+        decode_buffer_entry = decode_buffer[node_idx]
+
+        embeddings_predicted_by_children = torch.stack(
+            decode_buffer_entry.embeddings_predicted_by_children
+        )
+
+        average_predicted_embeddings = torch.mean(
+            embeddings_predicted_by_children,
+            dim=0,
+        )
+        predicted_type_logits: Tensor = self.node_type_predictor(
+            average_predicted_embeddings
+        )
+
+        decode_buffer_entry.classification_loss = F.cross_entropy(
+            predicted_type_logits,
+            torch.tensor(
+                graph.node_types[node_idx],
+                dtype=torch.long,
+                device=predicted_type_logits.device,
+            ),
+        )
+        decode_buffer_entry.child_predicted_embeddings_similarity_loss = torch.std(
+            embeddings_predicted_by_children
+        )
+
+        node_parent_indices = graph.node_inputs_indices[node_idx]
+        if len(node_parent_indices) == 0:
+            return
+
+        node_autoencoder = node_autoencoders[graph.node_types[node_idx]]
+        predicted_parent_embeddings = node_autoencoder.decode(
+            average_predicted_embeddings
+        )
+
+        for parent_idx, parent_embedding in zip(
+            node_parent_indices, predicted_parent_embeddings
+        ):
+            parent_decode_buffer_entry = decode_buffer[parent_idx]
+            parent_decode_buffer_entry.embeddings_predicted_by_children.append(
+                parent_embedding
+            )
 
     def inference_decode_blind_autoregressive(
         self,

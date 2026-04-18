@@ -6,7 +6,7 @@ from dagnabbit.dag.description import (
 from dagnabbit.dag.render import render_dag
 
 
-def graft_condenser_graph_onto_primary_graph(
+def graft_condenser_graph_onto_primary_graph_for_rendering(
     primary_graph: FixedInDegreeDAGDescription,
     condenser_graph: FixedInDegreeDAGDescription,
 ) -> FixedInDegreeDAGDescription:
@@ -124,7 +124,7 @@ def main():
     output = render_dag(condenser, output_path="dag_condenser", fmt="png")
     print(f"Rendered condenser graph to {output}")
 
-    dag = graft_condenser_graph_onto_primary_graph(primary, condenser)
+    dag = graft_condenser_graph_onto_primary_graph_for_rendering(primary, condenser)
     output = render_dag(dag, output_path="dag_render", fmt="png")
     print(f"Rendered combined DAG to {output}")
 

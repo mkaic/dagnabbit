@@ -2,6 +2,7 @@ import torch
 
 NodeInputIndices = list[int]
 
+
 class FixedInDegreeDAGDescription:
     def __init__(
         self,
