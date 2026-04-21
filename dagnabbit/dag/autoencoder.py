@@ -415,9 +415,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         condenser_decode_buffer[-1] = TrainingDecodeBufferEntry(
             embeddings_predicted_by_children=[graph_embedding],
-            child_predicted_embeddings_similarity_loss=torch.std(
-                graph_embedding, dim=0
-            ),
+            child_predicted_embeddings_similarity_loss=None,
             classification_loss=None,
             predicted_type_logits=None,
         )
@@ -550,8 +548,9 @@ class DagnabbitAutoEncoder(nn.Module):
         decode_buffer_entry.classification_loss = (
             classification_loss * classification_loss_weight
         )
+
         decode_buffer_entry.child_predicted_embeddings_similarity_loss = torch.std(
-            embeddings_predicted_by_children
+            embeddings_predicted_by_children, dim=0, correction=0
         )
 
         node_parent_indices = graph.node_inputs_indices[node_idx]
