@@ -2,7 +2,6 @@ import logging
 
 import numpy as np
 import torch
-from sklearn.metrics import roc_auc_score
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import make_random_graph_description
@@ -20,8 +19,6 @@ def combine_losses(
     ps_mean = torch.stack(
         losses.primary_node_predicted_embeddings_similarity_losses
     ).mean()
-    cm_mean = torch.stack(losses.condenser_node_teacher_forcing_losses).mean()
-    pm_mean = torch.stack(losses.primary_node_teacher_forcing_losses).mean()
     cec_mean = torch.stack(losses.condenser_node_encoded_classification_losses).mean()
     pec_mean = torch.stack(losses.primary_node_encoded_classification_losses).mean()
 
@@ -30,8 +27,6 @@ def combine_losses(
         + cfg.W_CONDENSER_DECODED_SIMILARITY * cs_mean
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
         + cfg.W_PRIMARY_DECODED_SIMILARITY * ps_mean
-        + cfg.W_CONDENSER_TEACHER_FORCING * cm_mean
-        + cfg.W_PRIMARY_TEACHER_FORCING * pm_mean
         + cfg.W_CONDENSER_ENCODED_CLASSIFICATION * cec_mean
         + cfg.W_PRIMARY_ENCODED_CLASSIFICATION * pec_mean
     )
@@ -40,11 +35,9 @@ def combine_losses(
         "condenser_decoded_classification": cc_mean.item(),
         "condenser_decoded_similarity": cs_mean.item(),
         "condenser_encoded_classification": cec_mean.item(),
-        "condenser_teacher_forcing": cm_mean.item(),
         "primary_decoded_classification": pc_mean.item(),
         "primary_decoded_similarity": ps_mean.item(),
         "primary_encoded_classification": pec_mean.item(),
-        "primary_teacher_forcing": pm_mean.item(),
     }
     return total, components
 
@@ -57,57 +50,59 @@ def format_param_count(n: int) -> str:
     return str(n)
 
 
-def per_type_aucs(
+def per_type_accuracies(
     logits_per_node: list[torch.Tensor],
     true_types: list[int],
     num_classes: int,
 ) -> dict[int, float]:
-    """One-vs-rest ROC-AUC per class. NaN for classes with only one label."""
-    probs = torch.softmax(torch.stack(logits_per_node).detach(), dim=-1).cpu().numpy()
+    """Per-class accuracy (recall): argmax==c rate over nodes whose true type is c.
+
+    NaN for classes with no nodes of that type in the batch.
+    """
+    preds = torch.stack(logits_per_node).detach().argmax(dim=-1).cpu().numpy()
     truth = np.asarray(true_types, dtype=np.int64)
-    aucs: dict[int, float] = {}
+    accuracies: dict[int, float] = {}
     for c in range(num_classes):
-        labels = (truth == c).astype(np.int64)
-        if labels.min() == labels.max():
-            aucs[c] = float("nan")
+        mask = truth == c
+        if not mask.any():
+            accuracies[c] = float("nan")
         else:
-            aucs[c] = float(roc_auc_score(labels, probs[:, c]))
-    return aucs
+            accuracies[c] = float((preds[mask] == c).mean())
+    return accuracies
 
 
 def format_step_report(
     step: int,
     total: float,
     components: dict[str, float],
-    encoder_aucs: dict[int, float],
-    decoder_aucs: dict[int, float],
+    encoder_accuracies: dict[int, float],
+    decoder_accuracies: dict[int, float],
 ) -> str:
-    """Compact multi-line summary of a training step's losses and AUCs."""
+    """Compact multi-line summary of a training step's losses and accuracies."""
 
     def fmt_loss_row(prefix: str, label: str) -> str:
         return (
             f"  {label:<10} "
             f"dec_cls={components[f'{prefix}_decoded_classification']:>9.4g}  "
             f"dec_sim={components[f'{prefix}_decoded_similarity']:>9.4g}  "
-            f"enc_cls={components[f'{prefix}_encoded_classification']:>9.4g}  "
-            f"tf={components[f'{prefix}_teacher_forcing']:>9.4g}"
+            f"enc_cls={components[f'{prefix}_encoded_classification']:>9.4g}"
         )
 
     trunk_end = cfg.NUM_TRUNK_NODE_TYPES
     root_end = trunk_end + cfg.NUM_ROOT_NODES
     output_end = root_end + cfg.NUM_OUTPUT_NODES
 
-    def fmt_auc_group(aucs: dict[int, float], start: int, end: int) -> str:
+    def fmt_acc_group(accuracies: dict[int, float], start: int, end: int) -> str:
         return "[" + ", ".join(
-            "  nan" if np.isnan(aucs[i]) else f"{aucs[i]:.3f}"
+            "  nan" if np.isnan(accuracies[i]) else f"{accuracies[i]:.3f}"
             for i in range(start, end)
         ) + "]"
 
-    def fmt_auc_row(label: str, start: int, end: int) -> str:
+    def fmt_acc_row(label: str, start: int, end: int) -> str:
         return (
             f"  {label:<10} "
-            f"enc={fmt_auc_group(encoder_aucs, start, end)}  "
-            f"dec={fmt_auc_group(decoder_aucs, start, end)}"
+            f"enc={fmt_acc_group(encoder_accuracies, start, end)}  "
+            f"dec={fmt_acc_group(decoder_accuracies, start, end)}"
         )
 
     return "\n".join(
@@ -115,9 +110,9 @@ def format_step_report(
             f"step={step} total={total:.4g}",
             fmt_loss_row("condenser", "condenser"),
             fmt_loss_row("primary", "primary"),
-            fmt_auc_row("auc_trunk", 0, trunk_end),
-            fmt_auc_row("auc_root", trunk_end, root_end),
-            fmt_auc_row("auc_output", root_end, output_end),
+            fmt_acc_row("acc_trunk", 0, trunk_end),
+            fmt_acc_row("acc_root", trunk_end, root_end),
+            fmt_acc_row("acc_output", root_end, output_end),
         ]
     )
 
@@ -168,12 +163,12 @@ def main() -> None:
         optimizer.step()
 
         if step % cfg.LOG_EVERY == 0:
-            decoder_aucs = per_type_aucs(
+            decoder_accuracies = per_type_accuracies(
                 losses.primary_node_predicted_type_logits,
                 losses.primary_node_true_types,
                 num_classes=model.num_node_types,
             )
-            encoder_aucs = per_type_aucs(
+            encoder_accuracies = per_type_accuracies(
                 losses.primary_node_encoded_type_logits,
                 losses.primary_node_true_types,
                 num_classes=model.num_node_types,
@@ -181,7 +176,11 @@ def main() -> None:
             logging.info(
                 "%s",
                 format_step_report(
-                    step, total.item(), components, encoder_aucs, decoder_aucs
+                    step,
+                    total.item(),
+                    components,
+                    encoder_accuracies,
+                    decoder_accuracies,
                 ),
             )
 

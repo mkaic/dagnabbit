@@ -1,14 +1,14 @@
 # --- model ---
-NODE_EMBEDDING_DIM = 512
+NODE_EMBEDDING_DIM = 128
 TRUNK_NODE_TYPE_IN_DEGREES = 2
-NUM_TRUNK_NODE_TYPES = 4
+NUM_TRUNK_NODE_TYPES = 1
 CONDENSER_NODE_TYPE_IN_DEGREE = 2
 NUM_ROOT_NODES = 4
 NUM_OUTPUT_NODES = 4
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
-MLP_DEPTH = 3
+MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
-MLP_EXPANSION_FACTOR = 3.0
+MLP_EXPANSION_FACTOR = 2.0
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 8
@@ -28,8 +28,3 @@ W_CONDENSER_DECODED_SIMILARITY = 0.1
 W_PRIMARY_ENCODED_CLASSIFICATION = 0.1
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 W_PRIMARY_DECODED_SIMILARITY = 0.1
-
-# Teacher-forcing MSE between decode-side averaged prediction and encode-side
-# embedding for each node. Target is NOT detached.
-W_CONDENSER_TEACHER_FORCING = 0.0
-W_PRIMARY_TEACHER_FORCING = 0.0
