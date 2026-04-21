@@ -18,6 +18,19 @@ def _normalize_to_sqrt_n(x: Tensor) -> Tensor:
     return F.normalize(x, dim=-1) * math.sqrt(dim)
 
 
+def _class_balance_weights(node_types: list[int]) -> list[float]:
+    """Return per-node weights of ``1 / count_of_that_type``.
+
+    Scaling each node's classification loss by this weight makes every type
+    present in ``node_types`` contribute equally to the summed loss, regardless
+    of how many nodes of that type appear in the graph.
+    """
+    counts: dict[int, int] = {}
+    for t in node_types:
+        counts[t] = counts.get(t, 0) + 1
+    return [1.0 / counts[t] for t in node_types]
+
+
 class MLP(nn.Module):
     def __init__(self, vector_dims: Iterable[int], activation: nn.Module = nn.GELU()):
         super().__init__()
@@ -421,6 +434,13 @@ class DagnabbitAutoEncoder(nn.Module):
             predicted_type_logits=None,
         )
 
+        condenser_classification_loss_weights = _class_balance_weights(
+            list(condenser_graph.node_types)
+        )
+        primary_classification_loss_weights = _class_balance_weights(
+            list(primary_graph.node_types)
+        )
+
         for node_idx in reversed(
             range(condenser_graph.num_root_nodes, condenser_graph.num_nodes)
         ):
@@ -429,6 +449,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=condenser_graph,
                 decode_buffer=condenser_decode_buffer,
                 node_autoencoders={0: self.condenser_node_autoencoder},
+                classification_loss_weight=condenser_classification_loss_weights[
+                    node_idx
+                ],
             )
 
         # Transplant the decoder buffer entries for the condenser graph inputs
@@ -461,6 +484,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=primary_graph,
                 decode_buffer=primary_decode_buffer,
                 node_autoencoders=self.node_autoencoders,
+                classification_loss_weight=primary_classification_loss_weights[
+                    node_idx
+                ],
             )
 
         condenser_trunk_entries = condenser_decode_buffer[
@@ -482,32 +508,32 @@ class DagnabbitAutoEncoder(nn.Module):
         ):
             logits = self.node_type_predictor(condenser_buffer[node_idx])
             condenser_encoded_type_logits.append(logits)
-            condenser_encoded_classification_losses.append(
-                F.cross_entropy(
-                    logits,
-                    torch.tensor(
-                        condenser_graph.node_types[node_idx],
-                        dtype=torch.long,
-                        device=logits.device,
-                    ),
-                )
+            loss = F.cross_entropy(
+                logits,
+                torch.tensor(
+                    condenser_graph.node_types[node_idx],
+                    dtype=torch.long,
+                    device=logits.device,
+                ),
             )
+            loss = loss * condenser_classification_loss_weights[node_idx]
+            condenser_encoded_classification_losses.append(loss)
 
         primary_encoded_classification_losses: list[Tensor] = []
         primary_encoded_type_logits: list[Tensor] = []
         for node_idx in range(primary_graph.num_nodes):
             logits = self.node_type_predictor(primary_buffer[node_idx])
             primary_encoded_type_logits.append(logits)
-            primary_encoded_classification_losses.append(
-                F.cross_entropy(
-                    logits,
-                    torch.tensor(
-                        primary_graph.node_types[node_idx],
-                        dtype=torch.long,
-                        device=logits.device,
-                    ),
-                )
+            loss = F.cross_entropy(
+                logits,
+                torch.tensor(
+                    primary_graph.node_types[node_idx],
+                    dtype=torch.long,
+                    device=logits.device,
+                ),
             )
+            loss = loss * primary_classification_loss_weights[node_idx]
+            primary_encoded_classification_losses.append(loss)
 
         return TrainingStepLossReturnType(
             condenser_node_classification_losses=[
@@ -544,9 +570,14 @@ class DagnabbitAutoEncoder(nn.Module):
         graph: FixedInDegreeDAGDescription,
         decode_buffer: list[TrainingDecodeBufferEntry],
         node_autoencoders: dict[int, NodeAutoEncoder],
+        classification_loss_weight: float = 1.0,
     ) -> None:
         """Populate `decode_buffer[node_idx]`'s losses and push this node's
-        predicted parent embeddings into its parents' buffer entries."""
+        predicted parent embeddings into its parents' buffer entries.
+
+        ``classification_loss_weight`` multiplies this node's classification
+        loss; callers use it for class-balanced weighting across node types.
+        """
 
         decode_buffer_entry = decode_buffer[node_idx]
 
@@ -563,13 +594,16 @@ class DagnabbitAutoEncoder(nn.Module):
         )
         decode_buffer_entry.predicted_type_logits = predicted_type_logits
 
-        decode_buffer_entry.classification_loss = F.cross_entropy(
+        classification_loss = F.cross_entropy(
             predicted_type_logits,
             torch.tensor(
                 graph.node_types[node_idx],
                 dtype=torch.long,
                 device=predicted_type_logits.device,
             ),
+        )
+        decode_buffer_entry.classification_loss = (
+            classification_loss * classification_loss_weight
         )
         decode_buffer_entry.child_predicted_embeddings_similarity_loss = torch.std(
             embeddings_predicted_by_children

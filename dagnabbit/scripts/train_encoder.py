@@ -153,6 +153,7 @@ def main() -> None:
     with mlflow.start_run():
         mlflow.log_params({k: v for k, v in vars(cfg).items() if not k.startswith("_")})
 
+        optimizer.zero_grad()
         for step in range(cfg.NUM_STEPS):
             graph = make_random_graph_description(
                 num_root_nodes=cfg.NUM_ROOT_NODES,
@@ -165,9 +166,12 @@ def main() -> None:
             losses = model.training_forward(graph)
             total, components = combine_losses(losses)
 
-            optimizer.zero_grad()
-            total.backward()
-            optimizer.step()
+            scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
+            scaled_loss.backward()
+
+            if (step + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
             if step % cfg.LOG_EVERY == 0:
                 decoder_accuracies = per_type_accuracies(
