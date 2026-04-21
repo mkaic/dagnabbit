@@ -229,21 +229,9 @@ class TrainingStepLossReturnType:
     condenser_node_predicted_embeddings_similarity_losses: list[Tensor]
     primary_node_classification_losses: list[Tensor]
     primary_node_predicted_embeddings_similarity_losses: list[Tensor]
-    # Classification losses evaluated directly on the encoder-side embedding
-    # (i.e., the node's entry in the encode buffer), providing a direct
-    # gradient to the encoders for type-separable outputs.
-    condenser_node_encoded_classification_losses: list[Tensor]
-    primary_node_encoded_classification_losses: list[Tensor]
     # Raw per-node logits and true type labels for downstream diagnostics
-    # (e.g. per-node-type classification AUCs). `*_predicted_type_logits` are
-    # from the decode-side classifier (mean of child-predicted embeddings);
-    # `*_encoded_type_logits` are from the encode-side classifier (the node's
-    # own encoder embedding).
-    condenser_node_predicted_type_logits: list[Tensor]
-    condenser_node_encoded_type_logits: list[Tensor]
-    condenser_node_true_types: list[int]
+    # (e.g. per-node-type accuracy per class).
     primary_node_predicted_type_logits: list[Tensor]
-    primary_node_encoded_type_logits: list[Tensor]
     primary_node_true_types: list[int]
 
 
@@ -497,43 +485,6 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_graph.num_root_nodes :
         ]
 
-        # Encoder-side classification losses: classify each node's own encoder
-        # embedding against its true type. Skips condenser roots (which are
-        # just copies of primary leaf encodings and already supervised on the
-        # primary side) to match the existing decode-side condenser scheme.
-        condenser_encoded_classification_losses: list[Tensor] = []
-        condenser_encoded_type_logits: list[Tensor] = []
-        for node_idx in range(
-            condenser_graph.num_root_nodes, condenser_graph.num_nodes
-        ):
-            logits = self.node_type_predictor(condenser_buffer[node_idx])
-            condenser_encoded_type_logits.append(logits)
-            loss = F.cross_entropy(
-                logits,
-                torch.tensor(
-                    condenser_graph.node_types[node_idx],
-                    dtype=torch.long,
-                    device=logits.device,
-                ),
-            )
-            loss = loss * condenser_classification_loss_weights[node_idx]
-            condenser_encoded_classification_losses.append(loss)
-
-        primary_encoded_classification_losses: list[Tensor] = []
-        primary_encoded_type_logits: list[Tensor] = []
-        for node_idx in range(primary_graph.num_nodes):
-            logits = self.node_type_predictor(primary_buffer[node_idx])
-            primary_encoded_type_logits.append(logits)
-            loss = F.cross_entropy(
-                logits,
-                torch.tensor(
-                    primary_graph.node_types[node_idx],
-                    dtype=torch.long,
-                    device=logits.device,
-                ),
-            )
-            loss = loss * primary_classification_loss_weights[node_idx]
-            primary_encoded_classification_losses.append(loss)
 
         return TrainingStepLossReturnType(
             condenser_node_classification_losses=[
@@ -550,17 +501,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 e.child_predicted_embeddings_similarity_loss
                 for e in primary_decode_buffer
             ],
-            condenser_node_encoded_classification_losses=condenser_encoded_classification_losses,
-            primary_node_encoded_classification_losses=primary_encoded_classification_losses,
-            condenser_node_predicted_type_logits=[
-                e.predicted_type_logits for e in condenser_trunk_entries
-            ],
-            condenser_node_encoded_type_logits=condenser_encoded_type_logits,
-            condenser_node_true_types=list(condenser_trunk_true_types),
             primary_node_predicted_type_logits=[
                 e.predicted_type_logits for e in primary_decode_buffer
             ],
-            primary_node_encoded_type_logits=primary_encoded_type_logits,
             primary_node_true_types=list(primary_graph.node_types),
         )
 
@@ -589,6 +532,8 @@ class DagnabbitAutoEncoder(nn.Module):
             embeddings_predicted_by_children,
             dim=0,
         )
+        average_predicted_embeddings = _normalize_to_sqrt_n(average_predicted_embeddings)
+
         predicted_type_logits: Tensor = self.node_type_predictor(
             average_predicted_embeddings
         )

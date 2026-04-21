@@ -20,25 +20,19 @@ def combine_losses(
     ps_mean = torch.stack(
         losses.primary_node_predicted_embeddings_similarity_losses
     ).mean()
-    cec_mean = torch.stack(losses.condenser_node_encoded_classification_losses).mean()
-    pec_mean = torch.stack(losses.primary_node_encoded_classification_losses).mean()
 
     total = (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean
         + cfg.W_CONDENSER_DECODED_SIMILARITY * cs_mean
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
         + cfg.W_PRIMARY_DECODED_SIMILARITY * ps_mean
-        + cfg.W_CONDENSER_ENCODED_CLASSIFICATION * cec_mean
-        + cfg.W_PRIMARY_ENCODED_CLASSIFICATION * pec_mean
     )
 
     components = {
         "condenser_decoded_classification": cc_mean.item(),
         "condenser_decoded_similarity": cs_mean.item(),
-        "condenser_encoded_classification": cec_mean.item(),
         "primary_decoded_classification": pc_mean.item(),
         "primary_decoded_similarity": ps_mean.item(),
-        "primary_encoded_classification": pec_mean.item(),
     }
     return total, components
 
@@ -51,17 +45,25 @@ def format_param_count(n: int) -> str:
     return str(n)
 
 
-def per_type_accuracies(
+def step_preds_and_truth(
     logits_per_node: list[torch.Tensor],
     true_types: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract argmax predictions and true class ids for one step."""
+    preds = torch.stack(logits_per_node).detach().argmax(dim=-1).cpu().numpy()
+    truth = np.asarray(true_types, dtype=np.int64)
+    return preds, truth
+
+
+def per_type_accuracies(
+    preds: np.ndarray,
+    truth: np.ndarray,
     num_classes: int,
 ) -> dict[int, float]:
     """Per-class accuracy (recall): argmax==c rate over nodes whose true type is c.
 
-    NaN for classes with no nodes of that type in the batch.
+    NaN for classes with no nodes of that type in the accumulated window.
     """
-    preds = torch.stack(logits_per_node).detach().argmax(dim=-1).cpu().numpy()
-    truth = np.asarray(true_types, dtype=np.int64)
     accuracies: dict[int, float] = {}
     for c in range(num_classes):
         mask = truth == c
@@ -76,7 +78,6 @@ def format_step_report(
     step: int,
     total: float,
     components: dict[str, float],
-    encoder_accuracies: dict[int, float],
     decoder_accuracies: dict[int, float],
 ) -> str:
     """Compact multi-line summary of a training step's losses and accuracies."""
@@ -85,8 +86,7 @@ def format_step_report(
         return (
             f"  {label:<10} "
             f"dec_cls={components[f'{prefix}_decoded_classification']:>9.4g}  "
-            f"dec_sim={components[f'{prefix}_decoded_similarity']:>9.4g}  "
-            f"enc_cls={components[f'{prefix}_encoded_classification']:>9.4g}"
+            f"dec_sim={components[f'{prefix}_decoded_similarity']:>9.4g}"
         )
 
     trunk_end = cfg.NUM_TRUNK_NODE_TYPES
@@ -102,7 +102,6 @@ def format_step_report(
     def fmt_acc_row(label: str, start: int, end: int) -> str:
         return (
             f"  {label:<10} "
-            f"enc={fmt_acc_group(encoder_accuracies, start, end)}  "
             f"dec={fmt_acc_group(decoder_accuracies, start, end)}"
         )
 
@@ -154,6 +153,8 @@ def main() -> None:
         mlflow.log_params({k: v for k, v in vars(cfg).items() if not k.startswith("_")})
 
         optimizer.zero_grad()
+        window_preds: list[np.ndarray] = []
+        window_truth: list[np.ndarray] = []
         for step in range(cfg.NUM_STEPS):
             graph = make_random_graph_description(
                 num_root_nodes=cfg.NUM_ROOT_NODES,
@@ -173,24 +174,27 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad()
 
+            step_preds, step_truth = step_preds_and_truth(
+                losses.primary_node_predicted_type_logits,
+                losses.primary_node_true_types,
+            )
+            window_preds.append(step_preds)
+            window_truth.append(step_truth)
+
             if step % cfg.LOG_EVERY == 0:
                 decoder_accuracies = per_type_accuracies(
-                    losses.primary_node_predicted_type_logits,
-                    losses.primary_node_true_types,
+                    np.concatenate(window_preds),
+                    np.concatenate(window_truth),
                     num_classes=model.num_node_types,
                 )
-                encoder_accuracies = per_type_accuracies(
-                    losses.primary_node_encoded_type_logits,
-                    losses.primary_node_true_types,
-                    num_classes=model.num_node_types,
-                )
+                window_preds.clear()
+                window_truth.clear()
                 logging.info(
                     "%s",
                     format_step_report(
                         step,
                         total.item(),
                         components,
-                        encoder_accuracies,
                         decoder_accuracies,
                     ),
                 )
@@ -198,18 +202,10 @@ def main() -> None:
                 metrics: dict[str, float] = {"loss/total": total.item()}
                 metrics.update({f"loss/{name}": v for name, v in components.items()})
 
-                valid_enc = [v for v in encoder_accuracies.values() if not np.isnan(v)]
                 valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
-                if valid_enc:
-                    metrics["accuracy/encoder_mean"] = float(np.mean(valid_enc))
                 if valid_dec:
                     metrics["accuracy/decoder_mean"] = float(np.mean(valid_dec))
 
-                metrics.update({
-                    f"accuracy_per_class/encoder_class_{cls}": acc
-                    for cls, acc in encoder_accuracies.items()
-                    if not np.isnan(acc)
-                })
                 metrics.update({
                     f"accuracy_per_class/decoder_class_{cls}": acc
                     for cls, acc in decoder_accuracies.items()
