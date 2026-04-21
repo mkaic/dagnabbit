@@ -1,5 +1,6 @@
 import logging
 
+import mlflow
 import numpy as np
 import torch
 
@@ -126,6 +127,9 @@ def main() -> None:
 
     device = torch.device(cfg.DEVICE)
 
+    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_NAME)
+
     model = DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
@@ -146,43 +150,69 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
 
-    for step in range(cfg.NUM_STEPS):
-        graph = make_random_graph_description(
-            num_root_nodes=cfg.NUM_ROOT_NODES,
-            num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-            num_output_nodes=cfg.NUM_OUTPUT_NODES,
-            trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-            num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-        )
+    with mlflow.start_run():
+        mlflow.log_params({k: v for k, v in vars(cfg).items() if not k.startswith("_")})
 
-        losses = model.training_forward(graph)
-        total, components = combine_losses(losses)
+        for step in range(cfg.NUM_STEPS):
+            graph = make_random_graph_description(
+                num_root_nodes=cfg.NUM_ROOT_NODES,
+                num_trunk_nodes=cfg.NUM_TRUNK_NODES,
+                num_output_nodes=cfg.NUM_OUTPUT_NODES,
+                trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+                num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+            )
 
-        optimizer.zero_grad()
-        total.backward()
-        optimizer.step()
+            losses = model.training_forward(graph)
+            total, components = combine_losses(losses)
 
-        if step % cfg.LOG_EVERY == 0:
-            decoder_accuracies = per_type_accuracies(
-                losses.primary_node_predicted_type_logits,
-                losses.primary_node_true_types,
-                num_classes=model.num_node_types,
-            )
-            encoder_accuracies = per_type_accuracies(
-                losses.primary_node_encoded_type_logits,
-                losses.primary_node_true_types,
-                num_classes=model.num_node_types,
-            )
-            logging.info(
-                "%s",
-                format_step_report(
-                    step,
-                    total.item(),
-                    components,
-                    encoder_accuracies,
-                    decoder_accuracies,
-                ),
-            )
+            optimizer.zero_grad()
+            total.backward()
+            optimizer.step()
+
+            if step % cfg.LOG_EVERY == 0:
+                decoder_accuracies = per_type_accuracies(
+                    losses.primary_node_predicted_type_logits,
+                    losses.primary_node_true_types,
+                    num_classes=model.num_node_types,
+                )
+                encoder_accuracies = per_type_accuracies(
+                    losses.primary_node_encoded_type_logits,
+                    losses.primary_node_true_types,
+                    num_classes=model.num_node_types,
+                )
+                logging.info(
+                    "%s",
+                    format_step_report(
+                        step,
+                        total.item(),
+                        components,
+                        encoder_accuracies,
+                        decoder_accuracies,
+                    ),
+                )
+
+                metrics: dict[str, float] = {"loss/total": total.item()}
+                metrics.update({f"loss/{name}": v for name, v in components.items()})
+
+                valid_enc = [v for v in encoder_accuracies.values() if not np.isnan(v)]
+                valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
+                if valid_enc:
+                    metrics["accuracy/encoder_mean"] = float(np.mean(valid_enc))
+                if valid_dec:
+                    metrics["accuracy/decoder_mean"] = float(np.mean(valid_dec))
+
+                metrics.update({
+                    f"accuracy_per_class/encoder_class_{cls}": acc
+                    for cls, acc in encoder_accuracies.items()
+                    if not np.isnan(acc)
+                })
+                metrics.update({
+                    f"accuracy_per_class/decoder_class_{cls}": acc
+                    for cls, acc in decoder_accuracies.items()
+                    if not np.isnan(acc)
+                })
+
+                mlflow.log_metrics(metrics, step=step)
 
 
 if __name__ == "__main__":

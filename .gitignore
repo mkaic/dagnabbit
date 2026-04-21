@@ -1,5 +1,6 @@
 outputs
 *.png
+mlflow.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -19,6 +19,8 @@ LEARNING_RATE = 1e-3
 LOG_EVERY = 10
 DEVICE = "cpu"
 SEED = 0
+MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+MLFLOW_EXPERIMENT_NAME = "dagnabbit"
 
 # --- loss weights ---
 W_CONDENSER_ENCODED_CLASSIFICATION = 0.1
