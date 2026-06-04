@@ -407,7 +407,8 @@ class DagnabbitAutoEncoder(nn.Module):
 
         embeddings_buffer = torch.empty(
             (graph.num_nodes, node_embedding_dim),
-            dtype=torch.float32,
+            dtype=root_node_embeddings.dtype,
+            device=root_node_embeddings.device,
         )
         embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
 
