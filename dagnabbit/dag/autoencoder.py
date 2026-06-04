@@ -286,6 +286,10 @@ class TrainingDecodeBufferEntry:
     classification_loss: Tensor | None
     child_predicted_embeddings_similarity_loss: Tensor | None
     predicted_type_logits: Tensor | None
+    # The variance-preserving combination of `embeddings_predicted_by_children`
+    # that this node's decode/classification actually consumes. Populated by
+    # `_decode_step`; kept for diagnostics (e.g. decode-side signal propagation).
+    combined_predicted_embedding: Tensor | None = None
 
 
 @dataclass
@@ -455,8 +459,23 @@ class DagnabbitAutoEncoder(nn.Module):
     def training_forward(
         self,
         primary_graph: FixedInDegreeDAGDescription,
-    ) -> TrainingStepLossReturnType:
-        """Returns losses for the training step."""
+        return_buffers: bool = False,
+    ) -> (
+        TrainingStepLossReturnType
+        | tuple[
+            TrainingStepLossReturnType,
+            Tensor,
+            list[TrainingDecodeBufferEntry],
+        ]
+    ):
+        """Returns losses for the training step.
+
+        When ``return_buffers`` is True, additionally returns the primary-graph
+        encode buffer (per-node embeddings from the forward pass) and the primary
+        decode buffer (each entry's ``combined_predicted_embedding`` holds the
+        decode-side per-node prediction), for diagnostics such as signal
+        propagation analysis.
+        """
 
         # Encode
         condenser_graph, graph_embedding, primary_buffer, condenser_buffer = (
@@ -549,7 +568,7 @@ class DagnabbitAutoEncoder(nn.Module):
         ]
 
 
-        return TrainingStepLossReturnType(
+        losses = TrainingStepLossReturnType(
             condenser_node_classification_losses=[
                 e.classification_loss for e in condenser_trunk_entries
             ],
@@ -569,6 +588,10 @@ class DagnabbitAutoEncoder(nn.Module):
             ],
             primary_node_true_types=list(primary_graph.node_types),
         )
+
+        if return_buffers:
+            return losses, primary_buffer, primary_decode_buffer
+        return losses
 
     def _decode_step(
         self,
@@ -599,6 +622,7 @@ class DagnabbitAutoEncoder(nn.Module):
         combined_predicted_embeddings = embeddings_predicted_by_children.sum(
             dim=0
         ) / math.sqrt(num_children)
+        decode_buffer_entry.combined_predicted_embedding = combined_predicted_embeddings
 
         predicted_type_logits: Tensor = self.node_type_predictor(
             combined_predicted_embeddings

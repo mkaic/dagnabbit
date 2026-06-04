@@ -9,7 +9,11 @@ per-node embedding norm should stay flat around ``sqrt(node_embedding_dim)`` as
 DAG depth increases, and the per-element mean should stay near zero (no
 mean-shift), *without* any brute-force normalization.
 
-Run it directly to eyeball the depth-vs-statistics table::
+This covers both passes: the ``encode`` forward pass down the DAG, and the
+``decode`` guided-autoregressive pass that propagates predicted embeddings back
+up the DAG (each node's ``combined_predicted_embedding``).
+
+Run it directly to eyeball the depth-vs-statistics tables::
 
     python -m dagnabbit.dag.tests.test_signal_propagation
 
@@ -93,42 +97,68 @@ def measure_signal_propagation(
     num_models: int = 4,
     graphs_per_model: int = 4,
     seed: int = 0,
-) -> dict[int, dict[str, float]]:
+) -> dict[str, dict[int, dict[str, float]]]:
     """Run several freshly-initialized models on several random graphs and return
-    primary-buffer statistics aggregated (mean over samples) per DAG depth."""
+    per-DAG-depth statistics (averaged over samples) for both phases:
+
+    - ``"encode"``: the primary forward-pass buffer (``NodeEncoder`` MLPs
+      composed down the DAG).
+    - ``"decode"``: each primary node's ``combined_predicted_embedding`` from the
+      guided-autoregressive decode (predictions propagated back up the DAG).
+
+    Both phases are indexed by the same primary-graph nodes, so they share one
+    depth assignment.
+    """
     torch.manual_seed(seed)
 
-    accum: dict[int, dict[str, list[float]]] = {}
+    accum: dict[str, dict[int, dict[str, list[float]]]] = {
+        "encode": {},
+        "decode": {},
+    }
     with torch.no_grad():
         for _ in range(num_models):
             model = build_model()
             for _ in range(graphs_per_model):
                 graph = sample_graph()
-                _, _, primary_buffer, _ = model.encode_graph_with_condenser(
+                _, primary_buffer, primary_decode_buffer = model.training_forward(
                     graph, return_buffers=True
                 )
                 depths = node_depths(graph)
-                for depth, stats in _bucket_stats_by_depth(
-                    primary_buffer, depths
-                ).items():
-                    bucket = accum.setdefault(
-                        depth, {k: [] for k in stats if k != "count"}
-                    )
-                    for key, value in stats.items():
-                        if key == "count":
-                            continue
-                        bucket[key].append(value)
+
+                decode_rows = [
+                    e.combined_predicted_embedding for e in primary_decode_buffer
+                ]
+                assert all(r is not None for r in decode_rows), (
+                    "every primary node should be decoded and have a combined "
+                    "predicted embedding"
+                )
+                decode_buffer = torch.stack(decode_rows)
+
+                phase_buffers = {"encode": primary_buffer, "decode": decode_buffer}
+                for phase, buffer in phase_buffers.items():
+                    for depth, stats in _bucket_stats_by_depth(buffer, depths).items():
+                        bucket = accum[phase].setdefault(
+                            depth, {k: [] for k in stats if k != "count"}
+                        )
+                        for key, value in stats.items():
+                            if key == "count":
+                                continue
+                            bucket[key].append(value)
 
     return {
-        depth: {key: float(sum(vals) / len(vals)) for key, vals in keyed.items()}
-        for depth, keyed in sorted(accum.items())
+        phase: {
+            depth: {key: float(sum(vals) / len(vals)) for key, vals in keyed.items()}
+            for depth, keyed in sorted(per_depth.items())
+        }
+        for phase, per_depth in accum.items()
     }
 
 
-def format_table(stats_by_depth: dict[int, dict[str, float]]) -> str:
+def format_table(phase: str, stats_by_depth: dict[int, dict[str, float]]) -> str:
     target = math.sqrt(cfg.NODE_EMBEDDING_DIM)
     header = (
-        f"target norm = sqrt(D) = {target:.2f}  (D = {cfg.NODE_EMBEDDING_DIM})\n"
+        f"[{phase}] target norm = sqrt(D) = {target:.2f}  "
+        f"(D = {cfg.NODE_EMBEDDING_DIM})\n"
         f"{'depth':>5}  {'norm_mean':>9}  {'norm_min':>9}  {'norm_max':>9}  "
         f"{'elem_mean':>9}  {'elem_std':>9}"
     )
@@ -141,33 +171,46 @@ def format_table(stats_by_depth: dict[int, dict[str, float]]) -> str:
 
 
 def test_norms_stay_bounded() -> None:
-    """Norms should neither explode nor collapse as DAG depth grows."""
+    """Norms should neither explode nor collapse as DAG depth grows, on both the
+    encode and decode passes."""
     target = math.sqrt(cfg.NODE_EMBEDDING_DIM)
-    stats_by_depth = measure_signal_propagation()
+    stats_by_phase = measure_signal_propagation()
 
-    for depth, s in stats_by_depth.items():
-        assert math.isfinite(s["norm_mean"]), f"non-finite norm at depth {depth}"
-        # Generous band: the original failure mode was norms exploding by orders
-        # of magnitude with depth; this catches that (and collapse) robustly.
-        assert 0.25 * target <= s["norm_mean"] <= 4.0 * target, (
-            f"depth {depth}: norm_mean {s['norm_mean']:.3f} outside "
-            f"[{0.25 * target:.3f}, {4.0 * target:.3f}]"
-        )
+    for phase, stats_by_depth in stats_by_phase.items():
+        for depth, s in stats_by_depth.items():
+            assert math.isfinite(s["norm_mean"]), (
+                f"[{phase}] non-finite norm at depth {depth}"
+            )
+            # Generous band: the original failure mode was norms exploding by
+            # orders of magnitude with depth; this catches that (and collapse).
+            assert 0.25 * target <= s["norm_mean"] <= 4.0 * target, (
+                f"[{phase}] depth {depth}: norm_mean {s['norm_mean']:.3f} outside "
+                f"[{0.25 * target:.3f}, {4.0 * target:.3f}]"
+            )
 
 
 def test_no_mean_shift() -> None:
-    """Per-element mean should stay near zero (Scaled WS removes mean-shift)."""
-    stats_by_depth = measure_signal_propagation()
-    for depth, s in stats_by_depth.items():
-        assert abs(s["elem_mean"]) < 0.5, (
-            f"depth {depth}: element mean {s['elem_mean']:.4f} drifted from 0"
-        )
+    """Per-element mean should stay near zero on both passes (Scaled WS removes
+    mean-shift)."""
+    stats_by_phase = measure_signal_propagation()
+    for phase, stats_by_depth in stats_by_phase.items():
+        for depth, s in stats_by_depth.items():
+            assert abs(s["elem_mean"]) < 0.5, (
+                f"[{phase}] depth {depth}: element mean {s['elem_mean']:.4f} "
+                f"drifted from 0"
+            )
 
 
 def main() -> None:
-    stats_by_depth = measure_signal_propagation()
-    print("Signal propagation through the primary DAG (fresh init, no training):")
-    print(format_table(stats_by_depth))
+    stats_by_phase = measure_signal_propagation()
+    print(
+        "Signal propagation through the primary DAG (fresh init, no training).\n"
+        "encode = forward pass down the DAG; "
+        "decode = guided-autoregressive predictions back up the DAG.\n"
+    )
+    print(format_table("encode", stats_by_phase["encode"]))
+    print()
+    print(format_table("decode", stats_by_phase["decode"]))
 
     test_norms_stay_bounded()
     test_no_mean_shift()
