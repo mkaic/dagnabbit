@@ -4,6 +4,7 @@ from datetime import datetime
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.summary import hparams as hparams_summary
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
@@ -152,8 +153,13 @@ def cfg_hparams() -> dict[str, bool | int | float | str]:
 
 
 def log_run_config(writer: SummaryWriter) -> None:
-    # Must be logged before scalars so TensorBoard associates them with this run.
-    writer.add_hparams(cfg_hparams(), {"hparam/started": 0.0})
+    # Log hparams on this writer (add_hparams opens a nested SummaryWriter subdir).
+    exp, ssi, sei = hparams_summary(
+        cfg_hparams(), {"hparam/started": 0.0}
+    )
+    writer.file_writer.add_summary(exp, 0)
+    writer.file_writer.add_summary(ssi, 0)
+    writer.file_writer.add_summary(sei, 0)
 
     config_text = "\n".join(
         f"{key}={value}"
