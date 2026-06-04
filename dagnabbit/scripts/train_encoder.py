@@ -75,6 +75,21 @@ def per_type_accuracies(
     return accuracies
 
 
+def node_type_class_label(cls: int) -> str:
+    """Map a node-type class index to a human-readable metaclass label."""
+    trunk_end = cfg.NUM_TRUNK_NODE_TYPES
+    root_end = trunk_end + cfg.NUM_ROOT_NODES
+    output_end = root_end + cfg.NUM_OUTPUT_NODES
+
+    if cls < trunk_end:
+        return f"trunk_class_{cls}"
+    if cls < root_end:
+        return f"root_class_{cls - trunk_end}"
+    if cls < output_end:
+        return f"output_class_{cls - root_end}"
+    raise ValueError(f"unknown node type class index: {cls}")
+
+
 def format_step_report(
     step: int,
     total: float,
@@ -225,7 +240,7 @@ def main() -> None:
                 for cls, acc in decoder_accuracies.items():
                     if not np.isnan(acc):
                         writer.add_scalar(
-                            f"accuracy_per_class/decoder_class_{cls}",
+                            f"accuracy_per_class/{node_type_class_label(cls)}",
                             acc,
                             step,
                         )
