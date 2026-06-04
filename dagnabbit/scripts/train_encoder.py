@@ -179,6 +179,11 @@ def parse_args() -> argparse.Namespace:
             "Defaults to a timestamp."
         ),
     )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable TensorBoard logging.",
+    )
     return parser.parse_args()
 
 
@@ -188,11 +193,14 @@ def main() -> None:
 
     device = torch.device(cfg.DEVICE)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
-    log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
-    writer = SummaryWriter(log_dir=log_dir)
-    log_run_config(writer)
+    writer: SummaryWriter | None = None
+    if not args.no_log:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
+        log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
+        writer = SummaryWriter(log_dir=log_dir)
+        log_run_config(writer)
+        print(f"tensorboard_log_dir={log_dir}")
 
     model = DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
@@ -207,7 +215,6 @@ def main() -> None:
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"tensorboard_log_dir={log_dir}")
     print(
         f"trainable_parameters={format_param_count(num_trainable_params)} "
         f"({num_trainable_params})"
@@ -240,12 +247,13 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad()
 
-            step_preds, step_truth = step_preds_and_truth(
-                losses.primary_node_predicted_type_logits,
-                losses.primary_node_true_types,
-            )
-            window_preds.append(step_preds)
-            window_truth.append(step_truth)
+            if writer is not None:
+                step_preds, step_truth = step_preds_and_truth(
+                    losses.primary_node_predicted_type_logits,
+                    losses.primary_node_true_types,
+                )
+                window_preds.append(step_preds)
+                window_truth.append(step_truth)
 
             loss_val = total.item()
             if loss_ema is None:
@@ -254,7 +262,7 @@ def main() -> None:
                 loss_ema = LOSS_EMA_DECAY * loss_ema + (1 - LOSS_EMA_DECAY) * loss_val
             progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
 
-            if step % cfg.LOG_EVERY == 0:
+            if writer is not None and step % cfg.LOG_EVERY == 0:
                 decoder_accuracies = per_type_accuracies(
                     np.concatenate(window_preds),
                     np.concatenate(window_truth),
@@ -270,7 +278,8 @@ def main() -> None:
                     decoder_accuracies,
                 )
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
 
 
 if __name__ == "__main__":
