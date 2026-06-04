@@ -1,3 +1,4 @@
+import argparse
 import logging
 from datetime import datetime
 
@@ -133,7 +134,23 @@ def format_step_report(
     )
 
 
-def log_config(writer: SummaryWriter) -> None:
+def cfg_hparams() -> dict[str, bool | int | float | str]:
+    """Build an ``add_hparams``-compatible dict from ``config.py``."""
+    hparams: dict[str, bool | int | float | str] = {}
+    for key, value in vars(cfg).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, (bool, int, float, str)):
+            hparams[key] = value
+        else:
+            hparams[key] = str(value)
+    return hparams
+
+
+def log_run_config(writer: SummaryWriter) -> None:
+    # Must be logged before scalars so TensorBoard associates them with this run.
+    writer.add_hparams(cfg_hparams(), {"hparam/started": 0.0})
+
     config_text = "\n".join(
         f"{key}={value}"
         for key, value in vars(cfg).items()
@@ -142,7 +159,21 @@ def log_config(writer: SummaryWriter) -> None:
     writer.add_text("config", config_text, global_step=0)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the DAG autoencoder.")
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Name for this TensorBoard run (creates runs/<name>/). "
+            "Defaults to a timestamp."
+        ),
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -151,10 +182,11 @@ def main() -> None:
 
     device = torch.device(cfg.DEVICE)
 
-    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
     log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
     writer = SummaryWriter(log_dir=log_dir)
-    log_config(writer)
+    log_run_config(writer)
     logging.info("tensorboard_log_dir=%s", log_dir)
 
     model = DagnabbitAutoEncoder(
