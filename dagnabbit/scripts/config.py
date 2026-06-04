@@ -10,7 +10,7 @@ NUM_OUTPUT_NODES = 4
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
 MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
-MLP_EXPANSION_FACTOR = 2.0
+MLP_EXPANSION_FACTOR = 4.0
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 64
@@ -21,7 +21,7 @@ LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 64
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 1.0
+GRADIENT_CLIP_MAX_NORM = None
 LOG_EVERY = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
