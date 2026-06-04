@@ -1,8 +1,9 @@
 import logging
+from datetime import datetime
 
-import mlflow
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import make_random_graph_description
@@ -117,6 +118,15 @@ def format_step_report(
     )
 
 
+def log_config(writer: SummaryWriter) -> None:
+    config_text = "\n".join(
+        f"{key}={value}"
+        for key, value in vars(cfg).items()
+        if not key.startswith("_")
+    )
+    writer.add_text("config", config_text, global_step=0)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -126,8 +136,11 @@ def main() -> None:
 
     device = torch.device(cfg.DEVICE)
 
-    mlflow.set_tracking_uri(cfg.MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(cfg.MLFLOW_EXPERIMENT_NAME)
+    run_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
+    writer = SummaryWriter(log_dir=log_dir)
+    log_config(writer)
+    logging.info("tensorboard_log_dir=%s", log_dir)
 
     model = DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
@@ -149,9 +162,7 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
 
-    with mlflow.start_run():
-        mlflow.log_params({k: v for k, v in vars(cfg).items() if not k.startswith("_")})
-
+    try:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
         window_truth: list[np.ndarray] = []
@@ -199,20 +210,27 @@ def main() -> None:
                     ),
                 )
 
-                metrics: dict[str, float] = {"loss/total": total.item()}
-                metrics.update({f"loss/{name}": v for name, v in components.items()})
+                writer.add_scalar("loss/total", total.item(), step)
+                for name, value in components.items():
+                    writer.add_scalar(f"loss/{name}", value, step)
 
                 valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
                 if valid_dec:
-                    metrics["accuracy/decoder_mean"] = float(np.mean(valid_dec))
+                    writer.add_scalar(
+                        "accuracy/decoder_mean",
+                        float(np.mean(valid_dec)),
+                        step,
+                    )
 
-                metrics.update({
-                    f"accuracy_per_class/decoder_class_{cls}": acc
-                    for cls, acc in decoder_accuracies.items()
-                    if not np.isnan(acc)
-                })
-
-                mlflow.log_metrics(metrics, step=step)
+                for cls, acc in decoder_accuracies.items():
+                    if not np.isnan(acc):
+                        writer.add_scalar(
+                            f"accuracy_per_class/decoder_class_{cls}",
+                            acc,
+                            step,
+                        )
+    finally:
+        writer.close()
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ dependencies = [
     "ruff>=0.14.13",
     "graphviz==0.21",
     "scikit-learn>=1.8.0",
-    "mlflow>=3.11.1",
+    "tensorboard>=2.18.0",
 ]
 
 [tool.setuptools.packages.find]
