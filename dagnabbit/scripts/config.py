@@ -1,3 +1,5 @@
+import torch
+
 # --- model ---
 NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
@@ -21,7 +23,7 @@ GRADIENT_ACCUMULATION_STEPS = 64
 # Set to None to disable clipping.
 GRADIENT_CLIP_MAX_NORM = 1.0
 LOG_EVERY = 64
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
