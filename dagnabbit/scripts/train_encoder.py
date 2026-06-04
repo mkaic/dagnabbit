@@ -244,6 +244,10 @@ def main() -> None:
             scaled_loss.backward()
 
             if (step + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
+                if cfg.GRADIENT_CLIP_MAX_NORM is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg.GRADIENT_CLIP_MAX_NORM
+                    )
                 optimizer.step()
                 optimizer.zero_grad()
 

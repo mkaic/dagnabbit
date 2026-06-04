@@ -16,8 +16,11 @@ NUM_TRUNK_NODES = 64
 # --- training ---
 NUM_STEPS = 10_000
 LEARNING_RATE = 1e-3
-GRADIENT_ACCUMULATION_STEPS = 8
-LOG_EVERY = 8
+GRADIENT_ACCUMULATION_STEPS = 64
+# Max L2 norm of gradients across all parameters before each optimizer step.
+# Set to None to disable clipping.
+GRADIENT_CLIP_MAX_NORM = 1.0
+LOG_EVERY = 64
 DEVICE = "cpu"
 SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
