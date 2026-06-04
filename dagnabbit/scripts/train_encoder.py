@@ -1,10 +1,10 @@
 import argparse
-import logging
 from datetime import datetime
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import make_random_graph_description
@@ -91,47 +91,51 @@ def node_type_class_label(cls: int) -> str:
     raise ValueError(f"unknown node type class index: {cls}")
 
 
-def format_step_report(
+LOSS_EMA_DECAY = 0.99
+
+
+def log_step_metrics(
+    writer: SummaryWriter,
     step: int,
     total: float,
     components: dict[str, float],
     decoder_accuracies: dict[int, float],
-) -> str:
-    """Compact multi-line summary of a training step's losses and accuracies."""
+) -> None:
+    writer.add_scalar("loss/total", total, step)
+    for name, value in components.items():
+        writer.add_scalar(f"loss/{name}", value, step)
 
-    def fmt_loss_row(prefix: str, label: str) -> str:
-        return (
-            f"  {label:<10} "
-            f"dec_cls={components[f'{prefix}_decoded_classification']:>9.4g}  "
-            f"dec_sim={components[f'{prefix}_decoded_similarity']:>9.4g}"
-        )
+    valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
+    if valid_dec:
+        writer.add_scalar("accuracy/decoder_mean", float(np.mean(valid_dec)), step)
 
     trunk_end = cfg.NUM_TRUNK_NODE_TYPES
     root_end = trunk_end + cfg.NUM_ROOT_NODES
     output_end = root_end + cfg.NUM_OUTPUT_NODES
-
-    def fmt_acc_group(accuracies: dict[int, float], start: int, end: int) -> str:
-        return "[" + ", ".join(
-            "  nan" if np.isnan(accuracies[i]) else f"{accuracies[i]:.3f}"
+    for group_name, start, end in (
+        ("trunk", 0, trunk_end),
+        ("root", trunk_end, root_end),
+        ("output", root_end, output_end),
+    ):
+        group_vals = [
+            decoder_accuracies[i]
             for i in range(start, end)
-        ) + "]"
-
-    def fmt_acc_row(label: str, start: int, end: int) -> str:
-        return (
-            f"  {label:<10} "
-            f"dec={fmt_acc_group(decoder_accuracies, start, end)}"
-        )
-
-    return "\n".join(
-        [
-            f"step={step} total={total:.4g}",
-            fmt_loss_row("condenser", "condenser"),
-            fmt_loss_row("primary", "primary"),
-            fmt_acc_row("acc_trunk", 0, trunk_end),
-            fmt_acc_row("acc_root", trunk_end, root_end),
-            fmt_acc_row("acc_output", root_end, output_end),
+            if not np.isnan(decoder_accuracies[i])
         ]
-    )
+        if group_vals:
+            writer.add_scalar(
+                f"accuracy/{group_name}",
+                float(np.mean(group_vals)),
+                step,
+            )
+
+    for cls, acc in decoder_accuracies.items():
+        if not np.isnan(acc):
+            writer.add_scalar(
+                f"accuracy_per_class/{node_type_class_label(cls)}",
+                acc,
+                step,
+            )
 
 
 def cfg_hparams() -> dict[str, bool | int | float | str]:
@@ -174,10 +178,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
     torch.manual_seed(cfg.SEED)
 
     device = torch.device(cfg.DEVICE)
@@ -187,7 +187,6 @@ def main() -> None:
     log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
     writer = SummaryWriter(log_dir=log_dir)
     log_run_config(writer)
-    logging.info("tensorboard_log_dir=%s", log_dir)
 
     model = DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
@@ -201,10 +200,11 @@ def main() -> None:
     ).to(device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(
-        "trainable_parameters=%s (%d)",
-        format_param_count(num_trainable_params),
-        num_trainable_params,
+
+    print(f"tensorboard_log_dir={log_dir}")
+    print(
+        f"trainable_parameters={format_param_count(num_trainable_params)} "
+        f"({num_trainable_params})"
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
@@ -213,7 +213,9 @@ def main() -> None:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
         window_truth: list[np.ndarray] = []
-        for step in range(cfg.NUM_STEPS):
+        loss_ema: float | None = None
+        progress = tqdm(range(cfg.NUM_STEPS), unit="step")
+        for step in progress:
             graph = make_random_graph_description(
                 num_root_nodes=cfg.NUM_ROOT_NODES,
                 num_trunk_nodes=cfg.NUM_TRUNK_NODES,
@@ -239,6 +241,13 @@ def main() -> None:
             window_preds.append(step_preds)
             window_truth.append(step_truth)
 
+            loss_val = total.item()
+            if loss_ema is None:
+                loss_ema = loss_val
+            else:
+                loss_ema = LOSS_EMA_DECAY * loss_ema + (1 - LOSS_EMA_DECAY) * loss_val
+            progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
+
             if step % cfg.LOG_EVERY == 0:
                 decoder_accuracies = per_type_accuracies(
                     np.concatenate(window_preds),
@@ -247,35 +256,13 @@ def main() -> None:
                 )
                 window_preds.clear()
                 window_truth.clear()
-                logging.info(
-                    "%s",
-                    format_step_report(
-                        step,
-                        total.item(),
-                        components,
-                        decoder_accuracies,
-                    ),
+                log_step_metrics(
+                    writer,
+                    step,
+                    loss_val,
+                    components,
+                    decoder_accuracies,
                 )
-
-                writer.add_scalar("loss/total", total.item(), step)
-                for name, value in components.items():
-                    writer.add_scalar(f"loss/{name}", value, step)
-
-                valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
-                if valid_dec:
-                    writer.add_scalar(
-                        "accuracy/decoder_mean",
-                        float(np.mean(valid_dec)),
-                        step,
-                    )
-
-                for cls, acc in decoder_accuracies.items():
-                    if not np.isnan(acc):
-                        writer.add_scalar(
-                            f"accuracy_per_class/{node_type_class_label(cls)}",
-                            acc,
-                            step,
-                        )
     finally:
         writer.close()
 
