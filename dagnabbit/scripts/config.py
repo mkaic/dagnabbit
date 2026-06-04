@@ -16,7 +16,7 @@ MLP_EXPANSION_FACTOR = 2.0
 NUM_TRUNK_NODES = 64
 
 # --- training ---
-NUM_STEPS = 10_000
+NUM_STEPS = 1_000_000
 LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 64
 # Max L2 norm of gradients across all parameters before each optimizer step.
