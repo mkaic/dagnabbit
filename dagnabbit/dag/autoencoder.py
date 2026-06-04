@@ -12,12 +12,6 @@ from dagnabbit.dag.description import (
 import torch.nn.functional as F
 
 
-def _normalize_to_sqrt_n(x: Tensor) -> Tensor:
-    """Rescale each D-dim vector along the last axis to have L2 norm sqrt(D)."""
-    dim = x.shape[-1]
-    return F.normalize(x, dim=-1) * math.sqrt(dim)
-
-
 def _class_balance_weights(node_types: list[int]) -> list[float]:
     """Return per-node weights of ``1 / count_of_that_type``.
 
@@ -31,13 +25,86 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
     return [1.0 / counts[t] for t in node_types]
 
 
+# Variance-preserving gain for GELU under standard-normal inputs: the reciprocal
+# of the standard deviation of ``GELU(z)`` for ``z ~ N(0, 1)`` (Brock et al.,
+# 2021, "Characterizing Signal Propagation to Close the Performance Gap in
+# Unnormalized ResNets"). Multiplying GELU outputs by this restores unit
+# variance, so a stack of Scaled-WS linears + GELUs is variance-preserving.
+GELU_VARIANCE_PRESERVING_GAIN = 1.7015043497085571
+
+
+class GammaScaledGELU(nn.Module):
+    """GELU scaled by its variance-preserving gain (Brock et al., 2021).
+
+    Computes ``GELU(x) * gamma``. The gain is applied *after* GELU on purpose:
+    it is calibrated as ``1 / std(GELU(z))`` for ``z ~ N(0, 1)``, so it only
+    restores unit variance when GELU is fed a unit-variance input and its
+    (variance-reduced) output is rescaled afterwards. Scaling before GELU would
+    break the calibration, since GELU is nonlinear.
+    """
+
+    def __init__(self, gain: float = GELU_VARIANCE_PRESERVING_GAIN):
+        super().__init__()
+        self.gain = gain
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.gelu(x) * self.gain
+
+
+class StandardizedLinear(nn.Module):
+    """Linear layer with Scaled Weight Standardization (Brock et al., 2021).
+
+    On every forward pass each output neuron's fan-in weights are standardized
+    to zero mean and, after fan-in scaling by ``1 / sqrt(fan_in)``, unit
+    sum-of-squares, then multiplied by ``gain``::
+
+        W_hat[i, j] = gain * (W[i, j] - mean_i) / sqrt(var_i * fan_in + eps)
+
+    For zero-mean, unit-variance inputs this makes ``Var(output) = gain**2``
+    (i.e. variance-preserving when ``gain == 1``) and forces each row's weight
+    mean to exactly zero, which removes the mean-shift that a positive-mean
+    activation (e.g. GELU) would otherwise accumulate across depth. The
+    standardization is a differentiable reparameterization, so gradients flow
+    into the underlying ``weight``.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        gain: float = 1.0,
+        eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gain = gain
+        self.eps = eps
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+
+    def _standardized_weight(self) -> Tensor:
+        mean = self.weight.mean(dim=1, keepdim=True)
+        var = self.weight.var(dim=1, unbiased=False, keepdim=True)
+        denom = torch.sqrt(var * self.in_features + self.eps)
+        return self.gain * (self.weight - mean) / denom
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self._standardized_weight(), self.bias)
+
+
 class MLP(nn.Module):
-    def __init__(self, vector_dims: Iterable[int], activation: nn.Module = nn.GELU()):
+    def __init__(
+        self,
+        vector_dims: Iterable[int],
+        activation: nn.Module = GammaScaledGELU(),
+    ):
         super().__init__()
 
         self.layers = nn.ModuleList(
             [
-                nn.Linear(vector_dims[i], vector_dims[i + 1])
+                StandardizedLinear(vector_dims[i], vector_dims[i + 1])
                 for i in range(len(vector_dims) - 1)
             ]
         )
@@ -90,7 +157,6 @@ class NodeEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
         x = self.encoder(x)
-        x = _normalize_to_sqrt_n(x)
 
         return x
 
@@ -118,7 +184,6 @@ class NodeDecoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)
         x = x.view(self.in_degree, self.node_embedding_dim)
-        x = _normalize_to_sqrt_n(x)
         x = torch.unbind(x, dim=0)
 
         return x
@@ -526,14 +591,17 @@ class DagnabbitAutoEncoder(nn.Module):
             decode_buffer_entry.embeddings_predicted_by_children
         )
 
-        average_predicted_embeddings = torch.mean(
-            embeddings_predicted_by_children,
-            dim=0,
-        )
-        average_predicted_embeddings = _normalize_to_sqrt_n(average_predicted_embeddings)
+        # Combine the per-child predictions in a variance-preserving way:
+        # for k uncorrelated unit-variance vectors, ``sum / sqrt(k)`` keeps unit
+        # variance (a plain mean would shrink it by ``1 / k``). This replaces the
+        # brute-force renormalization that previously masked the shrinkage.
+        num_children = embeddings_predicted_by_children.shape[0]
+        combined_predicted_embeddings = embeddings_predicted_by_children.sum(
+            dim=0
+        ) / math.sqrt(num_children)
 
         predicted_type_logits: Tensor = self.node_type_predictor(
-            average_predicted_embeddings
+            combined_predicted_embeddings
         )
         decode_buffer_entry.predicted_type_logits = predicted_type_logits
 
@@ -560,7 +628,7 @@ class DagnabbitAutoEncoder(nn.Module):
         node_type = graph.node_types[node_idx]
         node_autoencoder = node_autoencoders[node_type]
         predicted_parent_embeddings = node_autoencoder.decode(
-            average_predicted_embeddings, node_type
+            combined_predicted_embeddings, node_type
         )
 
         for parent_idx, parent_embedding in zip(
