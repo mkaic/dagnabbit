@@ -21,10 +21,10 @@ LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 1
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = None
+GRADIENT_CLIP_MAX_NORM = 1
 LOG_EVERY = 1
-DEVICE="cpu"
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# DEVICE="cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
