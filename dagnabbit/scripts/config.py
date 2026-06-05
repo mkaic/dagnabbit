@@ -23,7 +23,8 @@ GRADIENT_ACCUMULATION_STEPS = 64
 # Set to None to disable clipping.
 GRADIENT_CLIP_MAX_NORM = None
 LOG_EVERY = 64
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE="cpu"
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
