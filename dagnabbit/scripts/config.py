@@ -1,14 +1,14 @@
 import torch
 
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 1
 CONDENSER_NODE_TYPE_IN_DEGREE = 2
 NUM_ROOT_NODES = 4
 NUM_OUTPUT_NODES = 4
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
-MLP_DEPTH = 4
+MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
 MLP_EXPANSION_FACTOR = 2.0
 
