@@ -1,7 +1,7 @@
 import torch
 
 # --- model ---
-NODE_EMBEDDING_DIM = 512
+NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 1
 CONDENSER_NODE_TYPE_IN_DEGREE = 2
@@ -18,11 +18,11 @@ NUM_TRUNK_NODES = 64
 # --- training ---
 NUM_STEPS = 1_000_000
 LEARNING_RATE = 1e-3
-GRADIENT_ACCUMULATION_STEPS = 64
+GRADIENT_ACCUMULATION_STEPS = 1
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
 GRADIENT_CLIP_MAX_NORM = None
-LOG_EVERY = 64
+LOG_EVERY = 1
 DEVICE="cpu"
 # DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
