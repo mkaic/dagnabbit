@@ -85,10 +85,15 @@ class StandardizedLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def _standardized_weight(self) -> Tensor:
-        mean = self.weight.mean(dim=1, keepdim=True)
-        var = self.weight.var(dim=1, unbiased=False, keepdim=True)
+        # Upcast to float32 for the normalization arithmetic: eps=1e-5 loses its
+        # guard in bf16's ~3-digit precision, and var/sqrt are sensitive to that.
+        # The result is cast back to the parameter dtype so the matmul runs at
+        # whatever precision the caller (or autocast) expects.
+        w = self.weight.float()
+        mean = w.mean(dim=1, keepdim=True)
+        var = w.var(dim=1, unbiased=False, keepdim=True)
         denom = torch.sqrt(var * self.in_features + self.eps)
-        return self.gain * (self.weight - mean) / denom
+        return (self.gain * (w - mean) / denom).to(self.weight.dtype)
 
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(x, self._standardized_weight(), self.bias)

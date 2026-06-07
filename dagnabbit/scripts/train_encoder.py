@@ -114,7 +114,7 @@ def main() -> None:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-    ).to(device)
+    ).to(device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
