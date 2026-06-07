@@ -30,8 +30,11 @@ SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
 # --- loss weights ---
+# Reconstruction = cosine distance between each node's decode-side combined
+# prediction and its encode-side embedding (direct embedding-reconstruction /
+# teacher-forcing target).
 W_CONDENSER_DECODED_CLASSIFICATION = 1.0
-W_CONDENSER_DECODED_SIMILARITY = 0.01
+W_CONDENSER_RECONSTRUCTION = 1.0
 
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
-W_PRIMARY_DECODED_SIMILARITY = 0.01
+W_PRIMARY_RECONSTRUCTION = 1.0

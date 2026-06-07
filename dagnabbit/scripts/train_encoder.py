@@ -25,28 +25,24 @@ def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     cc_mean = torch.stack(losses.condenser_node_classification_losses).mean()
-    cs_mean = torch.stack(
-        losses.condenser_node_predicted_embeddings_similarity_losses
-    ).mean()
+    cr_mean = torch.stack(losses.condenser_node_reconstruction_losses).mean()
     pc_mean = torch.stack(losses.primary_node_classification_losses).mean()
-    ps_mean = torch.stack(
-        losses.primary_node_predicted_embeddings_similarity_losses
-    ).mean()
+    pr_mean = torch.stack(losses.primary_node_reconstruction_losses).mean()
 
     total = (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean
-        + cfg.W_CONDENSER_DECODED_SIMILARITY * cs_mean
+        + cfg.W_CONDENSER_RECONSTRUCTION * cr_mean
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
-        + cfg.W_PRIMARY_DECODED_SIMILARITY * ps_mean
+        + cfg.W_PRIMARY_RECONSTRUCTION * pr_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
     # steps that actually log them, rather than every step.
     components = {
         "condenser_decoded_classification": cc_mean,
-        "condenser_decoded_similarity": cs_mean,
+        "condenser_reconstruction": cr_mean,
         "primary_decoded_classification": pc_mean,
-        "primary_decoded_similarity": ps_mean,
+        "primary_reconstruction": pr_mean,
     }
     return total, components
 

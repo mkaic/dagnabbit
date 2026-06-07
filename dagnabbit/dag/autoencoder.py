@@ -296,7 +296,13 @@ class OutputNodeAutoEncoder(NodeAutoEncoder):
             mlp_depth=mlp_depth,
             mlp_expansion_factor=mlp_expansion_factor,
         )
+        # Frozen for the same reason as the root embeddings (see
+        # DagnabbitAutoEncoder.__init__): output slots follow an adjacent
+        # taxonomy to roots, so pinning them to fixed, near-orthogonal targets
+        # forces the encode/decode path to preserve each output slot's identity
+        # rather than letting the learnable slot embeddings collapse together.
         self.output_node_embeddings = nn.Embedding(num_output_nodes, node_embedding_dim)
+        self.output_node_embeddings.weight.requires_grad_(False)
 
     def encode(self, input_node_embeddings: Tensor, node_type: int) -> Tensor:
         output_slot_idx = node_type - self.output_node_types_start
@@ -319,7 +325,10 @@ class OutputNodeAutoEncoder(NodeAutoEncoder):
 class TrainingDecodeBufferEntry:
     embeddings_predicted_by_children: list[Tensor]
     classification_loss: Tensor | None
-    child_predicted_embeddings_similarity_loss: Tensor | None
+    # Cosine distance between this node's decode-side combined prediction and the
+    # encode-side embedding for the same node, tying the decode path back to the
+    # encode path (a direct embedding-reconstruction / teacher-forcing target).
+    reconstruction_loss: Tensor | None
     predicted_type_logits: Tensor | None
     # The variance-preserving combination of `embeddings_predicted_by_children`
     # that this node's decode/classification actually consumes. Populated by
@@ -330,9 +339,9 @@ class TrainingDecodeBufferEntry:
 @dataclass
 class TrainingStepLossReturnType:
     condenser_node_classification_losses: list[Tensor]
-    condenser_node_predicted_embeddings_similarity_losses: list[Tensor]
+    condenser_node_reconstruction_losses: list[Tensor]
     primary_node_classification_losses: list[Tensor]
-    primary_node_predicted_embeddings_similarity_losses: list[Tensor]
+    primary_node_reconstruction_losses: list[Tensor]
     # Raw per-node logits and true type labels for downstream diagnostics
     # (e.g. per-node-type accuracy per class).
     condenser_node_predicted_type_logits: list[Tensor]
@@ -407,9 +416,16 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         # ---- Root node embeddings ----
+        # Frozen on purpose. When these are learnable they tend to collapse
+        # together (root identity is only weakly supervised through the shared
+        # type head), which leaves root classification stuck at chance. Freezing
+        # a random init pins the four roots to fixed, near-orthogonal targets
+        # (random high-dim vectors are ~orthogonal), so the encode/decode path is
+        # forced to preserve and recover each root's identity instead.
         self.root_node_embeddings = nn.Embedding(
             self.num_root_nodes, self.node_embedding_dim
         )
+        self.root_node_embeddings.weight.requires_grad_(False)
 
         # ---- Unified node-autoencoder lookup by node type ----
         # Trunk types live at [0, num_trunk_node_types); output types live at
@@ -551,7 +567,7 @@ class DagnabbitAutoEncoder(nn.Module):
         condenser_decode_buffer = [
             TrainingDecodeBufferEntry(
                 embeddings_predicted_by_children=[],
-                child_predicted_embeddings_similarity_loss=None,
+                reconstruction_loss=None,
                 classification_loss=None,
                 predicted_type_logits=None,
             )
@@ -560,7 +576,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         condenser_decode_buffer[-1] = TrainingDecodeBufferEntry(
             embeddings_predicted_by_children=[graph_embedding],
-            child_predicted_embeddings_similarity_loss=None,
+            reconstruction_loss=None,
             classification_loss=None,
             predicted_type_logits=None,
         )
@@ -591,6 +607,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=condenser_graph,
                 decode_buffer=condenser_decode_buffer,
                 node_autoencoders={0: self.condenser_node_autoencoder},
+                encoder_buffer=condenser_buffer,
                 class_label=condenser_node_labels[node_idx],
                 classification_loss_weight=condenser_classification_loss_weights[
                     node_idx
@@ -606,7 +623,7 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_decode_buffer = [
             TrainingDecodeBufferEntry(
                 embeddings_predicted_by_children=[],
-                child_predicted_embeddings_similarity_loss=None,
+                reconstruction_loss=None,
                 classification_loss=None,
                 predicted_type_logits=None,
             )
@@ -627,6 +644,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=primary_graph,
                 decode_buffer=primary_decode_buffer,
                 node_autoencoders=self.node_autoencoders,
+                encoder_buffer=primary_buffer,
                 class_label=primary_node_labels[node_idx],
                 classification_loss_weight=primary_classification_loss_weights[
                     node_idx
@@ -646,16 +664,14 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_node_classification_losses=[
                 e.classification_loss for e in condenser_trunk_entries
             ],
-            condenser_node_predicted_embeddings_similarity_losses=[
-                e.child_predicted_embeddings_similarity_loss
-                for e in condenser_trunk_entries
+            condenser_node_reconstruction_losses=[
+                e.reconstruction_loss for e in condenser_trunk_entries
             ],
             primary_node_classification_losses=[
                 e.classification_loss for e in primary_decode_buffer
             ],
-            primary_node_predicted_embeddings_similarity_losses=[
-                e.child_predicted_embeddings_similarity_loss
-                for e in primary_decode_buffer
+            primary_node_reconstruction_losses=[
+                e.reconstruction_loss for e in primary_decode_buffer
             ],
             condenser_node_predicted_type_logits=[
                 e.predicted_type_logits for e in condenser_trunk_entries
@@ -677,12 +693,16 @@ class DagnabbitAutoEncoder(nn.Module):
         graph: FixedInDegreeDAGDescription,
         decode_buffer: list[TrainingDecodeBufferEntry],
         node_autoencoders: dict[int, NodeAutoEncoder],
+        encoder_buffer: Tensor,
         class_label: Tensor,
         classification_loss_weight: float = 1.0,
     ) -> None:
         """Populate `decode_buffer[node_idx]`'s losses and push this node's
         predicted parent embeddings into its parents' buffer entries.
 
+        ``encoder_buffer`` is the encode-side per-node embedding buffer for this
+        graph; ``encoder_buffer[node_idx]`` is the reconstruction target for this
+        node's decode-side prediction.
         ``class_label`` is this node's classification target as a 0-dim ``long``
         tensor already on the right device (precomputed by the caller).
         ``classification_loss_weight`` multiplies this node's classification
@@ -715,8 +735,17 @@ class DagnabbitAutoEncoder(nn.Module):
             classification_loss * classification_loss_weight
         )
 
-        decode_buffer_entry.child_predicted_embeddings_similarity_loss = torch.std(
-            embeddings_predicted_by_children, dim=0, correction=0
+        # Tie the decode path to the encode path: this node's combined
+        # child-predicted embedding is pulled toward the encoder's embedding for
+        # the same node. The encoder-side target is NOT detached, so this loss
+        # backpropagates into both paths. Using cosine distance (rather than MSE)
+        # keeps it bounded in [0, 2] regardless of embedding magnitudes, which
+        # matters here because the combined prediction is sqrt(k)-scaled and
+        # encoder magnitudes can drift during training (an MSE term would explode).
+        decode_buffer_entry.reconstruction_loss = 1.0 - F.cosine_similarity(
+            combined_predicted_embeddings,
+            encoder_buffer[node_idx],
+            dim=0,
         )
 
         node_parent_indices = graph.node_inputs_indices[node_idx]
