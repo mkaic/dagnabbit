@@ -2,8 +2,8 @@ outputs
 *.png
 runs/
 
-profile_out/
-profile_terminal_output.txt
+profile_out*/
+profile_terminal_output*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

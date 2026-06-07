@@ -144,6 +144,7 @@ class MLP(nn.Module):
         )
         self.activation = activation
 
+    @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
             x = layer(x)
