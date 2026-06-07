@@ -144,7 +144,12 @@ def main() -> None:
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
             )
 
-            losses = model.training_forward(graph)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                losses = model.training_forward(graph)
             total, components = combine_losses(losses)
 
             scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
