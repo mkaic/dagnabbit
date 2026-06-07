@@ -23,6 +23,7 @@ GRADIENT_ACCUMULATION_STEPS = 1
 # Set to None to disable clipping.
 GRADIENT_CLIP_MAX_NORM = 1
 LOG_EVERY = 1
+CHECK_BEST_EVERY = 1000
 # DEVICE="cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1

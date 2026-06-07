@@ -1,5 +1,7 @@
 import argparse
+from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -169,6 +171,24 @@ def log_run_config(writer: SummaryWriter) -> None:
     writer.add_text("config", config_text, global_step=0)
 
 
+def save_checkpoint(
+    path: Path,
+    step: int,
+    model: DagnabbitAutoEncoder,
+    optimizer: torch.optim.Optimizer,
+    loss: float,
+) -> None:
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": loss,
+        },
+        path,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the DAG autoencoder.")
     parser.add_argument(
@@ -193,14 +213,17 @@ def main() -> None:
 
     device = torch.device(cfg.DEVICE)
 
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
+    run_dir = Path(cfg.TENSORBOARD_LOG_DIR) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"run_dir={run_dir}")
+
     writer: SummaryWriter | None = None
     if not args.no_log:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
-        log_dir = f"{cfg.TENSORBOARD_LOG_DIR}/{run_name}"
-        writer = SummaryWriter(log_dir=log_dir)
+        writer = SummaryWriter(log_dir=str(run_dir))
         log_run_config(writer)
-        print(f"tensorboard_log_dir={log_dir}")
+        print(f"tensorboard_log_dir={run_dir}")
 
     model = DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
@@ -227,6 +250,8 @@ def main() -> None:
         window_preds: list[np.ndarray] = []
         window_truth: list[np.ndarray] = []
         loss_ema: float | None = None
+        best_loss: float | None = None
+        loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
             graph = make_random_graph_description(
@@ -260,6 +285,7 @@ def main() -> None:
                 window_truth.append(step_truth)
 
             loss_val = total.item()
+            loss_window.append(loss_val)
             if loss_ema is None:
                 loss_ema = loss_val
             else:
@@ -281,6 +307,23 @@ def main() -> None:
                     components,
                     decoder_accuracies,
                 )
+
+            if (step + 1) % cfg.CHECK_BEST_EVERY == 0:
+                avg_loss = sum(loss_window) / len(loss_window)
+                if best_loss is None or avg_loss < best_loss:
+                    best_loss = avg_loss
+                    checkpoint_path = run_dir / "best.ckpt"
+                    save_checkpoint(
+                        checkpoint_path,
+                        step,
+                        model,
+                        optimizer,
+                        avg_loss,
+                    )
+                    progress.write(
+                        f"step {step + 1}: new best avg loss {avg_loss:.4g} "
+                        f"-> {checkpoint_path}"
+                    )
     finally:
         if writer is not None:
             writer.close()
