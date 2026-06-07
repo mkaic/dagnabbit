@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.profiler import ProfilerActivity, profile, schedule
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -69,6 +70,36 @@ def save_checkpoint(
     )
 
 
+def dump_profile(
+    prof: profile,
+    output_dir: Path,
+    device: torch.device,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
+    table = prof.key_averages().table(sort_by=sort_key, row_limit=30)
+    print("\n==== top ops by", sort_key, "====")
+    print(table)
+    (output_dir / "op_table.txt").write_text(table)
+
+    trace_path = output_dir / "trace.json"
+    prof.export_chrome_trace(str(trace_path))
+    print(f"chrome_trace={trace_path}  (open in chrome://tracing or ui.perfetto.dev)")
+
+    if device.type == "cuda":
+        snapshot_path = output_dir / "mem_snapshot.pickle"
+        torch.cuda.memory._dump_snapshot(str(snapshot_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"memory_snapshot={snapshot_path}  (open at pytorch.org/memory_viz)")
+        print(
+            "max_memory_allocated_gb="
+            f"{torch.cuda.max_memory_allocated() / 1e9:.3f}  "
+            "max_memory_reserved_gb="
+            f"{torch.cuda.max_memory_reserved() / 1e9:.3f}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the DAG autoencoder.")
     parser.add_argument(
@@ -83,6 +114,25 @@ def parse_args() -> argparse.Namespace:
         "--no-log",
         action="store_true",
         help="Disable TensorBoard logging.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Run a short torch.profiler + CUDA memory-snapshot pass instead of a "
+            "full training run, write artifacts to --profile-output-dir, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=8,
+        help="Number of profiled (active) steps after warmup. Only used with --profile.",
+    )
+    parser.add_argument(
+        "--profile-output-dir",
+        default="profile_out",
+        help="Directory for profiler artifacts (trace.json, mem_snapshot.pickle).",
     )
     return parser.parse_args()
 
@@ -124,6 +174,32 @@ def main() -> None:
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
+
+    prof: profile | None = None
+    total_profile_steps = 0
+    if args.profile:
+        # wait: skip the very first (cold) step; warmup: let allocator/caches and
+        # cudnn autotune settle so we measure steady-state; active: recorded steps.
+        wait, warmup = 1, 2
+        total_profile_steps = wait + warmup + args.profile_steps
+        activities = [ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+            torch.cuda.memory._record_memory_history(max_entries=100_000)
+        prof = profile(
+            activities=activities,
+            schedule=schedule(
+                wait=wait, warmup=warmup, active=args.profile_steps, repeat=1
+            ),
+            record_shapes=True,
+            with_stack=True,
+            profile_memory=True,
+        )
+        prof.start()
+        print(
+            f"profiling: running {total_profile_steps} steps "
+            f"(wait={wait}, warmup={warmup}, active={args.profile_steps})"
+        )
 
     try:
         optimizer.zero_grad()
@@ -226,7 +302,15 @@ def main() -> None:
                         f"step {step + 1}: new best avg loss {avg_loss:.4g} "
                         f"-> {checkpoint_path}"
                     )
+
+            if prof is not None:
+                prof.step()
+                if step + 1 >= total_profile_steps:
+                    break
     finally:
+        if prof is not None:
+            prof.stop()
+            dump_profile(prof, Path(args.profile_output_dir), device)
         if writer is not None:
             writer.close()
 
