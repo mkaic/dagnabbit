@@ -6,12 +6,18 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.tensorboard.summary import hparams as hparams_summary
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
+from dagnabbit.scripts.logging_utils import (
+    format_param_count,
+    log_run_config,
+    log_step_metrics,
+    per_type_accuracies,
+    step_preds_and_truth,
+)
 
 
 def combine_losses(
@@ -42,133 +48,7 @@ def combine_losses(
     return total, components
 
 
-def format_param_count(n: int) -> str:
-    """Format a parameter count as a short human-readable string (e.g. 1.23M)."""
-    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(n) >= threshold:
-            return f"{n / threshold:.2f}{suffix}"
-    return str(n)
-
-
-def step_preds_and_truth(
-    logits_per_node: list[torch.Tensor],
-    true_types: list[int],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Extract argmax predictions and true class ids for one step."""
-    preds = torch.stack(logits_per_node).detach().argmax(dim=-1).cpu().numpy()
-    truth = np.asarray(true_types, dtype=np.int64)
-    return preds, truth
-
-
-def per_type_accuracies(
-    preds: np.ndarray,
-    truth: np.ndarray,
-    num_classes: int,
-) -> dict[int, float]:
-    """Per-class accuracy (recall): argmax==c rate over nodes whose true type is c.
-
-    NaN for classes with no nodes of that type in the accumulated window.
-    """
-    accuracies: dict[int, float] = {}
-    for c in range(num_classes):
-        mask = truth == c
-        if not mask.any():
-            accuracies[c] = float("nan")
-        else:
-            accuracies[c] = float((preds[mask] == c).mean())
-    return accuracies
-
-
-def node_type_class_label(cls: int) -> str:
-    """Map a node-type class index to a human-readable metaclass label."""
-    trunk_end = cfg.NUM_TRUNK_NODE_TYPES
-    root_end = trunk_end + cfg.NUM_ROOT_NODES
-    output_end = root_end + cfg.NUM_OUTPUT_NODES
-
-    if cls < trunk_end:
-        return f"trunk_class_{cls}"
-    if cls < root_end:
-        return f"root_class_{cls - trunk_end}"
-    if cls < output_end:
-        return f"output_class_{cls - root_end}"
-    raise ValueError(f"unknown node type class index: {cls}")
-
-
 LOSS_EMA_DECAY = 0.99
-
-
-def log_step_metrics(
-    writer: SummaryWriter,
-    step: int,
-    total: float,
-    components: dict[str, float],
-    decoder_accuracies: dict[int, float],
-) -> None:
-    writer.add_scalar("loss/total", total, step)
-    for name, value in components.items():
-        writer.add_scalar(f"loss/{name}", value, step)
-
-    valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
-    if valid_dec:
-        writer.add_scalar("accuracy/decoder_mean", float(np.mean(valid_dec)), step)
-
-    trunk_end = cfg.NUM_TRUNK_NODE_TYPES
-    root_end = trunk_end + cfg.NUM_ROOT_NODES
-    output_end = root_end + cfg.NUM_OUTPUT_NODES
-    for group_name, start, end in (
-        ("trunk", 0, trunk_end),
-        ("root", trunk_end, root_end),
-        ("output", root_end, output_end),
-    ):
-        group_vals = [
-            decoder_accuracies[i]
-            for i in range(start, end)
-            if not np.isnan(decoder_accuracies[i])
-        ]
-        if group_vals:
-            writer.add_scalar(
-                f"accuracy/{group_name}",
-                float(np.mean(group_vals)),
-                step,
-            )
-
-    for cls, acc in decoder_accuracies.items():
-        if not np.isnan(acc):
-            writer.add_scalar(
-                f"accuracy_per_class/{node_type_class_label(cls)}",
-                acc,
-                step,
-            )
-
-
-def cfg_hparams() -> dict[str, bool | int | float | str]:
-    """Build an ``add_hparams``-compatible dict from ``config.py``."""
-    hparams: dict[str, bool | int | float | str] = {}
-    for key, value in vars(cfg).items():
-        if key.startswith("_"):
-            continue
-        if isinstance(value, (bool, int, float, str)):
-            hparams[key] = value
-        else:
-            hparams[key] = str(value)
-    return hparams
-
-
-def log_run_config(writer: SummaryWriter) -> None:
-    # Log hparams on this writer (add_hparams opens a nested SummaryWriter subdir).
-    exp, ssi, sei = hparams_summary(
-        cfg_hparams(), {"hparam/started": 0.0}
-    )
-    writer.file_writer.add_summary(exp, 0)
-    writer.file_writer.add_summary(ssi, 0)
-    writer.file_writer.add_summary(sei, 0)
-
-    config_text = "\n".join(
-        f"{key}={value}"
-        for key, value in vars(cfg).items()
-        if not key.startswith("_")
-    )
-    writer.add_text("config", config_text, global_step=0)
 
 
 def save_checkpoint(
@@ -249,6 +129,8 @@ def main() -> None:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
         window_truth: list[np.ndarray] = []
+        condenser_window_preds: list[np.ndarray] = []
+        condenser_window_truth: list[np.ndarray] = []
         loss_ema: float | None = None
         best_loss: float | None = None
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
@@ -284,6 +166,13 @@ def main() -> None:
                 window_preds.append(step_preds)
                 window_truth.append(step_truth)
 
+                condenser_step_preds, condenser_step_truth = step_preds_and_truth(
+                    losses.condenser_node_predicted_type_logits,
+                    losses.condenser_node_true_types,
+                )
+                condenser_window_preds.append(condenser_step_preds)
+                condenser_window_truth.append(condenser_step_truth)
+
             loss_val = total.item()
             loss_window.append(loss_val)
             if loss_ema is None:
@@ -298,14 +187,22 @@ def main() -> None:
                     np.concatenate(window_truth),
                     num_classes=model.num_node_types,
                 )
+                condenser_decoder_accuracies = per_type_accuracies(
+                    np.concatenate(condenser_window_preds),
+                    np.concatenate(condenser_window_truth),
+                    num_classes=model.num_node_types,
+                )
                 window_preds.clear()
                 window_truth.clear()
+                condenser_window_preds.clear()
+                condenser_window_truth.clear()
                 log_step_metrics(
                     writer,
                     step,
                     loss_val,
                     components,
                     decoder_accuracies,
+                    condenser_decoder_accuracies,
                 )
 
             if (step + 1) % cfg.CHECK_BEST_EVERY == 0:

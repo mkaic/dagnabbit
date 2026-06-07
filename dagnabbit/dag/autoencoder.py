@@ -300,6 +300,8 @@ class TrainingStepLossReturnType:
     primary_node_predicted_embeddings_similarity_losses: list[Tensor]
     # Raw per-node logits and true type labels for downstream diagnostics
     # (e.g. per-node-type accuracy per class).
+    condenser_node_predicted_type_logits: list[Tensor]
+    condenser_node_true_types: list[int]
     primary_node_predicted_type_logits: list[Tensor]
     primary_node_true_types: list[int]
 
@@ -584,6 +586,10 @@ class DagnabbitAutoEncoder(nn.Module):
                 e.child_predicted_embeddings_similarity_loss
                 for e in primary_decode_buffer
             ],
+            condenser_node_predicted_type_logits=[
+                e.predicted_type_logits for e in condenser_trunk_entries
+            ],
+            condenser_node_true_types=list(condenser_trunk_true_types),
             primary_node_predicted_type_logits=[
                 e.predicted_type_logits for e in primary_decode_buffer
             ],
