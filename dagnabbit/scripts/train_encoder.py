@@ -114,7 +114,7 @@ def main() -> None:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-    ).to(device=device, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32)
+    ).to(device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -144,12 +144,7 @@ def main() -> None:
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
             )
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=device.type == "cuda",
-            ):
-                losses = model.training_forward(graph)
+            losses = model.training_forward(graph)
             total, components = combine_losses(losses)
 
             scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
