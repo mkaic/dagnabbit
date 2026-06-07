@@ -23,7 +23,7 @@ from dagnabbit.scripts.logging_utils import (
 
 def combine_losses(
     losses: TrainingStepLossReturnType,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     cc_mean = torch.stack(losses.condenser_node_classification_losses).mean()
     cs_mean = torch.stack(
         losses.condenser_node_predicted_embeddings_similarity_losses
@@ -40,11 +40,13 @@ def combine_losses(
         + cfg.W_PRIMARY_DECODED_SIMILARITY * ps_mean
     )
 
+    # Keep components as tensors; materialize to floats (a GPU sync) only on the
+    # steps that actually log them, rather than every step.
     components = {
-        "condenser_decoded_classification": cc_mean.item(),
-        "condenser_decoded_similarity": cs_mean.item(),
-        "primary_decoded_classification": pc_mean.item(),
-        "primary_decoded_similarity": ps_mean.item(),
+        "condenser_decoded_classification": cc_mean,
+        "condenser_decoded_similarity": cs_mean,
+        "primary_decoded_classification": pc_mean,
+        "primary_decoded_similarity": ps_mean,
     }
     return total, components
 
@@ -220,16 +222,24 @@ def main() -> None:
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
             )
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=device.type == "cuda",
-            ):
-                losses = model.training_forward(graph)
-            total, components = combine_losses(losses)
+            autocast_enabled = device.type == "cuda"
+            # Standardize each linear's weight once for this step (in the autocast
+            # compute dtype so the bf16 cast is also done once) and reuse it for
+            # every node visit, instead of recomputing it per call. Backward stays
+            # inside this context (it needs the cached weights) but outside the
+            # autocast region, as recommended.
+            cache_dtype = torch.bfloat16 if autocast_enabled else None
+            with model.cached_standardized_weights(dtype=cache_dtype):
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.bfloat16,
+                    enabled=autocast_enabled,
+                ):
+                    losses = model.training_forward(graph)
+                total, components = combine_losses(losses)
 
-            scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
-            scaled_loss.backward()
+                scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
+                scaled_loss.backward()
 
             if (step + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
                 if cfg.GRADIENT_CLIP_MAX_NORM is not None:
@@ -281,7 +291,7 @@ def main() -> None:
                     writer,
                     step,
                     loss_val,
-                    components,
+                    {name: value.item() for name, value in components.items()},
                     decoder_accuracies,
                     condenser_decoder_accuracies,
                 )

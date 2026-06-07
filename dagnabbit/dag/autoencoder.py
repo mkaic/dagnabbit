@@ -1,9 +1,10 @@
+import contextlib
 import math
 
 import torch
 from torch import Tensor
 import torch.nn as nn
-from typing import Iterable
+from typing import Iterable, Iterator
 from dataclasses import dataclass
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
@@ -83,6 +84,12 @@ class StandardizedLinear(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.randn(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        # Per-step memoization of the standardized weight. Populated by
+        # `prime_weight_cache` (see `DagnabbitAutoEncoder.cached_standardized_weights`)
+        # so the standardization is computed once per step instead of once per
+        # node visit. A plain attribute, not a Parameter/buffer, so it never
+        # enters the state_dict.
+        self._weight_cache: Tensor | None = None
 
     def _standardized_weight(self) -> Tensor:
         mean = self.weight.mean(dim=1, keepdim=True)
@@ -90,8 +97,35 @@ class StandardizedLinear(nn.Module):
         denom = torch.sqrt(var * self.in_features + self.eps)
         return self.gain * (self.weight - mean) / denom
 
+    def prime_weight_cache(self, dtype: torch.dtype | None = None) -> None:
+        """Compute the standardized weight once and memoize it for reuse across
+        every call in the current forward/backward.
+
+        This is a differentiable reparameterization just like calling
+        ``_standardized_weight`` per forward: the cached tensor is part of the
+        autograd graph, so gradients still flow back into ``self.weight`` through
+        the standardization (Adam keeps optimizing the raw latent weight exactly
+        as before). It is merely computed once instead of once per node visit.
+
+        ``dtype`` casts the cached weight a single time (e.g. to the autocast
+        compute dtype). This matters because autocast only caches its weight
+        casts for *leaf* tensors; the standardized weight is non-leaf, so without
+        this each ``F.linear`` would re-cast (and save for backward) a fresh
+        low-precision copy on every call.
+        """
+        weight = self._standardized_weight()
+        if dtype is not None:
+            weight = weight.to(dtype)
+        self._weight_cache = weight
+
+    def clear_weight_cache(self) -> None:
+        self._weight_cache = None
+
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self._standardized_weight(), self.bias)
+        weight = self._weight_cache
+        if weight is None:
+            weight = self._standardized_weight()
+        return F.linear(x, weight, self.bias)
 
 
 class MLP(nn.Module):
@@ -398,6 +432,29 @@ class DagnabbitAutoEncoder(nn.Module):
             )
         )
 
+    @contextlib.contextmanager
+    def cached_standardized_weights(
+        self, dtype: torch.dtype | None = None
+    ) -> Iterator[None]:
+        """Standardize every ``StandardizedLinear``'s weight once, reuse it for
+        every node visit in this step, then drop the cache on exit.
+
+        Numerically identical to recomputing the standardization on every call
+        (so the optimizer still trains the raw latent weights through it), but
+        for this model it collapses ~1.7k standardizations/step down to the ~21
+        distinct linear layers. Wrap a single step's forward+backward in this;
+        the cache is rebuilt each step because the weights change after
+        ``optimizer.step()``.
+        """
+        linears = [m for m in self.modules() if isinstance(m, StandardizedLinear)]
+        for m in linears:
+            m.prime_weight_cache(dtype)
+        try:
+            yield
+        finally:
+            for m in linears:
+                m.clear_weight_cache()
+
     @staticmethod
     def evaluate_graph(
         graph: FixedInDegreeDAGDescription,
@@ -514,6 +571,17 @@ class DagnabbitAutoEncoder(nn.Module):
             list(primary_graph.node_types)
         )
 
+        # Precompute the per-node classification targets once as device tensors,
+        # instead of building a fresh scalar tensor (a host->device transfer) per
+        # node inside `_decode_step`.
+        label_device = self.root_node_embeddings.weight.device
+        condenser_node_labels = torch.as_tensor(
+            list(condenser_graph.node_types), dtype=torch.long, device=label_device
+        )
+        primary_node_labels = torch.as_tensor(
+            list(primary_graph.node_types), dtype=torch.long, device=label_device
+        )
+
         for node_idx in reversed(
             range(condenser_graph.num_root_nodes, condenser_graph.num_nodes)
         ):
@@ -522,6 +590,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=condenser_graph,
                 decode_buffer=condenser_decode_buffer,
                 node_autoencoders={0: self.condenser_node_autoencoder},
+                class_label=condenser_node_labels[node_idx],
                 classification_loss_weight=condenser_classification_loss_weights[
                     node_idx
                 ],
@@ -557,6 +626,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 graph=primary_graph,
                 decode_buffer=primary_decode_buffer,
                 node_autoencoders=self.node_autoencoders,
+                class_label=primary_node_labels[node_idx],
                 classification_loss_weight=primary_classification_loss_weights[
                     node_idx
                 ],
@@ -606,11 +676,14 @@ class DagnabbitAutoEncoder(nn.Module):
         graph: FixedInDegreeDAGDescription,
         decode_buffer: list[TrainingDecodeBufferEntry],
         node_autoencoders: dict[int, NodeAutoEncoder],
+        class_label: Tensor,
         classification_loss_weight: float = 1.0,
     ) -> None:
         """Populate `decode_buffer[node_idx]`'s losses and push this node's
         predicted parent embeddings into its parents' buffer entries.
 
+        ``class_label`` is this node's classification target as a 0-dim ``long``
+        tensor already on the right device (precomputed by the caller).
         ``classification_loss_weight`` multiplies this node's classification
         loss; callers use it for class-balanced weighting across node types.
         """
@@ -636,14 +709,7 @@ class DagnabbitAutoEncoder(nn.Module):
         )
         decode_buffer_entry.predicted_type_logits = predicted_type_logits
 
-        classification_loss = F.cross_entropy(
-            predicted_type_logits,
-            torch.tensor(
-                graph.node_types[node_idx],
-                dtype=torch.long,
-                device=predicted_type_logits.device,
-            ),
-        )
+        classification_loss = F.cross_entropy(predicted_type_logits, class_label)
         decode_buffer_entry.classification_loss = (
             classification_loss * classification_loss_weight
         )
