@@ -30,11 +30,30 @@ SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
 # --- loss weights ---
+# Uniform scale applied to the weighted sum of all loss terms before backward.
+GLOBAL_LOSS_MULTIPLIER = 1.0
+
 # Reconstruction = cosine distance between each node's decode-side combined
 # prediction and its encode-side embedding (direct embedding-reconstruction /
 # teacher-forcing target).
+#
+# Each training step runs two decode passes over one shared encode pass:
+#   * autoregressive: the genuine model; predictions compound down the DAG.
+#   * teacher-forced (TF): every node decodes its true encode embedding, so the
+#     autoregressive chain is severed and the decoders are scored on recovering
+#     parent identity from clean inputs.
+# The two are weighted independently; set the TF weights to 0.0 to disable the
+# teacher-forced pass' contribution to the loss (it is still computed for
+# logging, so zero them *and* skip logging if you want it fully gone).
 W_CONDENSER_DECODED_CLASSIFICATION = 1.0
 W_CONDENSER_RECONSTRUCTION = 0.2
 
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 W_PRIMARY_RECONSTRUCTION = 0.2
+
+# --- teacher-forced decode pass loss weights ---
+W_TF_CONDENSER_DECODED_CLASSIFICATION = 1.0
+W_TF_CONDENSER_RECONSTRUCTION = 0.2
+
+W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
+W_TF_PRIMARY_RECONSTRUCTION = 0.2

@@ -109,6 +109,8 @@ def log_step_metrics(
     components: dict[str, float],
     decoder_accuracies: dict[int, float],
     condenser_decoder_accuracies: dict[int, float],
+    tf_decoder_accuracies: dict[int, float] | None = None,
+    tf_condenser_decoder_accuracies: dict[int, float] | None = None,
 ) -> None:
     writer.add_scalar("loss/total", total, step)
     for name, value in components.items():
@@ -130,6 +132,29 @@ def log_step_metrics(
         tag_prefix="accuracy/condenser",
         per_class_tag_prefix="accuracy/condenser_per_class",
     )
+
+    # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
+    # so they sit next to the autoregressive curves in TensorBoard). The whole
+    # point of the TF pass is to watch whether root identity is recoverable from
+    # clean inputs, so per-class root accuracy lives here.
+    if tf_decoder_accuracies is not None:
+        log_decoder_accuracies(
+            writer,
+            step,
+            tf_decoder_accuracies,
+            mean_tag="accuracy/tf/decoder_mean",
+            tag_prefix="accuracy/tf",
+            per_class_tag_prefix="accuracy/tf_per_class",
+        )
+    if tf_condenser_decoder_accuracies is not None:
+        log_decoder_accuracies(
+            writer,
+            step,
+            tf_condenser_decoder_accuracies,
+            mean_tag="accuracy/tf_condenser/mean",
+            tag_prefix="accuracy/tf_condenser",
+            per_class_tag_prefix="accuracy/tf_condenser_per_class",
+        )
 
 
 def cfg_hparams() -> dict[str, bool | int | float | str]:

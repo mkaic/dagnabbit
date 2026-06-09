@@ -29,11 +29,20 @@ def combine_losses(
     pc_mean = losses.primary_node_classification_losses.mean()
     pr_mean = losses.primary_node_reconstruction_losses.mean()
 
-    total = (
+    tf_cc_mean = losses.teacher_forced_condenser_node_classification_losses.mean()
+    tf_cr_mean = losses.teacher_forced_condenser_node_reconstruction_losses.mean()
+    tf_pc_mean = losses.teacher_forced_primary_node_classification_losses.mean()
+    tf_pr_mean = losses.teacher_forced_primary_node_reconstruction_losses.mean()
+
+    total = cfg.GLOBAL_LOSS_MULTIPLIER * (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean
         + cfg.W_CONDENSER_RECONSTRUCTION * cr_mean
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
         + cfg.W_PRIMARY_RECONSTRUCTION * pr_mean
+        + cfg.W_TF_CONDENSER_DECODED_CLASSIFICATION * tf_cc_mean
+        + cfg.W_TF_CONDENSER_RECONSTRUCTION * tf_cr_mean
+        + cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
+        + cfg.W_TF_PRIMARY_RECONSTRUCTION * tf_pr_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
@@ -43,6 +52,10 @@ def combine_losses(
         "condenser_reconstruction": cr_mean,
         "primary_decoded_classification": pc_mean,
         "primary_reconstruction": pr_mean,
+        "tf_condenser_decoded_classification": tf_cc_mean,
+        "tf_condenser_reconstruction": tf_cr_mean,
+        "tf_primary_decoded_classification": tf_pc_mean,
+        "tf_primary_reconstruction": tf_pr_mean,
     }
     return total, components
 
@@ -205,6 +218,10 @@ def main() -> None:
         window_truth: list[np.ndarray] = []
         condenser_window_preds: list[np.ndarray] = []
         condenser_window_truth: list[np.ndarray] = []
+        tf_window_preds: list[np.ndarray] = []
+        tf_window_truth: list[np.ndarray] = []
+        tf_condenser_window_preds: list[np.ndarray] = []
+        tf_condenser_window_truth: list[np.ndarray] = []
         loss_ema: float | None = None
         best_loss: float | None = None
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
@@ -260,6 +277,21 @@ def main() -> None:
                 condenser_window_preds.append(condenser_step_preds)
                 condenser_window_truth.append(condenser_step_truth)
 
+                # Teacher-forced predictions share the autoregressive true labels.
+                tf_step_preds, tf_step_truth = step_preds_and_truth(
+                    losses.teacher_forced_primary_node_predicted_type_logits,
+                    losses.primary_node_true_types,
+                )
+                tf_window_preds.append(tf_step_preds)
+                tf_window_truth.append(tf_step_truth)
+
+                tf_condenser_step_preds, tf_condenser_step_truth = step_preds_and_truth(
+                    losses.teacher_forced_condenser_node_predicted_type_logits,
+                    losses.condenser_node_true_types,
+                )
+                tf_condenser_window_preds.append(tf_condenser_step_preds)
+                tf_condenser_window_truth.append(tf_condenser_step_truth)
+
             loss_val = total.item()
             loss_window.append(loss_val)
             if loss_ema is None:
@@ -279,10 +311,24 @@ def main() -> None:
                     np.concatenate(condenser_window_truth),
                     num_classes=model.num_node_types,
                 )
+                tf_decoder_accuracies = per_type_accuracies(
+                    np.concatenate(tf_window_preds),
+                    np.concatenate(tf_window_truth),
+                    num_classes=model.num_node_types,
+                )
+                tf_condenser_decoder_accuracies = per_type_accuracies(
+                    np.concatenate(tf_condenser_window_preds),
+                    np.concatenate(tf_condenser_window_truth),
+                    num_classes=model.num_node_types,
+                )
                 window_preds.clear()
                 window_truth.clear()
                 condenser_window_preds.clear()
                 condenser_window_truth.clear()
+                tf_window_preds.clear()
+                tf_window_truth.clear()
+                tf_condenser_window_preds.clear()
+                tf_condenser_window_truth.clear()
                 log_step_metrics(
                     writer,
                     step,
@@ -290,6 +336,8 @@ def main() -> None:
                     {name: value.item() for name, value in components.items()},
                     decoder_accuracies,
                     condenser_decoder_accuracies,
+                    tf_decoder_accuracies,
+                    tf_condenser_decoder_accuracies,
                 )
 
             if (step + 1) % cfg.CHECK_BEST_EVERY == 0:

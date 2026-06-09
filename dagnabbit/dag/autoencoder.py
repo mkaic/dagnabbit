@@ -404,6 +404,34 @@ class TrainingStepLossReturnType:
     condenser_node_true_types: Tensor
     primary_node_predicted_type_logits: Tensor
     primary_node_true_types: Tensor
+    # Teacher-forced counterparts of the four loss tensors and the two logit
+    # tensors above (same node alignment, same true labels). These come from a
+    # second decode pass that feeds each node its true encode embedding instead
+    # of its own prediction; see ``DagnabbitAutoEncoder._decode_pipeline``.
+    teacher_forced_condenser_node_classification_losses: Tensor
+    teacher_forced_condenser_node_reconstruction_losses: Tensor
+    teacher_forced_primary_node_classification_losses: Tensor
+    teacher_forced_primary_node_reconstruction_losses: Tensor
+    teacher_forced_condenser_node_predicted_type_logits: Tensor
+    teacher_forced_primary_node_predicted_type_logits: Tensor
+
+
+@dataclass
+class _DecodePipelineResult:
+    """Dense per-node outputs of a single decode pass (condenser + primary).
+
+    ``*_class_losses`` / ``*_recon_losses`` / ``*_logits`` are node-indexed; the
+    condenser tensors still include their (skipped) root slots at the front, so
+    callers slice ``[num_condenser_roots:]`` exactly as before.
+    """
+
+    condenser_logits: Tensor
+    condenser_class_losses: Tensor
+    condenser_recon_losses: Tensor
+    primary_combined: Tensor
+    primary_logits: Tensor
+    primary_class_losses: Tensor
+    primary_recon_losses: Tensor
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -660,18 +688,134 @@ class DagnabbitAutoEncoder(nn.Module):
 
         device = primary_buffer.device
 
-        # Guided Autoregressive Decode.
-        #
-        # The decode propagates predicted parent embeddings up each DAG. We hold
-        # two dense buffers per graph instead of per-node prediction lists:
-        #   child_sum[n]   = running sum of embeddings predicted for node n by
-        #                    its (already-decoded) children, and
-        #   child_count[n] = how many such predictions have landed on n.
-        # A node's combined prediction is then ``child_sum / sqrt(child_count)``
-        # (the same variance-preserving combine as before), and a child pushes
-        # into its parents with ``index_add_`` (an order-independent sum, so the
-        # result matches the old per-node list-sum up to float reduction order).
+        # ---- Per-graph labels and class-balance weights ----
+        # Shared by both decode passes (same graph, same node types).
+        condenser_labels = torch.as_tensor(
+            list(condenser_graph.node_types), dtype=torch.long, device=device
+        )
+        condenser_weights = torch.as_tensor(
+            _class_balance_weights(list(condenser_graph.node_types)),
+            dtype=condenser_buffer.dtype,
+            device=device,
+        )
+        primary_labels = torch.as_tensor(
+            list(primary_graph.node_types), dtype=torch.long, device=device
+        )
+        primary_weights = torch.as_tensor(
+            _class_balance_weights(list(primary_graph.node_types)),
+            dtype=primary_buffer.dtype,
+            device=device,
+        )
 
+        # Two decode passes over the *same* (shared) encode pass. The
+        # autoregressive pass is the genuine model -- predictions compound down
+        # each DAG. The teacher-forced pass instead feeds every node its true
+        # encode embedding, severing the autoregressive chain so the decoders are
+        # asked to recover each parent's identity from a clean input. The combine
+        # / classify / reconstruct targets are identical between the two; only
+        # what the decoders are fed differs (see ``_decode_graph``).
+        autoregressive = self._decode_pipeline(
+            primary_graph=primary_graph,
+            condenser_graph=condenser_graph,
+            primary_buffer=primary_buffer,
+            condenser_buffer=condenser_buffer,
+            graph_embedding=graph_embedding,
+            primary_labels=primary_labels,
+            primary_weights=primary_weights,
+            condenser_labels=condenser_labels,
+            condenser_weights=condenser_weights,
+            device=device,
+            teacher_forcing=False,
+        )
+        teacher_forced = self._decode_pipeline(
+            primary_graph=primary_graph,
+            condenser_graph=condenser_graph,
+            primary_buffer=primary_buffer,
+            condenser_buffer=condenser_buffer,
+            graph_embedding=graph_embedding,
+            primary_labels=primary_labels,
+            primary_weights=primary_weights,
+            condenser_labels=condenser_labels,
+            condenser_weights=condenser_weights,
+            device=device,
+            teacher_forcing=True,
+        )
+
+        # ---- Assemble the return contract ----
+        # The condenser exposes only its trunk nodes (roots are not decoded); the
+        # primary exposes every node. Autoregressive and teacher-forced loss /
+        # logit tensors stay node-aligned and share the same true labels.
+        num_condenser_roots = condenser_graph.num_root_nodes
+        losses = TrainingStepLossReturnType(
+            condenser_node_classification_losses=autoregressive.condenser_class_losses[
+                num_condenser_roots:
+            ],
+            condenser_node_reconstruction_losses=autoregressive.condenser_recon_losses[
+                num_condenser_roots:
+            ],
+            primary_node_classification_losses=autoregressive.primary_class_losses,
+            primary_node_reconstruction_losses=autoregressive.primary_recon_losses,
+            condenser_node_predicted_type_logits=autoregressive.condenser_logits[
+                num_condenser_roots:
+            ],
+            condenser_node_true_types=condenser_labels[num_condenser_roots:],
+            primary_node_predicted_type_logits=autoregressive.primary_logits,
+            primary_node_true_types=primary_labels,
+            teacher_forced_condenser_node_classification_losses=(
+                teacher_forced.condenser_class_losses[num_condenser_roots:]
+            ),
+            teacher_forced_condenser_node_reconstruction_losses=(
+                teacher_forced.condenser_recon_losses[num_condenser_roots:]
+            ),
+            teacher_forced_primary_node_classification_losses=(
+                teacher_forced.primary_class_losses
+            ),
+            teacher_forced_primary_node_reconstruction_losses=(
+                teacher_forced.primary_recon_losses
+            ),
+            teacher_forced_condenser_node_predicted_type_logits=(
+                teacher_forced.condenser_logits[num_condenser_roots:]
+            ),
+            teacher_forced_primary_node_predicted_type_logits=(
+                teacher_forced.primary_logits
+            ),
+        )
+
+        if return_buffers:
+            # `autoregressive.primary_combined` is the node-indexed [num_nodes, D]
+            # decode-side combined-prediction buffer from the genuine
+            # (autoregressive) pass, consumed directly by diagnostics.
+            return losses, primary_buffer, autoregressive.primary_combined
+        return losses
+
+    def _decode_pipeline(
+        self,
+        primary_graph: FixedInDegreeDAGDescription,
+        condenser_graph: FixedInDegreeDAGDescription,
+        primary_buffer: Tensor,
+        condenser_buffer: Tensor,
+        graph_embedding: Tensor,
+        primary_labels: Tensor,
+        primary_weights: Tensor,
+        condenser_labels: Tensor,
+        condenser_weights: Tensor,
+        device: torch.device,
+        teacher_forcing: bool,
+    ) -> "_DecodePipelineResult":
+        """Run one full decode (condenser -> transplant -> primary) end to end.
+
+        The decode propagates predicted parent embeddings up each DAG. We hold
+        two dense buffers per graph instead of per-node prediction lists:
+          child_sum[n]   = running sum of embeddings predicted for node n by its
+                           (already-decoded) children, and
+          child_count[n] = how many such predictions have landed on n.
+        A node's combined prediction is then ``child_sum / sqrt(child_count)``,
+        and a child pushes into its parents with ``index_add_`` (an
+        order-independent sum). Fresh buffers are allocated per call, so the
+        autoregressive and teacher-forced passes never share decode state.
+
+        ``teacher_forcing`` is threaded straight through to ``_decode_graph``.
+        """
         # ---- Condenser decode ----
         condenser_child_sum = torch.zeros(
             condenser_graph.num_nodes,
@@ -686,15 +830,6 @@ class DagnabbitAutoEncoder(nn.Module):
         # embedding: one prediction, so its combine is the graph embedding itself.
         condenser_child_sum[-1] = graph_embedding
         condenser_child_count[-1] = 1.0
-
-        condenser_labels = torch.as_tensor(
-            list(condenser_graph.node_types), dtype=torch.long, device=device
-        )
-        condenser_weights = torch.as_tensor(
-            _class_balance_weights(list(condenser_graph.node_types)),
-            dtype=condenser_buffer.dtype,
-            device=device,
-        )
 
         (
             _condenser_combined,
@@ -711,6 +846,7 @@ class DagnabbitAutoEncoder(nn.Module):
             class_weights=condenser_weights,
             process_roots=False,
             device=device,
+            teacher_forcing=teacher_forcing,
         )
 
         # ---- Transplant condenser roots -> primary leaves ----
@@ -741,15 +877,6 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         # ---- Primary decode ----
-        primary_labels = torch.as_tensor(
-            list(primary_graph.node_types), dtype=torch.long, device=device
-        )
-        primary_weights = torch.as_tensor(
-            _class_balance_weights(list(primary_graph.node_types)),
-            dtype=primary_buffer.dtype,
-            device=device,
-        )
-
         (
             primary_combined,
             primary_logits,
@@ -765,36 +892,18 @@ class DagnabbitAutoEncoder(nn.Module):
             class_weights=primary_weights,
             process_roots=True,
             device=device,
+            teacher_forcing=teacher_forcing,
         )
 
-        # ---- Assemble the return contract ----
-        # Return the dense per-node tensors directly (no per-node relisting). The
-        # condenser exposes only its trunk nodes (roots are not decoded), exactly
-        # as before; the primary exposes every node. All four loss tensors and the
-        # logits/true-type pairs stay node-aligned, which is all consumers require.
-        num_condenser_roots = condenser_graph.num_root_nodes
-        losses = TrainingStepLossReturnType(
-            condenser_node_classification_losses=condenser_class_losses[
-                num_condenser_roots:
-            ],
-            condenser_node_reconstruction_losses=condenser_recon_losses[
-                num_condenser_roots:
-            ],
-            primary_node_classification_losses=primary_class_losses,
-            primary_node_reconstruction_losses=primary_recon_losses,
-            condenser_node_predicted_type_logits=condenser_logits[
-                num_condenser_roots:
-            ],
-            condenser_node_true_types=condenser_labels[num_condenser_roots:],
-            primary_node_predicted_type_logits=primary_logits,
-            primary_node_true_types=primary_labels,
+        return _DecodePipelineResult(
+            condenser_logits=condenser_logits,
+            condenser_class_losses=condenser_class_losses,
+            condenser_recon_losses=condenser_recon_losses,
+            primary_combined=primary_combined,
+            primary_logits=primary_logits,
+            primary_class_losses=primary_class_losses,
+            primary_recon_losses=primary_recon_losses,
         )
-
-        if return_buffers:
-            # `primary_combined` is the node-indexed [num_nodes, D] decode-side
-            # combined-prediction buffer, consumed directly by diagnostics.
-            return losses, primary_buffer, primary_combined
-        return losses
 
     def _decode_graph(
         self,
@@ -807,6 +916,7 @@ class DagnabbitAutoEncoder(nn.Module):
         class_weights: Tensor,
         process_roots: bool,
         device: torch.device,
+        teacher_forcing: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Run the batched guided-autoregressive decode over one graph.
 
@@ -829,6 +939,17 @@ class DagnabbitAutoEncoder(nn.Module):
         primary roots are classified/reconstructed (they have no parents, so
         nothing is scattered), whereas condenser roots are skipped entirely --
         they only hold accumulated predictions for the transplant.
+
+        ``teacher_forcing`` controls *what each node's decoder is fed*. When
+        ``False`` (the default, the genuine autoregressive pass) a node decodes
+        its own predicted ``combined`` embedding, so prediction error compounds
+        down the DAG. When ``True`` every node instead decodes its *true*
+        encode-side embedding (``encoder_buffer``), so each parent prediction is
+        produced from ground truth -- this severs the autoregressive chain and
+        tests whether the decoders can recover a parent's identity (e.g. which
+        root) when handed a clean input. The combine / classify / reconstruct of
+        each node still uses the *accumulated* predictions, so the loss targets
+        are unchanged; only the decoder inputs differ.
 
         Returns dense per-node tensors ``(combined, logits, classification_loss,
         reconstruction_loss)``; entries for nodes that were not processed stay
@@ -892,9 +1013,19 @@ class DagnabbitAutoEncoder(nn.Module):
                 subtypes = group.subtypes.to(device)
 
                 node_autoencoder = node_autoencoders[int(group.subtypes[0])]
+                # Autoregressive: decode each node's own predicted ``combined``.
+                # Teacher-forced: decode each node's true encode embedding, so
+                # the prediction handed to each parent is generated from ground
+                # truth rather than from accumulated (possibly collapsed)
+                # predictions.
+                decode_input = (
+                    encoder_buffer[node_buffer_indices]
+                    if teacher_forcing
+                    else combined_buffer[node_buffer_indices]
+                )
                 # [G, in_degree, D]: predicted embedding of each ordered parent.
                 predicted_parent_embeddings = node_autoencoder.decode_batch(
-                    combined_buffer[node_buffer_indices], subtypes
+                    decode_input, subtypes
                 )
 
                 flat_parent_indices = parent_gather_indices.reshape(-1)
