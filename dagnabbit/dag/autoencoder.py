@@ -594,7 +594,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 node_autoencoder = node_autoencoders[int(group.subtypes[0])]
                 embeddings_buffer[node_buffer_indices] = node_autoencoder.encode_batch(
                     parent_embeddings, subtypes
-                )
+                ).to(embeddings_buffer.dtype)
 
         return embeddings_buffer
 
@@ -865,17 +865,20 @@ class DagnabbitAutoEncoder(nn.Module):
             combined_buffer[rank_node_indices] = combined
 
             logits = self.node_type_predictor(combined)
-            logits_buffer[rank_node_indices] = logits
+            logits_buffer[rank_node_indices] = logits.to(logits_buffer.dtype)
             cross_entropy = F.cross_entropy(
                 logits, labels[rank_node_indices], reduction="none"
             )
             classification_losses[rank_node_indices] = (
                 cross_entropy * class_weights[rank_node_indices]
-            )
+            ).to(classification_losses.dtype)
 
-            reconstruction_losses[rank_node_indices] = 1.0 - F.cosine_similarity(
-                combined, encoder_buffer[rank_node_indices], dim=-1
-            )
+            reconstruction_losses[rank_node_indices] = (
+                1.0
+                - F.cosine_similarity(
+                    combined, encoder_buffer[rank_node_indices], dim=-1
+                )
+            ).to(reconstruction_losses.dtype)
 
             # Per group with parents: decode this rank's combined predictions
             # into predicted parent embeddings and scatter them up the DAG.
