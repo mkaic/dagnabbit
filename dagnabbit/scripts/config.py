@@ -22,7 +22,7 @@ LEARNING_RATE = 1 / (NODE_EMBEDDING_DIM * 4)
 GRADIENT_ACCUMULATION_STEPS = 8 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = None
+GRADIENT_CLIP_MAX_NORM = 1.0
 LOG_EVERY = 8
 CHECK_BEST_EVERY = 1000
 # DEVICE="cpu"
