@@ -3,6 +3,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.tensorboard.summary import hparams as hparams_summary
 
+from dagnabbit.dag.description import NodeSupertype, subtype_to_supertype
 from dagnabbit.scripts import config as cfg
 
 
@@ -47,15 +48,13 @@ def node_type_class_label(cls: int) -> str:
     """Map a node-type class index to a human-readable metaclass label."""
     trunk_end = cfg.NUM_TRUNK_NODE_TYPES
     root_end = trunk_end + cfg.NUM_ROOT_NODES
-    output_end = root_end + cfg.NUM_OUTPUT_NODES
 
-    if cls < trunk_end:
+    supertype = subtype_to_supertype(cls)
+    if supertype is NodeSupertype.TRUNK:
         return f"trunk_class_{cls}"
-    if cls < root_end:
+    if supertype is NodeSupertype.ROOT:
         return f"root_class_{cls - trunk_end}"
-    if cls < output_end:
-        return f"output_class_{cls - root_end}"
-    raise ValueError(f"unknown node type class index: {cls}")
+    return f"output_class_{cls - root_end}"
 
 
 def log_decoder_accuracies(
@@ -71,22 +70,21 @@ def log_decoder_accuracies(
     if valid_dec:
         writer.add_scalar(mean_tag, float(np.mean(valid_dec)), step)
 
-    trunk_end = cfg.NUM_TRUNK_NODE_TYPES
-    root_end = trunk_end + cfg.NUM_ROOT_NODES
-    output_end = root_end + cfg.NUM_OUTPUT_NODES
-    for group_name, start, end in (
-        ("trunk", 0, trunk_end),
-        ("root", trunk_end, root_end),
-        ("output", root_end, output_end),
-    ):
-        group_vals = [
-            decoder_accuracies[i]
-            for i in range(start, end)
-            if not np.isnan(decoder_accuracies[i])
-        ]
+    supertype_groups: dict[NodeSupertype, list[float]] = {
+        NodeSupertype.TRUNK: [],
+        NodeSupertype.ROOT: [],
+        NodeSupertype.OUTPUT: [],
+    }
+    for cls, acc in decoder_accuracies.items():
+        if np.isnan(acc):
+            continue
+        supertype = subtype_to_supertype(cls)
+        supertype_groups[supertype].append(acc)
+
+    for supertype, group_vals in supertype_groups.items():
         if group_vals:
             writer.add_scalar(
-                f"{tag_prefix}/{group_name}",
+                f"{tag_prefix}/{supertype.value}",
                 float(np.mean(group_vals)),
                 step,
             )

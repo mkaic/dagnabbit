@@ -1,6 +1,60 @@
+from enum import Enum
+
 import torch
 
 NodeInputIndices = list[int]
+
+
+class NodeSupertype(Enum):
+    """Module-level role of a node, used as a batch key for grouped evaluation."""
+
+    ROOT = "root"
+    TRUNK = "trunk"
+    OUTPUT = "output"
+    CONDENSER = "condenser"
+
+
+def subtype_to_supertype(
+    node_type: int,
+    num_trunk_node_types: int | None = None,
+    num_root_nodes: int | None = None,
+    num_output_nodes: int | None = None,
+) -> NodeSupertype:
+    """Map a raw ``node_type`` subtype index to its :class:`NodeSupertype`.
+
+    Uses the unified type-index layout:
+        [0, num_trunk_node_types)                        -> TRUNK
+        [root_node_types_start, output_node_types_start) -> ROOT
+        [output_node_types_start, num_node_types)        -> OUTPUT
+
+    Any layout argument left as ``None`` falls back to the corresponding value
+    in ``dagnabbit.scripts.config``, so training callsites can omit them.
+
+    Note that the subtype alone cannot distinguish ``CONDENSER`` from ``TRUNK``
+    (condenser trunk nodes reuse the trunk type space); that distinction is made
+    at the graph level by the caller.
+    """
+    if num_trunk_node_types is None or num_root_nodes is None or num_output_nodes is None:
+        from dagnabbit.scripts import config as cfg
+
+        if num_trunk_node_types is None:
+            num_trunk_node_types = cfg.NUM_TRUNK_NODE_TYPES
+        if num_root_nodes is None:
+            num_root_nodes = cfg.NUM_ROOT_NODES
+        if num_output_nodes is None:
+            num_output_nodes = cfg.NUM_OUTPUT_NODES
+
+    root_node_types_start = num_trunk_node_types
+    output_node_types_start = num_trunk_node_types + num_root_nodes
+    num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
+
+    if node_type < root_node_types_start:
+        return NodeSupertype.TRUNK
+    if node_type < output_node_types_start:
+        return NodeSupertype.ROOT
+    if node_type < num_node_types:
+        return NodeSupertype.OUTPUT
+    raise ValueError(f"unknown node type subtype index: {node_type}")
 
 
 class FixedInDegreeDAGDescription:
