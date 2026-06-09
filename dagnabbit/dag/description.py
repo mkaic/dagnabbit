@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 
 import torch
@@ -57,6 +58,32 @@ def subtype_to_supertype(
     raise ValueError(f"unknown node type subtype index: {node_type}")
 
 
+@dataclass
+class RankGroup:
+    """A batch of nodes that share a topological rank and a batch key.
+
+    All nodes in a group are evaluated together in a single encoder/decoder MLP
+    call. Nodes are grouped by :class:`NodeSupertype`, and ``TRUNK`` nodes are
+    grouped further by their (trunk-local) subtype, since each trunk type has
+    its own module and in-degree. Every node in a group therefore shares the
+    same in-degree, so ``parent_buffer_gather_indices`` is a rectangular
+    ``[G, in_degree]`` tensor, and all ``subtypes`` are identical within a
+    ``TRUNK`` group. Use ``group.subtypes`` to look up the per-node module on
+    the model.
+
+    All tensors are stored on CPU at generation time; the model moves them to
+    the compute device once.
+    """
+
+    supertype: NodeSupertype
+    # Global buffer indices of the nodes in this group: LongTensor [G].
+    node_buffer_indices: torch.Tensor
+    # Buffer positions of each node's ordered parents: LongTensor [G, in_degree].
+    parent_buffer_gather_indices: torch.Tensor
+    # Raw node_type subtype index of each node: LongTensor [G].
+    subtypes: torch.Tensor
+
+
 class FixedInDegreeDAGDescription:
     def __init__(
         self,
@@ -111,6 +138,11 @@ class FixedInDegreeDAGDescription:
 
         self.leaf_node_indices = self.identify_leaf_nodes()
 
+        # Batch overlay over the (unchanged) flat arrays: longest-path rank per
+        # node, and the per-rank groups iterated over during grouped evaluation.
+        self.node_ranks = self.compute_node_ranks()
+        self.rank_groups = self.build_rank_groups()
+
     def identify_leaf_nodes(self) -> list[int]:
         """
         Identify all leaf nodes in the DAG.
@@ -123,6 +155,87 @@ class FixedInDegreeDAGDescription:
         for inputs in self.node_inputs_indices:
             referenced.update(inputs)
         return sorted(n for n in range(self.num_nodes) if n not in referenced)
+
+    def compute_node_ranks(self) -> list[int]:
+        """Longest-path depth of each node (roots are rank 0).
+
+        Every other node's rank is ``1 + max(parent ranks)``. Nodes are stored
+        in topological order (roots first, every trunk/output node only
+        references earlier indices), so a single forward sweep suffices.
+        """
+        ranks = [0] * self.num_nodes
+        for node_idx in range(self.num_root_nodes, self.num_nodes):
+            parents = self.node_inputs_indices[node_idx]
+            ranks[node_idx] = 1 + max((ranks[p] for p in parents), default=0)
+        return ranks
+
+    def build_rank_groups(self) -> list[list[RankGroup]]:
+        """Group nodes by topological rank and batch key into :class:`RankGroup`s.
+
+        Returns a list indexed by rank (ascending). Each entry is a list of
+        groups at that rank, one per batch key, in first-appearance node order.
+        The batch key is the node's :class:`NodeSupertype`, refined by
+        trunk-local subtype for ``TRUNK`` nodes. Roots (rank 0) form a
+        degenerate group with an empty ``[G, 0]`` ``parent_buffer_gather_indices``
+        and no MLP.
+        """
+        max_rank = max(self.node_ranks, default=0)
+
+        # Single pass over all nodes, bucketing into nested dicts indexed by rank
+        # then batch key. dict preserves insertion order (Python 3.7+), so both
+        # the ranks (visited ascending) and the groups within each rank come out
+        # in first-appearance node order without any separate ordering lists.
+        nodes_by_rank_and_key: list[dict[tuple, list[int]]] = [
+            {} for _ in range(max_rank + 1)
+        ]
+        for node_idx, (subtype, rank) in enumerate(
+            zip(self.node_types, self.node_ranks)
+        ):
+            supertype = subtype_to_supertype(
+                subtype,
+                num_trunk_node_types=self.num_trunk_node_types,
+                num_root_nodes=self.num_root_nodes,
+                num_output_nodes=self.num_output_nodes,
+            )
+            # Trunk types live at the start of the type space, so the raw subtype
+            # is already the trunk-local subtype; use it directly to split trunk
+            # groups (each trunk type has its own module + in-degree). Roots and
+            # outputs collapse into one group per supertype.
+            trunk_subtype = subtype if supertype is NodeSupertype.TRUNK else None
+            key = (supertype, trunk_subtype)
+            nodes_by_rank_and_key[rank].setdefault(key, []).append(node_idx)
+
+        rank_groups: list[list[RankGroup]] = []
+        for grouped_node_indices in nodes_by_rank_and_key:
+            groups: list[RankGroup] = []
+            for (supertype, _trunk_subtype), node_list in grouped_node_indices.items():
+                parent_lists = [self.node_inputs_indices[n] for n in node_list]
+
+                # Every node in a group shares an in-degree, so the parent gather
+                # is rectangular [G, in_degree] (empty second dim for roots).
+                in_degree = len(parent_lists[0])
+                assert all(len(p) == in_degree for p in parent_lists)
+
+                node_buffer_indices = torch.tensor(node_list, dtype=torch.long)
+                parent_buffer_gather_indices = torch.tensor(
+                    parent_lists, dtype=torch.long
+                ).reshape(len(node_list), in_degree)
+                subtypes = torch.tensor(
+                    [self.node_types[n] for n in node_list], dtype=torch.long
+                )
+
+                groups.append(
+                    RankGroup(
+                        supertype=supertype,
+                        node_buffer_indices=node_buffer_indices,
+                        parent_buffer_gather_indices=parent_buffer_gather_indices,
+                        subtypes=subtypes,
+                    )
+                )
+
+            rank_groups.append(groups)
+
+        return rank_groups
 
 
 def make_random_graph_description(
