@@ -235,20 +235,10 @@ def main() -> None:
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
             )
 
-            autocast_enabled = device.type == "cuda"
-            # Standardize each linear's weight once for this step (in the autocast
-            # compute dtype so the bf16 cast is also done once) and reuse it for
-            # every node visit, instead of recomputing it per call. Backward stays
-            # inside this context (it needs the cached weights) but outside the
-            # autocast region, as recommended.
-            cache_dtype = torch.bfloat16 if autocast_enabled else None
-            with model.cached_standardized_weights(dtype=cache_dtype):
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=autocast_enabled,
-                ):
-                    losses = model.training_forward(graph)
+            # Standardize each linear's weight once for this step and reuse it for
+            # every node visit, instead of recomputing it per call.
+            with model.cached_standardized_weights(dtype=None):
+                losses = model.training_forward(graph)
                 total, components = combine_losses(losses)
 
                 scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
