@@ -350,13 +350,7 @@ class OutputNodeAutoEncoder(NodeAutoEncoder):
             mlp_depth=mlp_depth,
             mlp_expansion_factor=mlp_expansion_factor,
         )
-        # Frozen for the same reason as the root embeddings (see
-        # DagnabbitAutoEncoder.__init__): output slots follow an adjacent
-        # taxonomy to roots, so pinning them to fixed, near-orthogonal targets
-        # forces the encode/decode path to preserve each output slot's identity
-        # rather than letting the learnable slot embeddings collapse together.
         self.output_node_embeddings = nn.Embedding(num_output_nodes, node_embedding_dim)
-        self.output_node_embeddings.weight.requires_grad_(False)
 
     def encode(self, input_node_embeddings: Tensor, node_type: int) -> Tensor:
         output_slot_idx = node_type - self.output_node_types_start
@@ -500,16 +494,9 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         # ---- Root node embeddings ----
-        # Frozen on purpose. When these are learnable they tend to collapse
-        # together (root identity is only weakly supervised through the shared
-        # type head), which leaves root classification stuck at chance. Freezing
-        # a random init pins the four roots to fixed, near-orthogonal targets
-        # (random high-dim vectors are ~orthogonal), so the encode/decode path is
-        # forced to preserve and recover each root's identity instead.
         self.root_node_embeddings = nn.Embedding(
             self.num_root_nodes, self.node_embedding_dim
         )
-        self.root_node_embeddings.weight.requires_grad_(False)
 
         # ---- Unified node-autoencoder lookup by node type ----
         # Trunk types live at [0, num_trunk_node_types); output types live at
