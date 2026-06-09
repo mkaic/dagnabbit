@@ -17,7 +17,7 @@ NUM_TRUNK_NODES = 64
 
 # --- training ---
 NUM_STEPS = 1_000_000
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1 / (NODE_EMBEDDING_DIM * 4)
 GRADIENT_ACCUMULATION_STEPS = 8 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
