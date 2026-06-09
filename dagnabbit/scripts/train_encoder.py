@@ -236,14 +236,11 @@ def main() -> None:
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
             )
 
-            # Standardize each linear's weight once for this step and reuse it for
-            # every node visit, instead of recomputing it per call.
-            with model.cached_standardized_weights(dtype=None):
-                losses = model.training_forward(graph)
-                total, components = combine_losses(losses)
+            losses = model.training_forward(graph)
+            total, components = combine_losses(losses)
 
-                scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
-                scaled_loss.backward()
+            scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
+            scaled_loss.backward()
 
             if (step + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
                 if cfg.GRADIENT_CLIP_MAX_NORM is not None:

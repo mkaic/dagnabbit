@@ -3,11 +3,10 @@
 Because ``evaluate_graph`` recursively composes a ``NodeEncoder`` MLP at every
 non-root node, the effective depth of the computation equals the depth of the
 DAG -- so a freshly-initialized model is really a very deep, weight-shared,
-residual-free network. With the Scaled-Weight-Standardization linears
-(``StandardizedLinear``) and the variance-preserving ``GammaScaledGELU``, the
+residual-free network. With the pre-norm ``LayerNorm -> Linear`` MLP blocks, the
 per-node embedding norm should stay flat around ``sqrt(node_embedding_dim)`` as
 DAG depth increases, and the per-element mean should stay near zero (no
-mean-shift), *without* any brute-force normalization.
+mean-shift), because each linear's input is re-centered and re-scaled.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
 ``decode`` guided-autoregressive pass that propagates predicted embeddings back
@@ -181,8 +180,8 @@ def test_norms_stay_bounded() -> None:
 
 
 def test_no_mean_shift() -> None:
-    """Per-element mean should stay near zero on both passes (Scaled WS removes
-    mean-shift)."""
+    """Per-element mean should stay near zero on both passes (LayerNorm
+    re-centering removes mean-shift)."""
     stats_by_phase = measure_signal_propagation()
     for phase, stats_by_depth in stats_by_phase.items():
         for depth, s in stats_by_depth.items():

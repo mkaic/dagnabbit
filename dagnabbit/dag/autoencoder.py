@@ -1,9 +1,7 @@
-import contextlib
-
 import torch
 from torch import Tensor
 import torch.nn as nn
-from typing import Iterable, Iterator
+from typing import Iterable
 from dataclasses import dataclass
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
@@ -25,123 +23,38 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
     return [1.0 / counts[t] for t in node_types]
 
 
-# Variance-preserving gain for GELU under standard-normal inputs: the reciprocal
-# of the standard deviation of ``GELU(z)`` for ``z ~ N(0, 1)`` (Brock et al.,
-# 2021, "Characterizing Signal Propagation to Close the Performance Gap in
-# Unnormalized ResNets"). Multiplying GELU outputs by this restores unit
-# variance, so a stack of Scaled-WS linears + GELUs is variance-preserving.
-GELU_VARIANCE_PRESERVING_GAIN = 1.7015043497085571
-
-
-class GammaScaledGELU(nn.Module):
-    """GELU scaled by its variance-preserving gain (Brock et al., 2021).
-
-    Computes ``GELU(x) * gamma``. The gain is applied *after* GELU on purpose:
-    it is calibrated as ``1 / std(GELU(z))`` for ``z ~ N(0, 1)``, so it only
-    restores unit variance when GELU is fed a unit-variance input and its
-    (variance-reduced) output is rescaled afterwards. Scaling before GELU would
-    break the calibration, since GELU is nonlinear.
-    """
-
-    def __init__(self, gain: float = GELU_VARIANCE_PRESERVING_GAIN):
-        super().__init__()
-        self.gain = gain
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.gelu(x) * self.gain
-
-
-class StandardizedLinear(nn.Module):
-    """Linear layer with Scaled Weight Standardization (Brock et al., 2021).
-
-    On every forward pass each output neuron's fan-in weights are standardized
-    to zero mean and, after fan-in scaling by ``1 / sqrt(fan_in)``, unit
-    sum-of-squares, then multiplied by ``gain``::
-
-        W_hat[i, j] = gain * (W[i, j] - mean_i) / sqrt(var_i * fan_in + eps)
-
-    For zero-mean, unit-variance inputs this makes ``Var(output) = gain**2``
-    (i.e. variance-preserving when ``gain == 1``) and forces each row's weight
-    mean to exactly zero, which removes the mean-shift that a positive-mean
-    activation (e.g. GELU) would otherwise accumulate across depth. The
-    standardization is a differentiable reparameterization, so gradients flow
-    into the underlying ``weight``.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        gain: float = 1.0,
-        eps: float = 1e-5,
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.gain = gain
-        self.eps = eps
-        self.weight = nn.Parameter(torch.randn(out_features, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        # Per-step memoization of the standardized weight. Populated by
-        # `prime_weight_cache` (see `DagnabbitAutoEncoder.cached_standardized_weights`)
-        # so the standardization is computed once per step instead of once per
-        # node visit. A plain attribute, not a Parameter/buffer, so it never
-        # enters the state_dict.
-        self._weight_cache: Tensor | None = None
-
-    def _standardized_weight(self) -> Tensor:
-        mean = self.weight.mean(dim=1, keepdim=True)
-        var = self.weight.var(dim=1, unbiased=False, keepdim=True)
-        denom = torch.sqrt(var * self.in_features + self.eps)
-        return self.gain * (self.weight - mean) / denom
-
-    def prime_weight_cache(self, dtype: torch.dtype | None = None) -> None:
-        """Compute the standardized weight once and memoize it for reuse across
-        every call in the current forward/backward.
-
-        This is a differentiable reparameterization just like calling
-        ``_standardized_weight`` per forward: the cached tensor is part of the
-        autograd graph, so gradients still flow back into ``self.weight`` through
-        the standardization (Adam keeps optimizing the raw latent weight exactly
-        as before). It is merely computed once instead of once per node visit.
-
-        ``dtype`` casts the cached weight a single time (e.g. to the autocast
-        compute dtype). This matters because autocast only caches its weight
-        casts for *leaf* tensors; the standardized weight is non-leaf, so without
-        this each ``F.linear`` would re-cast (and save for backward) a fresh
-        low-precision copy on every call.
-        """
-        weight = self._standardized_weight()
-        if dtype is not None:
-            weight = weight.to(dtype)
-        self._weight_cache = weight
-
-    def clear_weight_cache(self) -> None:
-        self._weight_cache = None
-
-    def forward(self, x: Tensor) -> Tensor:
-        weight = self._weight_cache
-        if weight is None:
-            weight = self._standardized_weight()
-        return F.linear(x, weight, self.bias)
-
-
 class MLP(nn.Module):
+    """Pre-norm MLP: ``LayerNorm -> Linear`` per layer, GELU between layers.
+
+    Replaces the previous Scaled-Weight-Standardization scheme
+    (``StandardizedLinear`` + variance-preserving ``GammaScaledGELU``). A
+    LayerNorm on the input of every linear keeps activation scale and mean
+    controlled as these MLPs are composed recursively across DAG depth, so the
+    network stays well-conditioned without normalizing the weights. The
+    normalization now lives in the forward activations rather than in a weight
+    reparameterization, so there is nothing to memoize per step.
+    """
+
     def __init__(
         self,
         vector_dims: Iterable[int],
-        activation: nn.Module = GammaScaledGELU(),
+        activation: nn.Module | None = None,
     ):
         super().__init__()
 
         self.layers = nn.ModuleList(
             [
-                StandardizedLinear(vector_dims[i], vector_dims[i + 1])
+                nn.Linear(vector_dims[i], vector_dims[i + 1])
                 for i in range(len(vector_dims) - 1)
             ]
         )
-        self.activation = activation
+        # Pre-norm: normalize the input fed to each linear. This does the
+        # signal-propagation work that weight standardization used to do
+        # (re-centering removes GELU mean-shift; re-scaling keeps variance ~1).
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
+        )
+        self.activation = activation if activation is not None else nn.GELU()
 
     # ``dynamic=True``: grouped (rank-batched) evaluation calls every MLP with a
     # leading batch axis ``G`` that varies per topological rank and per random
@@ -152,6 +65,7 @@ class MLP(nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
+            x = self.norms[i](x)
             x = layer(x)
             if i + 1 < len(self.layers):
                 x = self.activation(x)
@@ -559,29 +473,6 @@ class DagnabbitAutoEncoder(nn.Module):
         torch._dynamo.config.cache_size_limit = max(
             torch._dynamo.config.cache_size_limit, needed
         )
-
-    @contextlib.contextmanager
-    def cached_standardized_weights(
-        self, dtype: torch.dtype | None = None
-    ) -> Iterator[None]:
-        """Standardize every ``StandardizedLinear``'s weight once, reuse it for
-        every node visit in this step, then drop the cache on exit.
-
-        Numerically identical to recomputing the standardization on every call
-        (so the optimizer still trains the raw latent weights through it), but
-        for this model it collapses ~1.7k standardizations/step down to the ~21
-        distinct linear layers. Wrap a single step's forward+backward in this;
-        the cache is rebuilt each step because the weights change after
-        ``optimizer.step()``.
-        """
-        linears = [m for m in self.modules() if isinstance(m, StandardizedLinear)]
-        for m in linears:
-            m.prime_weight_cache(dtype)
-        try:
-            yield
-        finally:
-            for m in linears:
-                m.clear_weight_cache()
 
     @staticmethod
     def evaluate_graph(
