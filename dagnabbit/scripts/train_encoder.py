@@ -151,6 +151,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(cfg.SEED)
+    torch.set_float32_matmul_precision("high")
 
     device = torch.device(cfg.DEVICE)
 
