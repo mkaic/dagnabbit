@@ -18,12 +18,12 @@ NUM_TRUNK_NODES = 64
 
 # --- training ---
 NUM_STEPS = 1_000_000
-LEARNING_RATE = 1 / (NODE_EMBEDDING_DIM * 4)
-GRADIENT_ACCUMULATION_STEPS = 16 
+GRADIENT_ACCUMULATION_STEPS = 64 
+LEARNING_RATE = 1e-3 / GRADIENT_ACCUMULATION_STEPS
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 1.0
-LOG_EVERY = 8
+GRADIENT_CLIP_MAX_NORM = None
+LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
 # DEVICE="cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
