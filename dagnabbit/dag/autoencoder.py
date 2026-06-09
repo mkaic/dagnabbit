@@ -24,15 +24,13 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
 
 
 class MLP(nn.Module):
-    """Pre-norm MLP: ``LayerNorm -> Linear`` per layer, GELU between layers.
+    """Plain MLP: ``Linear`` per layer, GELU activations between layers.
 
-    Replaces the previous Scaled-Weight-Standardization scheme
-    (``StandardizedLinear`` + variance-preserving ``GammaScaledGELU``). A
-    LayerNorm on the input of every linear keeps activation scale and mean
-    controlled as these MLPs are composed recursively across DAG depth, so the
-    network stays well-conditioned without normalizing the weights. The
-    normalization now lives in the forward activations rather than in a weight
-    reparameterization, so there is nothing to memoize per step.
+    No LayerNorm lives inside this module. Callers that need normalisation are
+    responsible for adding it at the boundary where it is semantically
+    appropriate (e.g. ``NodeEncoder`` adds one after its MLP output;
+    ``NodeDecoder`` adds one before its MLP input; the classification head uses
+    none).
     """
 
     def __init__(
@@ -48,12 +46,6 @@ class MLP(nn.Module):
                 for i in range(len(vector_dims) - 1)
             ]
         )
-        # Pre-norm: normalize the input fed to each linear. This does the
-        # signal-propagation work that weight standardization used to do
-        # (re-centering removes GELU mean-shift; re-scaling keeps variance ~1).
-        self.norms = nn.ModuleList(
-            [nn.LayerNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
-        )
         self.activation = activation if activation is not None else nn.GELU()
 
     # ``dynamic=True``: grouped (rank-batched) evaluation calls every MLP with a
@@ -65,7 +57,6 @@ class MLP(nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
-            x = self.norms[i](x)
             x = layer(x)
             if i + 1 < len(self.layers):
                 x = self.activation(x)
@@ -107,10 +98,12 @@ class NodeEncoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+        self.output_norm = nn.LayerNorm(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
         x = self.encoder(x)
+        x = self.output_norm(x)
 
         return x
 
@@ -124,7 +117,8 @@ class NodeEncoder(nn.Module):
         ``[in_degree, D]`` slice (same flatten order, same weights).
         """
         x = x.reshape(x.shape[0], self.in_degree * self.node_embedding_dim)
-        return self.encoder(x)
+        x = self.encoder(x)
+        return self.output_norm(x)
 
 
 class NodeDecoder(nn.Module):
@@ -146,10 +140,12 @@ class NodeDecoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+        self.output_norm = nn.LayerNorm(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)
         x = x.view(self.in_degree, self.node_embedding_dim)
+        x = self.output_norm(x)
         x = torch.unbind(x, dim=0)
 
         return x
@@ -164,7 +160,8 @@ class NodeDecoder(nn.Module):
         calling :meth:`forward` per node.
         """
         x = self.decoder(x)
-        return x.view(x.shape[0], self.in_degree, self.node_embedding_dim)
+        x = x.view(x.shape[0], self.in_degree, self.node_embedding_dim)
+        return self.output_norm(x)
 
 
 class NodeAutoEncoder(nn.Module):

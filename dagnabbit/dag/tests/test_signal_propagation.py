@@ -3,10 +3,10 @@
 Because ``evaluate_graph`` recursively composes a ``NodeEncoder`` MLP at every
 non-root node, the effective depth of the computation equals the depth of the
 DAG -- so a freshly-initialized model is really a very deep, weight-shared,
-residual-free network. With the pre-norm ``LayerNorm -> Linear`` MLP blocks, the
-per-node embedding norm should stay flat around ``sqrt(node_embedding_dim)`` as
-DAG depth increases, and the per-element mean should stay near zero (no
-mean-shift), because each linear's input is re-centered and re-scaled.
+residual-free network. Each ``NodeEncoder`` applies a ``LayerNorm`` after its
+MLP output, which re-centres and re-scales the embedding before it is passed as
+input to the next rank's encoders, keeping the per-node embedding norm flat
+around ``sqrt(node_embedding_dim)`` as DAG depth increases.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
 ``decode`` guided-autoregressive pass that propagates predicted embeddings back
