@@ -714,7 +714,15 @@ class DagnabbitAutoEncoder(nn.Module):
         # asked to recover each parent's identity from a clean input. The combine
         # / classify / reconstruct targets are identical between the two; only
         # what the decoders are fed differs (see ``_decode_graph``).
-        autoregressive = self._decode_pipeline(
+        #
+        # The two passes are independent of each other at every rank (each only
+        # depends on its own higher-rank predictions), so they are run in
+        # lockstep and batched together: at each rank their inputs are
+        # concatenated along the batch axis for a single ``node_type_predictor``
+        # / ``decode_batch`` (and loss) launch, then split back apart. Every op
+        # involved is row-wise, so this is numerically identical to two separate
+        # pipelines but roughly halves the kernel-launch count.
+        autoregressive, teacher_forced = self._decode_pipeline(
             primary_graph=primary_graph,
             condenser_graph=condenser_graph,
             primary_buffer=primary_buffer,
@@ -725,20 +733,6 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_labels=condenser_labels,
             condenser_weights=condenser_weights,
             device=device,
-            teacher_forcing=False,
-        )
-        teacher_forced = self._decode_pipeline(
-            primary_graph=primary_graph,
-            condenser_graph=condenser_graph,
-            primary_buffer=primary_buffer,
-            condenser_buffer=condenser_buffer,
-            graph_embedding=graph_embedding,
-            primary_labels=primary_labels,
-            primary_weights=primary_weights,
-            condenser_labels=condenser_labels,
-            condenser_weights=condenser_weights,
-            device=device,
-            teacher_forcing=True,
         )
 
         # ---- Assemble the return contract ----
@@ -800,174 +794,220 @@ class DagnabbitAutoEncoder(nn.Module):
         condenser_labels: Tensor,
         condenser_weights: Tensor,
         device: torch.device,
-        teacher_forcing: bool,
-    ) -> "_DecodePipelineResult":
-        """Run one full decode (condenser -> transplant -> primary) end to end.
+    ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult"]:
+        """Run the full decode (condenser -> transplant -> primary) for both the
+        autoregressive and teacher-forced passes at once.
 
         The decode propagates predicted parent embeddings up each DAG. We hold
-        two dense buffers per graph instead of per-node prediction lists:
+        two dense buffers per graph *per pass* instead of per-node prediction
+        lists:
           child_sum[n]   = running sum of embeddings predicted for node n by its
                            (already-decoded) children, and
           child_count[n] = how many such predictions have landed on n.
         A node's combined prediction is then ``child_sum / sqrt(child_count)``,
         and a child pushes into its parents with ``index_add_`` (an
-        order-independent sum). Fresh buffers are allocated per call, so the
-        autoregressive and teacher-forced passes never share decode state.
+        order-independent sum). The autoregressive and teacher-forced passes get
+        their own fresh buffers, so they never share decode state -- but they are
+        decoded in lockstep inside :meth:`_decode_graph`, which concatenates the
+        two passes for each MLP/loss launch.
 
-        ``teacher_forcing`` is threaded straight through to ``_decode_graph``.
+        Returns ``(autoregressive_result, teacher_forced_result)``.
         """
-        # ---- Condenser decode ----
-        condenser_child_sum = torch.zeros(
-            condenser_graph.num_nodes,
-            self.node_embedding_dim,
-            dtype=condenser_buffer.dtype,
-            device=device,
+
+        def _zeros(graph: FixedInDegreeDAGDescription, dtype: torch.dtype):
+            child_sum = torch.zeros(
+                graph.num_nodes,
+                self.node_embedding_dim,
+                dtype=dtype,
+                device=device,
+            )
+            child_count = torch.zeros(graph.num_nodes, dtype=dtype, device=device)
+            return child_sum, child_count
+
+        # ---- Condenser decode (both passes) ----
+        ar_condenser_sum, ar_condenser_count = _zeros(
+            condenser_graph, condenser_buffer.dtype
         )
-        condenser_child_count = torch.zeros(
-            condenser_graph.num_nodes, dtype=condenser_buffer.dtype, device=device
+        tf_condenser_sum, tf_condenser_count = _zeros(
+            condenser_graph, condenser_buffer.dtype
         )
         # Seed the condenser's single top node (last index) with the graph
-        # embedding: one prediction, so its combine is the graph embedding itself.
-        condenser_child_sum[-1] = graph_embedding
-        condenser_child_count[-1] = 1.0
+        # embedding: one prediction, so its combine is the graph embedding
+        # itself. Both passes start from the same shared graph embedding.
+        ar_condenser_sum[-1] = graph_embedding
+        ar_condenser_count[-1] = 1.0
+        tf_condenser_sum[-1] = graph_embedding
+        tf_condenser_count[-1] = 1.0
 
         (
-            _condenser_combined,
-            condenser_logits,
-            condenser_class_losses,
-            condenser_recon_losses,
+            (_, ar_condenser_logits, ar_condenser_class, ar_condenser_recon),
+            (_, tf_condenser_logits, tf_condenser_class, tf_condenser_recon),
         ) = self._decode_graph(
             graph=condenser_graph,
             encoder_buffer=condenser_buffer,
-            child_sum=condenser_child_sum,
-            child_count=condenser_child_count,
+            autoregressive_child_sum=ar_condenser_sum,
+            autoregressive_child_count=ar_condenser_count,
+            teacher_forced_child_sum=tf_condenser_sum,
+            teacher_forced_child_count=tf_condenser_count,
             node_autoencoders={0: self.condenser_node_autoencoder},
             labels=condenser_labels,
             class_weights=condenser_weights,
             process_roots=False,
             device=device,
-            teacher_forcing=teacher_forcing,
         )
 
-        # ---- Transplant condenser roots -> primary leaves ----
+        # ---- Transplant condenser roots -> primary leaves (per pass) ----
         # Condenser root ``i`` is the same semantic node as primary node
         # ``primary_graph.leaf_node_indices[i]`` (see `encode_graph_with_condenser`),
         # so the predictions accumulated on condenser-root entries seed the
         # corresponding primary leaves' child buffers.
-        primary_child_sum = torch.zeros(
-            primary_graph.num_nodes,
-            self.node_embedding_dim,
-            dtype=primary_buffer.dtype,
-            device=device,
-        )
-        primary_child_count = torch.zeros(
-            primary_graph.num_nodes, dtype=primary_buffer.dtype, device=device
-        )
+        ar_primary_sum, ar_primary_count = _zeros(primary_graph, primary_buffer.dtype)
+        tf_primary_sum, tf_primary_count = _zeros(primary_graph, primary_buffer.dtype)
         leaf_indices = torch.as_tensor(
             primary_graph.leaf_node_indices, dtype=torch.long, device=device
         )
         condenser_root_indices = torch.arange(
             condenser_graph.num_root_nodes, device=device
         )
-        primary_child_sum.index_add_(
-            0, leaf_indices, condenser_child_sum[condenser_root_indices]
+        ar_primary_sum.index_add_(
+            0, leaf_indices, ar_condenser_sum[condenser_root_indices]
         )
-        primary_child_count.index_add_(
-            0, leaf_indices, condenser_child_count[condenser_root_indices]
+        ar_primary_count.index_add_(
+            0, leaf_indices, ar_condenser_count[condenser_root_indices]
+        )
+        tf_primary_sum.index_add_(
+            0, leaf_indices, tf_condenser_sum[condenser_root_indices]
+        )
+        tf_primary_count.index_add_(
+            0, leaf_indices, tf_condenser_count[condenser_root_indices]
         )
 
-        # ---- Primary decode ----
+        # ---- Primary decode (both passes) ----
         (
-            primary_combined,
-            primary_logits,
-            primary_class_losses,
-            primary_recon_losses,
+            (ar_primary_combined, ar_primary_logits, ar_primary_class, ar_primary_recon),
+            (tf_primary_combined, tf_primary_logits, tf_primary_class, tf_primary_recon),
         ) = self._decode_graph(
             graph=primary_graph,
             encoder_buffer=primary_buffer,
-            child_sum=primary_child_sum,
-            child_count=primary_child_count,
+            autoregressive_child_sum=ar_primary_sum,
+            autoregressive_child_count=ar_primary_count,
+            teacher_forced_child_sum=tf_primary_sum,
+            teacher_forced_child_count=tf_primary_count,
             node_autoencoders=self.node_autoencoders,
             labels=primary_labels,
             class_weights=primary_weights,
             process_roots=True,
             device=device,
-            teacher_forcing=teacher_forcing,
         )
 
-        return _DecodePipelineResult(
-            condenser_logits=condenser_logits,
-            condenser_class_losses=condenser_class_losses,
-            condenser_recon_losses=condenser_recon_losses,
-            primary_combined=primary_combined,
-            primary_logits=primary_logits,
-            primary_class_losses=primary_class_losses,
-            primary_recon_losses=primary_recon_losses,
+        autoregressive = _DecodePipelineResult(
+            condenser_logits=ar_condenser_logits,
+            condenser_class_losses=ar_condenser_class,
+            condenser_recon_losses=ar_condenser_recon,
+            primary_combined=ar_primary_combined,
+            primary_logits=ar_primary_logits,
+            primary_class_losses=ar_primary_class,
+            primary_recon_losses=ar_primary_recon,
         )
+        teacher_forced = _DecodePipelineResult(
+            condenser_logits=tf_condenser_logits,
+            condenser_class_losses=tf_condenser_class,
+            condenser_recon_losses=tf_condenser_recon,
+            primary_combined=tf_primary_combined,
+            primary_logits=tf_primary_logits,
+            primary_class_losses=tf_primary_class,
+            primary_recon_losses=tf_primary_recon,
+        )
+        return autoregressive, teacher_forced
 
     def _decode_graph(
         self,
         graph: FixedInDegreeDAGDescription,
         encoder_buffer: Tensor,
-        child_sum: Tensor,
-        child_count: Tensor,
+        autoregressive_child_sum: Tensor,
+        autoregressive_child_count: Tensor,
+        teacher_forced_child_sum: Tensor,
+        teacher_forced_child_count: Tensor,
         node_autoencoders: dict[int, NodeAutoEncoder],
         labels: Tensor,
         class_weights: Tensor,
         process_roots: bool,
         device: torch.device,
-        teacher_forcing: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Run the batched guided-autoregressive decode over one graph.
+    ) -> tuple[
+        tuple[Tensor, Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor, Tensor],
+    ]:
+        """Run the batched guided-autoregressive decode over one graph for the
+        autoregressive and teacher-forced passes **simultaneously**.
 
         Walks topological ranks **descending** (every edge strictly increases
         rank, so all of a node's children -- which live at higher ranks -- have
-        already pushed their predictions into ``child_sum`` / ``child_count`` by
-        the time the node is processed, and no two same-rank nodes are
+        already pushed their predictions into the ``child_sum`` / ``child_count``
+        buffers by the time the node is processed, and no two same-rank nodes are
         parent/child). At each rank it batches:
 
         1. the variance-preserving combine ``child_sum / sqrt(child_count)``,
-        2. classification (one ``node_type_predictor`` call) with class-balanced
+        2. classification (``node_type_predictor``) with class-balanced
            cross-entropy, and
         3. reconstruction (cosine distance to ``encoder_buffer``);
 
-        then, per supertype group with parents, one ``decode_batch`` call whose
+        then, per supertype group with parents, one ``decode_batch`` whose
         predicted parent embeddings are ``index_add_``-scattered into the
         parents' ``child_sum`` (and ``child_count`` incremented).
+
+        The two passes differ only in *what each node's decoder is fed*. The
+        autoregressive pass decodes each node's own predicted ``combined``
+        embedding, so prediction error compounds down the DAG. The teacher-forced
+        pass instead decodes each node's *true* encode-side embedding
+        (``encoder_buffer``), so each parent prediction is produced from ground
+        truth -- this severs the autoregressive chain and tests whether the
+        decoders can recover a parent's identity (e.g. which root) from a clean
+        input. Both passes' combine / classify / reconstruct still use their own
+        *accumulated* predictions, so loss targets match between the two; only
+        the decoder inputs differ.
+
+        Because the two passes are independent of each other at every rank, their
+        inputs are concatenated along the batch axis (autoregressive rows first,
+        teacher-forced rows second) for a single ``node_type_predictor`` /
+        ``decode_batch`` (and cross-entropy / cosine) launch, then split back
+        apart. Every op is row-wise, so this is numerically identical to running
+        the two passes separately while roughly halving the kernel-launch count.
 
         ``process_roots`` controls whether rank-0 (root) nodes are decoded:
         primary roots are classified/reconstructed (they have no parents, so
         nothing is scattered), whereas condenser roots are skipped entirely --
         they only hold accumulated predictions for the transplant.
 
-        ``teacher_forcing`` controls *what each node's decoder is fed*. When
-        ``False`` (the default, the genuine autoregressive pass) a node decodes
-        its own predicted ``combined`` embedding, so prediction error compounds
-        down the DAG. When ``True`` every node instead decodes its *true*
-        encode-side embedding (``encoder_buffer``), so each parent prediction is
-        produced from ground truth -- this severs the autoregressive chain and
-        tests whether the decoders can recover a parent's identity (e.g. which
-        root) when handed a clean input. The combine / classify / reconstruct of
-        each node still uses the *accumulated* predictions, so the loss targets
-        are unchanged; only the decoder inputs differ.
-
-        Returns dense per-node tensors ``(combined, logits, classification_loss,
+        Returns ``(autoregressive_tensors, teacher_forced_tensors)`` where each
+        is a dense per-node tuple ``(combined, logits, classification_loss,
         reconstruction_loss)``; entries for nodes that were not processed stay
         zero.
         """
         num_nodes = graph.num_nodes
-        combined_buffer = torch.zeros(
-            num_nodes, self.node_embedding_dim, dtype=child_sum.dtype, device=device
-        )
-        logits_buffer = torch.zeros(
-            num_nodes, self.num_node_types, dtype=encoder_buffer.dtype, device=device
-        )
-        classification_losses = torch.zeros(
-            num_nodes, dtype=encoder_buffer.dtype, device=device
-        )
-        reconstruction_losses = torch.zeros(
-            num_nodes, dtype=encoder_buffer.dtype, device=device
-        )
+
+        def _alloc_pass_buffers():
+            combined = torch.zeros(
+                num_nodes,
+                self.node_embedding_dim,
+                dtype=autoregressive_child_sum.dtype,
+                device=device,
+            )
+            logits = torch.zeros(
+                num_nodes,
+                self.num_node_types,
+                dtype=encoder_buffer.dtype,
+                device=device,
+            )
+            class_losses = torch.zeros(
+                num_nodes, dtype=encoder_buffer.dtype, device=device
+            )
+            recon_losses = torch.zeros(
+                num_nodes, dtype=encoder_buffer.dtype, device=device
+            )
+            return combined, logits, class_losses, recon_losses
+
+        ar_combined, ar_logits, ar_class, ar_recon = _alloc_pass_buffers()
+        tf_combined, tf_logits, tf_class, tf_recon = _alloc_pass_buffers()
 
         for rank in reversed(range(len(graph.rank_groups))):
             if rank == 0 and not process_roots:
@@ -980,26 +1020,59 @@ class DagnabbitAutoEncoder(nn.Module):
             rank_node_indices = torch.cat(
                 [g.node_buffer_indices for g in groups]
             ).to(device)
+            num_rank_nodes = rank_node_indices.shape[0]
 
-            counts = child_count[rank_node_indices]
-            combined = child_sum[rank_node_indices] / counts.sqrt().unsqueeze(-1)
-            combined_buffer[rank_node_indices] = combined
-
-            logits = self.node_type_predictor(combined)
-            logits_buffer[rank_node_indices] = logits.to(logits_buffer.dtype)
-            cross_entropy = F.cross_entropy(
-                logits, labels[rank_node_indices], reduction="none"
+            # Per-pass combine (each pass accumulates into its own buffers).
+            ar_counts = autoregressive_child_count[rank_node_indices]
+            tf_counts = teacher_forced_child_count[rank_node_indices]
+            ar_combined_rank = (
+                autoregressive_child_sum[rank_node_indices]
+                / ar_counts.sqrt().unsqueeze(-1)
             )
-            classification_losses[rank_node_indices] = (
-                cross_entropy * class_weights[rank_node_indices]
-            ).to(classification_losses.dtype)
+            tf_combined_rank = (
+                teacher_forced_child_sum[rank_node_indices]
+                / tf_counts.sqrt().unsqueeze(-1)
+            )
+            ar_combined[rank_node_indices] = ar_combined_rank
+            tf_combined[rank_node_indices] = tf_combined_rank
 
-            reconstruction_losses[rank_node_indices] = (
-                1.0
-                - F.cosine_similarity(
-                    combined, encoder_buffer[rank_node_indices], dim=-1
-                )
-            ).to(reconstruction_losses.dtype)
+            # Classify + reconstruct both passes in one launch each. Rows
+            # ``[:num_rank_nodes]`` are autoregressive, ``[num_rank_nodes:]`` are
+            # teacher-forced; the type head and cosine are row-wise, so this is
+            # identical to two separate calls.
+            combined_both = torch.cat([ar_combined_rank, tf_combined_rank], dim=0)
+            logits_both = self.node_type_predictor(combined_both)
+            ar_logits[rank_node_indices] = logits_both[:num_rank_nodes].to(
+                ar_logits.dtype
+            )
+            tf_logits[rank_node_indices] = logits_both[num_rank_nodes:].to(
+                tf_logits.dtype
+            )
+
+            rank_labels = labels[rank_node_indices]
+            rank_weights = class_weights[rank_node_indices]
+            cross_entropy_both = F.cross_entropy(
+                logits_both,
+                torch.cat([rank_labels, rank_labels]),
+                reduction="none",
+            ) * torch.cat([rank_weights, rank_weights])
+            ar_class[rank_node_indices] = cross_entropy_both[:num_rank_nodes].to(
+                ar_class.dtype
+            )
+            tf_class[rank_node_indices] = cross_entropy_both[num_rank_nodes:].to(
+                tf_class.dtype
+            )
+
+            rank_encoder = encoder_buffer[rank_node_indices]
+            recon_both = 1.0 - F.cosine_similarity(
+                combined_both, torch.cat([rank_encoder, rank_encoder]), dim=-1
+            )
+            ar_recon[rank_node_indices] = recon_both[:num_rank_nodes].to(
+                ar_recon.dtype
+            )
+            tf_recon[rank_node_indices] = recon_both[num_rank_nodes:].to(
+                tf_recon.dtype
+            )
 
             # Per group with parents: decode this rank's combined predictions
             # into predicted parent embeddings and scatter them up the DAG.
@@ -1011,39 +1084,54 @@ class DagnabbitAutoEncoder(nn.Module):
                 node_buffer_indices = group.node_buffer_indices.to(device)
                 parent_gather_indices = group.parent_buffer_gather_indices.to(device)
                 subtypes = group.subtypes.to(device)
+                num_group_nodes = node_buffer_indices.shape[0]
 
                 node_autoencoder = node_autoencoders[int(group.subtypes[0])]
-                # Autoregressive: decode each node's own predicted ``combined``.
-                # Teacher-forced: decode each node's true encode embedding, so
-                # the prediction handed to each parent is generated from ground
-                # truth rather than from accumulated (possibly collapsed)
-                # predictions.
-                decode_input = (
-                    encoder_buffer[node_buffer_indices]
-                    if teacher_forcing
-                    else combined_buffer[node_buffer_indices]
+                # Concatenate the autoregressive decoder inputs (each node's own
+                # predicted ``combined``) with the teacher-forced inputs (each
+                # node's true encode embedding) so both go through this group's
+                # decoder in a single kernel launch, then split the predictions
+                # back apart for per-pass scatter.
+                decode_input_both = torch.cat(
+                    [
+                        ar_combined[node_buffer_indices],
+                        encoder_buffer[node_buffer_indices],
+                    ],
+                    dim=0,
                 )
-                # [G, in_degree, D]: predicted embedding of each ordered parent.
-                predicted_parent_embeddings = node_autoencoder.decode_batch(
-                    decode_input, subtypes
+                subtypes_both = torch.cat([subtypes, subtypes])
+                # [2G, in_degree, D]: predicted ordered-parent embeddings.
+                predicted_both = node_autoencoder.decode_batch(
+                    decode_input_both, subtypes_both
                 )
+                ar_predicted = predicted_both[:num_group_nodes]
+                tf_predicted = predicted_both[num_group_nodes:]
 
                 flat_parent_indices = parent_gather_indices.reshape(-1)
-                flat_predictions = predicted_parent_embeddings.reshape(
-                    -1, self.node_embedding_dim
-                ).to(child_sum.dtype)
-                child_sum.index_add_(0, flat_parent_indices, flat_predictions)
-                child_count.index_add_(
-                    0,
-                    flat_parent_indices,
-                    torch.ones_like(flat_parent_indices, dtype=child_count.dtype),
+                ones = torch.ones_like(
+                    flat_parent_indices, dtype=autoregressive_child_count.dtype
                 )
 
+                autoregressive_child_sum.index_add_(
+                    0,
+                    flat_parent_indices,
+                    ar_predicted.reshape(-1, self.node_embedding_dim).to(
+                        autoregressive_child_sum.dtype
+                    ),
+                )
+                autoregressive_child_count.index_add_(0, flat_parent_indices, ones)
+                teacher_forced_child_sum.index_add_(
+                    0,
+                    flat_parent_indices,
+                    tf_predicted.reshape(-1, self.node_embedding_dim).to(
+                        teacher_forced_child_sum.dtype
+                    ),
+                )
+                teacher_forced_child_count.index_add_(0, flat_parent_indices, ones)
+
         return (
-            combined_buffer,
-            logits_buffer,
-            classification_losses,
-            reconstruction_losses,
+            (ar_combined, ar_logits, ar_class, ar_recon),
+            (tf_combined, tf_logits, tf_class, tf_recon),
         )
 
     def inference_decode_blind_autoregressive(
