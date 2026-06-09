@@ -16,12 +16,16 @@ def format_param_count(n: int) -> str:
 
 
 def step_preds_and_truth(
-    logits_per_node: list[torch.Tensor],
-    true_types: list[int],
+    logits_per_node: torch.Tensor,
+    true_types: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract argmax predictions and true class ids for one step."""
-    preds = torch.stack(logits_per_node).detach().argmax(dim=-1).cpu().numpy()
-    truth = np.asarray(true_types, dtype=np.int64)
+    """Extract argmax predictions and true class ids for one step.
+
+    ``logits_per_node`` is ``[N, num_types]`` and ``true_types`` is a 1-D label
+    tensor aligned with it.
+    """
+    preds = logits_per_node.detach().argmax(dim=-1).cpu().numpy()
+    truth = true_types.detach().cpu().numpy().astype(np.int64)
     return preds, truth
 
 

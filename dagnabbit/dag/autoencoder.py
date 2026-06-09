@@ -1,5 +1,4 @@
 import contextlib
-import math
 
 import torch
 from torch import Tensor
@@ -144,7 +143,13 @@ class MLP(nn.Module):
         )
         self.activation = activation
 
-    @torch.compile()
+    # ``dynamic=True``: grouped (rank-batched) evaluation calls every MLP with a
+    # leading batch axis ``G`` that varies per topological rank and per random
+    # graph. Compiling statically would recompile (and blow past dynamo's
+    # cache_size_limit) once per distinct ``G``; marking the batch dim dynamic
+    # compiles a single shape-polymorphic kernel instead. Only the leading dim
+    # varies -- each MLP instance has fixed layer widths -- so this is safe.
+    @torch.compile(dynamic=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
             x = layer(x)
@@ -195,6 +200,18 @@ class NodeEncoder(nn.Module):
 
         return x
 
+    def forward_batch(self, x: Tensor) -> Tensor:
+        """Batched encode over a leading group axis.
+
+        ``x`` is ``[G, in_degree, D]``; the ``in_degree`` parent embeddings of
+        each of the ``G`` nodes are flattened into a single ``in_degree * D``
+        vector and fed through the encoder in one MLP call, yielding ``[G, D]``.
+        Numerically identical to calling :meth:`forward` on each node's
+        ``[in_degree, D]`` slice (same flatten order, same weights).
+        """
+        x = x.reshape(x.shape[0], self.in_degree * self.node_embedding_dim)
+        return self.encoder(x)
+
 
 class NodeDecoder(nn.Module):
     def __init__(
@@ -223,6 +240,18 @@ class NodeDecoder(nn.Module):
 
         return x
 
+    def forward_batch(self, x: Tensor) -> Tensor:
+        """Batched decode over a leading group axis.
+
+        ``x`` is ``[G, D]``; each node embedding is decoded into its
+        ``in_degree`` predicted parent embeddings in one MLP call, returned as
+        ``[G, in_degree, D]`` (the parent axis is kept rather than unbound, so
+        callers can scatter into a parent buffer). Numerically identical to
+        calling :meth:`forward` per node.
+        """
+        x = self.decoder(x)
+        return x.view(x.shape[0], self.in_degree, self.node_embedding_dim)
+
 
 class NodeAutoEncoder(nn.Module):
     """Uniform node autoencoder interface.
@@ -237,6 +266,23 @@ class NodeAutoEncoder(nn.Module):
         raise NotImplementedError
 
     def decode(self, node_embedding: Tensor, node_type: int) -> Tensor:
+        raise NotImplementedError
+
+    def encode_batch(self, parent_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        """Batched :meth:`encode` over a group of same-supertype nodes.
+
+        ``parent_embeddings`` is ``[G, in_degree, D]`` and ``subtypes`` is the
+        per-node ``node_type`` index ``[G]`` (used by subclasses that need it,
+        e.g. output-slot embedding lookup). Returns ``[G, D]``.
+        """
+        raise NotImplementedError
+
+    def decode_batch(self, node_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        """Batched :meth:`decode` over a group of same-supertype nodes.
+
+        ``node_embeddings`` is ``[G, D]`` and ``subtypes`` is ``[G]``. Returns
+        the predicted parent embeddings as ``[G, in_degree, D]``.
+        """
         raise NotImplementedError
 
 
@@ -270,6 +316,14 @@ class FixedInDegreeNodeAutoEncoder(NodeAutoEncoder):
     def decode(self, node_embedding: Tensor, node_type: int) -> Tensor:
         del node_type
         return self.decoder(node_embedding)
+
+    def encode_batch(self, parent_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        del subtypes
+        return self.encoder.forward_batch(parent_embeddings)
+
+    def decode_batch(self, node_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        del subtypes
+        return self.decoder.forward_batch(node_embeddings)
 
 
 class OutputNodeAutoEncoder(NodeAutoEncoder):
@@ -320,34 +374,36 @@ class OutputNodeAutoEncoder(NodeAutoEncoder):
         del node_type
         return self.decoder(node_embedding)
 
+    def encode_batch(self, parent_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        # `parent_embeddings` is [G, 1, D] (each output node has exactly one
+        # graph-parent). Gather each node's learnable per-output-slot embedding
+        # and concatenate it as a second "parent", giving [G, 2, D] to match the
+        # in_degree=2 encoder (batched form of the single-node `encode`).
+        output_slot_idx = subtypes - self.output_node_types_start
+        output_slot_embeddings = self.output_node_embeddings.weight[output_slot_idx]
+        x = torch.cat([parent_embeddings, output_slot_embeddings.unsqueeze(1)], dim=1)
+        return self.encoder.forward_batch(x)
 
-@dataclass
-class TrainingDecodeBufferEntry:
-    embeddings_predicted_by_children: list[Tensor]
-    classification_loss: Tensor | None
-    # Cosine distance between this node's decode-side combined prediction and the
-    # encode-side embedding for the same node, tying the decode path back to the
-    # encode path (a direct embedding-reconstruction / teacher-forcing target).
-    reconstruction_loss: Tensor | None
-    predicted_type_logits: Tensor | None
-    # The variance-preserving combination of `embeddings_predicted_by_children`
-    # that this node's decode/classification actually consumes. Populated by
-    # `_decode_step`; kept for diagnostics (e.g. decode-side signal propagation).
-    combined_predicted_embedding: Tensor | None = None
+    def decode_batch(self, node_embeddings: Tensor, subtypes: Tensor) -> Tensor:
+        del subtypes
+        return self.decoder.forward_batch(node_embeddings)
 
 
 @dataclass
 class TrainingStepLossReturnType:
-    condenser_node_classification_losses: list[Tensor]
-    condenser_node_reconstruction_losses: list[Tensor]
-    primary_node_classification_losses: list[Tensor]
-    primary_node_reconstruction_losses: list[Tensor]
-    # Raw per-node logits and true type labels for downstream diagnostics
-    # (e.g. per-node-type accuracy per class).
-    condenser_node_predicted_type_logits: list[Tensor]
-    condenser_node_true_types: list[int]
-    primary_node_predicted_type_logits: list[Tensor]
-    primary_node_true_types: list[int]
+    # 1-D tensors over the contributing nodes. The condenser excludes its roots
+    # (they are not decoded); the primary includes every node.
+    condenser_node_classification_losses: Tensor
+    condenser_node_reconstruction_losses: Tensor
+    primary_node_classification_losses: Tensor
+    primary_node_reconstruction_losses: Tensor
+    # Raw per-node logits ``[N, num_types]`` and true type labels (1-D
+    # ``LongTensor``) for downstream diagnostics (e.g. per-node-type accuracy per
+    # class). ``*_predicted_type_logits[i]`` corresponds to ``*_true_types[i]``.
+    condenser_node_predicted_type_logits: Tensor
+    condenser_node_true_types: Tensor
+    primary_node_predicted_type_logits: Tensor
+    primary_node_true_types: Tensor
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -449,6 +505,33 @@ class DagnabbitAutoEncoder(nn.Module):
             )
         )
 
+        self._raise_dynamo_cache_limit_for_mlp_shapes()
+
+    def _raise_dynamo_cache_limit_for_mlp_shapes(self) -> None:
+        """Size dynamo's compile cache to this model's distinct MLP shapes.
+
+        Grouped (rank-batched) evaluation funnels every MLP through the single
+        decorated ``MLP.forward``; dynamo keys its compile cache on that one
+        shared code object, accumulating one specialization per distinct
+        (layer-shape x grad-mode x size-1-vs-dynamic-batch) combination. The
+        layer-shapes are fixed by this model's config (trunk in-degrees, output
+        / condenser in-degrees, embedding dim, type-head width), and
+        ``dynamic=True`` keeps the batch axis from multiplying the count, so the
+        total is bounded. We compute the number of distinct MLP layer-shapes
+        actually instantiated and give the cache room for each one's grad/no-grad
+        and batch-warmup variants (x4) plus headroom -- otherwise this bounded
+        set would thrash against dynamo's default ``cache_size_limit`` of 8.
+        """
+        distinct_mlp_shapes = {
+            tuple((layer.in_features, layer.out_features) for layer in mlp.layers)
+            for mlp in self.modules()
+            if isinstance(mlp, MLP)
+        }
+        needed = len(distinct_mlp_shapes) * 4 + 8
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, needed
+        )
+
     @contextlib.contextmanager
     def cached_standardized_weights(
         self, dtype: torch.dtype | None = None
@@ -481,24 +564,37 @@ class DagnabbitAutoEncoder(nn.Module):
     ) -> Tensor:
         assert root_node_embeddings.shape[0] == graph.num_root_nodes
 
+        device = root_node_embeddings.device
         embeddings_buffer = torch.empty(
             (graph.num_nodes, node_embedding_dim),
             dtype=root_node_embeddings.dtype,
-            device=root_node_embeddings.device,
+            device=device,
         )
         embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
 
-        for node_idx in range(graph.num_root_nodes, graph.num_nodes):
-            buffer_read_indices = graph.node_inputs_indices[node_idx]
-            parent_embeddings = embeddings_buffer[buffer_read_indices, :]
+        # Walk topological ranks ascending. Rank 0 is exactly the roots (any node
+        # with parents has rank >= 1), already seeded above, so skip it. Within a
+        # rank every node's parents live at strictly lower ranks and are therefore
+        # already written, so all groups at the rank can be evaluated in one
+        # batched MLP call each.
+        for rank, groups in enumerate(graph.rank_groups):
+            if rank == 0:
+                continue
+            for group in groups:
+                node_buffer_indices = group.node_buffer_indices.to(device)
+                parent_gather_indices = group.parent_buffer_gather_indices.to(device)
+                subtypes = group.subtypes.to(device)
 
-            node_type = graph.node_types[node_idx]
+                # [G, in_degree, D]: each node's ordered parent embeddings.
+                parent_embeddings = embeddings_buffer[parent_gather_indices]
 
-            node_autoencoder = node_autoencoders[node_type]
-
-            embeddings_buffer[node_idx] = node_autoencoder.encode(
-                parent_embeddings, node_type
-            )
+                # Every node in a group shares one module (trunk groups are split
+                # by subtype; outputs/condenser share a single module), so the
+                # subtype of any member resolves it.
+                node_autoencoder = node_autoencoders[int(group.subtypes[0])]
+                embeddings_buffer[node_buffer_indices] = node_autoencoder.encode_batch(
+                    parent_embeddings, subtypes
+                )
 
         return embeddings_buffer
 
@@ -542,15 +638,15 @@ class DagnabbitAutoEncoder(nn.Module):
         | tuple[
             TrainingStepLossReturnType,
             Tensor,
-            list[TrainingDecodeBufferEntry],
+            Tensor,
         ]
     ):
         """Returns losses for the training step.
 
         When ``return_buffers`` is True, additionally returns the primary-graph
         encode buffer (per-node embeddings from the forward pass) and the primary
-        decode buffer (each entry's ``combined_predicted_embedding`` holds the
-        decode-side per-node prediction), for diagnostics such as signal
+        decode buffer: a node-indexed ``[num_nodes, D]`` tensor of each node's
+        decode-side combined prediction, for diagnostics such as signal
         propagation analysis.
         """
 
@@ -562,209 +658,259 @@ class DagnabbitAutoEncoder(nn.Module):
             )
         )
 
-        # Guided Autoregressive Decode
+        device = primary_buffer.device
 
-        condenser_decode_buffer = [
-            TrainingDecodeBufferEntry(
-                embeddings_predicted_by_children=[],
-                reconstruction_loss=None,
-                classification_loss=None,
-                predicted_type_logits=None,
-            )
-            for _ in range(condenser_graph.num_nodes)
-        ]
+        # Guided Autoregressive Decode.
+        #
+        # The decode propagates predicted parent embeddings up each DAG. We hold
+        # two dense buffers per graph instead of per-node prediction lists:
+        #   child_sum[n]   = running sum of embeddings predicted for node n by
+        #                    its (already-decoded) children, and
+        #   child_count[n] = how many such predictions have landed on n.
+        # A node's combined prediction is then ``child_sum / sqrt(child_count)``
+        # (the same variance-preserving combine as before), and a child pushes
+        # into its parents with ``index_add_`` (an order-independent sum, so the
+        # result matches the old per-node list-sum up to float reduction order).
 
-        condenser_decode_buffer[-1] = TrainingDecodeBufferEntry(
-            embeddings_predicted_by_children=[graph_embedding],
-            reconstruction_loss=None,
-            classification_loss=None,
-            predicted_type_logits=None,
+        # ---- Condenser decode ----
+        condenser_child_sum = torch.zeros(
+            condenser_graph.num_nodes,
+            self.node_embedding_dim,
+            dtype=condenser_buffer.dtype,
+            device=device,
+        )
+        condenser_child_count = torch.zeros(
+            condenser_graph.num_nodes, dtype=condenser_buffer.dtype, device=device
+        )
+        # Seed the condenser's single top node (last index) with the graph
+        # embedding: one prediction, so its combine is the graph embedding itself.
+        condenser_child_sum[-1] = graph_embedding
+        condenser_child_count[-1] = 1.0
+
+        condenser_labels = torch.as_tensor(
+            list(condenser_graph.node_types), dtype=torch.long, device=device
+        )
+        condenser_weights = torch.as_tensor(
+            _class_balance_weights(list(condenser_graph.node_types)),
+            dtype=condenser_buffer.dtype,
+            device=device,
         )
 
-        condenser_classification_loss_weights = _class_balance_weights(
-            list(condenser_graph.node_types)
+        (
+            _condenser_combined,
+            condenser_logits,
+            condenser_class_losses,
+            condenser_recon_losses,
+        ) = self._decode_graph(
+            graph=condenser_graph,
+            encoder_buffer=condenser_buffer,
+            child_sum=condenser_child_sum,
+            child_count=condenser_child_count,
+            node_autoencoders={0: self.condenser_node_autoencoder},
+            labels=condenser_labels,
+            class_weights=condenser_weights,
+            process_roots=False,
+            device=device,
         )
-        primary_classification_loss_weights = _class_balance_weights(
-            list(primary_graph.node_types)
+
+        # ---- Transplant condenser roots -> primary leaves ----
+        # Condenser root ``i`` is the same semantic node as primary node
+        # ``primary_graph.leaf_node_indices[i]`` (see `encode_graph_with_condenser`),
+        # so the predictions accumulated on condenser-root entries seed the
+        # corresponding primary leaves' child buffers.
+        primary_child_sum = torch.zeros(
+            primary_graph.num_nodes,
+            self.node_embedding_dim,
+            dtype=primary_buffer.dtype,
+            device=device,
+        )
+        primary_child_count = torch.zeros(
+            primary_graph.num_nodes, dtype=primary_buffer.dtype, device=device
+        )
+        leaf_indices = torch.as_tensor(
+            primary_graph.leaf_node_indices, dtype=torch.long, device=device
+        )
+        condenser_root_indices = torch.arange(
+            condenser_graph.num_root_nodes, device=device
+        )
+        primary_child_sum.index_add_(
+            0, leaf_indices, condenser_child_sum[condenser_root_indices]
+        )
+        primary_child_count.index_add_(
+            0, leaf_indices, condenser_child_count[condenser_root_indices]
         )
 
-        # Precompute the per-node classification targets once as device tensors,
-        # instead of building a fresh scalar tensor (a host->device transfer) per
-        # node inside `_decode_step`.
-        label_device = self.root_node_embeddings.weight.device
-        condenser_node_labels = torch.as_tensor(
-            list(condenser_graph.node_types), dtype=torch.long, device=label_device
+        # ---- Primary decode ----
+        primary_labels = torch.as_tensor(
+            list(primary_graph.node_types), dtype=torch.long, device=device
         )
-        primary_node_labels = torch.as_tensor(
-            list(primary_graph.node_types), dtype=torch.long, device=label_device
+        primary_weights = torch.as_tensor(
+            _class_balance_weights(list(primary_graph.node_types)),
+            dtype=primary_buffer.dtype,
+            device=device,
         )
 
-        for node_idx in reversed(
-            range(condenser_graph.num_root_nodes, condenser_graph.num_nodes)
-        ):
-            self._decode_step(
-                node_idx=node_idx,
-                graph=condenser_graph,
-                decode_buffer=condenser_decode_buffer,
-                node_autoencoders={0: self.condenser_node_autoencoder},
-                encoder_buffer=condenser_buffer,
-                class_label=condenser_node_labels[node_idx],
-                classification_loss_weight=condenser_classification_loss_weights[
-                    node_idx
-                ],
-            )
+        (
+            primary_combined,
+            primary_logits,
+            primary_class_losses,
+            primary_recon_losses,
+        ) = self._decode_graph(
+            graph=primary_graph,
+            encoder_buffer=primary_buffer,
+            child_sum=primary_child_sum,
+            child_count=primary_child_count,
+            node_autoencoders=self.node_autoencoders,
+            labels=primary_labels,
+            class_weights=primary_weights,
+            process_roots=True,
+            device=device,
+        )
 
-        # Transplant the decoder buffer entries for the condenser graph inputs
-        # into their corresponding primary graph leaf node spots. Condenser
-        # root `i` is the same semantic node as primary node
-        # `primary_graph.leaf_node_indices[i]` (see `encode_graph_with_condenser`),
-        # so predictions accumulated at condenser-root entries are predictions
-        # of those primary leaves.
-        primary_decode_buffer = [
-            TrainingDecodeBufferEntry(
-                embeddings_predicted_by_children=[],
-                reconstruction_loss=None,
-                classification_loss=None,
-                predicted_type_logits=None,
-            )
-            for _ in range(primary_graph.num_nodes)
-        ]
-
-        for condenser_root_idx in range(condenser_graph.num_root_nodes):
-            primary_leaf_idx = primary_graph.leaf_node_indices[condenser_root_idx]
-            primary_decode_buffer[
-                primary_leaf_idx
-            ].embeddings_predicted_by_children = condenser_decode_buffer[
-                condenser_root_idx
-            ].embeddings_predicted_by_children
-
-        for node_idx in reversed(range(primary_graph.num_nodes)):
-            self._decode_step(
-                node_idx=node_idx,
-                graph=primary_graph,
-                decode_buffer=primary_decode_buffer,
-                node_autoencoders=self.node_autoencoders,
-                encoder_buffer=primary_buffer,
-                class_label=primary_node_labels[node_idx],
-                classification_loss_weight=primary_classification_loss_weights[
-                    node_idx
-                ],
-            )
-
-        condenser_trunk_entries = condenser_decode_buffer[
-            condenser_graph.num_root_nodes :
-        ]
-
-        condenser_trunk_true_types = condenser_graph.node_types[
-            condenser_graph.num_root_nodes :
-        ]
-
-
+        # ---- Assemble the return contract ----
+        # Return the dense per-node tensors directly (no per-node relisting). The
+        # condenser exposes only its trunk nodes (roots are not decoded), exactly
+        # as before; the primary exposes every node. All four loss tensors and the
+        # logits/true-type pairs stay node-aligned, which is all consumers require.
+        num_condenser_roots = condenser_graph.num_root_nodes
         losses = TrainingStepLossReturnType(
-            condenser_node_classification_losses=[
-                e.classification_loss for e in condenser_trunk_entries
+            condenser_node_classification_losses=condenser_class_losses[
+                num_condenser_roots:
             ],
-            condenser_node_reconstruction_losses=[
-                e.reconstruction_loss for e in condenser_trunk_entries
+            condenser_node_reconstruction_losses=condenser_recon_losses[
+                num_condenser_roots:
             ],
-            primary_node_classification_losses=[
-                e.classification_loss for e in primary_decode_buffer
+            primary_node_classification_losses=primary_class_losses,
+            primary_node_reconstruction_losses=primary_recon_losses,
+            condenser_node_predicted_type_logits=condenser_logits[
+                num_condenser_roots:
             ],
-            primary_node_reconstruction_losses=[
-                e.reconstruction_loss for e in primary_decode_buffer
-            ],
-            condenser_node_predicted_type_logits=[
-                e.predicted_type_logits for e in condenser_trunk_entries
-            ],
-            condenser_node_true_types=list(condenser_trunk_true_types),
-            primary_node_predicted_type_logits=[
-                e.predicted_type_logits for e in primary_decode_buffer
-            ],
-            primary_node_true_types=list(primary_graph.node_types),
+            condenser_node_true_types=condenser_labels[num_condenser_roots:],
+            primary_node_predicted_type_logits=primary_logits,
+            primary_node_true_types=primary_labels,
         )
 
         if return_buffers:
-            return losses, primary_buffer, primary_decode_buffer
+            # `primary_combined` is the node-indexed [num_nodes, D] decode-side
+            # combined-prediction buffer, consumed directly by diagnostics.
+            return losses, primary_buffer, primary_combined
         return losses
 
-    def _decode_step(
+    def _decode_graph(
         self,
-        node_idx: int,
         graph: FixedInDegreeDAGDescription,
-        decode_buffer: list[TrainingDecodeBufferEntry],
-        node_autoencoders: dict[int, NodeAutoEncoder],
         encoder_buffer: Tensor,
-        class_label: Tensor,
-        classification_loss_weight: float = 1.0,
-    ) -> None:
-        """Populate `decode_buffer[node_idx]`'s losses and push this node's
-        predicted parent embeddings into its parents' buffer entries.
+        child_sum: Tensor,
+        child_count: Tensor,
+        node_autoencoders: dict[int, NodeAutoEncoder],
+        labels: Tensor,
+        class_weights: Tensor,
+        process_roots: bool,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run the batched guided-autoregressive decode over one graph.
 
-        ``encoder_buffer`` is the encode-side per-node embedding buffer for this
-        graph; ``encoder_buffer[node_idx]`` is the reconstruction target for this
-        node's decode-side prediction.
-        ``class_label`` is this node's classification target as a 0-dim ``long``
-        tensor already on the right device (precomputed by the caller).
-        ``classification_loss_weight`` multiplies this node's classification
-        loss; callers use it for class-balanced weighting across node types.
+        Walks topological ranks **descending** (every edge strictly increases
+        rank, so all of a node's children -- which live at higher ranks -- have
+        already pushed their predictions into ``child_sum`` / ``child_count`` by
+        the time the node is processed, and no two same-rank nodes are
+        parent/child). At each rank it batches:
+
+        1. the variance-preserving combine ``child_sum / sqrt(child_count)``,
+        2. classification (one ``node_type_predictor`` call) with class-balanced
+           cross-entropy, and
+        3. reconstruction (cosine distance to ``encoder_buffer``);
+
+        then, per supertype group with parents, one ``decode_batch`` call whose
+        predicted parent embeddings are ``index_add_``-scattered into the
+        parents' ``child_sum`` (and ``child_count`` incremented).
+
+        ``process_roots`` controls whether rank-0 (root) nodes are decoded:
+        primary roots are classified/reconstructed (they have no parents, so
+        nothing is scattered), whereas condenser roots are skipped entirely --
+        they only hold accumulated predictions for the transplant.
+
+        Returns dense per-node tensors ``(combined, logits, classification_loss,
+        reconstruction_loss)``; entries for nodes that were not processed stay
+        zero.
         """
-
-        decode_buffer_entry = decode_buffer[node_idx]
-
-        embeddings_predicted_by_children = torch.stack(
-            decode_buffer_entry.embeddings_predicted_by_children
+        num_nodes = graph.num_nodes
+        combined_buffer = torch.zeros(
+            num_nodes, self.node_embedding_dim, dtype=child_sum.dtype, device=device
+        )
+        logits_buffer = torch.zeros(
+            num_nodes, self.num_node_types, dtype=encoder_buffer.dtype, device=device
+        )
+        classification_losses = torch.zeros(
+            num_nodes, dtype=encoder_buffer.dtype, device=device
+        )
+        reconstruction_losses = torch.zeros(
+            num_nodes, dtype=encoder_buffer.dtype, device=device
         )
 
-        # Combine the per-child predictions in a variance-preserving way:
-        # for k uncorrelated unit-variance vectors, ``sum / sqrt(k)`` keeps unit
-        # variance (a plain mean would shrink it by ``1 / k``). This replaces the
-        # brute-force renormalization that previously masked the shrinkage.
-        num_children = embeddings_predicted_by_children.shape[0]
-        combined_predicted_embeddings = embeddings_predicted_by_children.sum(
-            dim=0
-        ) / math.sqrt(num_children)
-        decode_buffer_entry.combined_predicted_embedding = combined_predicted_embeddings
+        for rank in reversed(range(len(graph.rank_groups))):
+            if rank == 0 and not process_roots:
+                continue
+            groups = graph.rank_groups[rank]
 
-        predicted_type_logits: Tensor = self.node_type_predictor(
-            combined_predicted_embeddings
-        )
-        decode_buffer_entry.predicted_type_logits = predicted_type_logits
+            # All nodes at this rank, across supertype groups: combine, classify
+            # and reconstruct uniformly (these use the shared type head and the
+            # encoder buffer regardless of supertype).
+            rank_node_indices = torch.cat(
+                [g.node_buffer_indices for g in groups]
+            ).to(device)
 
-        classification_loss = F.cross_entropy(predicted_type_logits, class_label)
-        decode_buffer_entry.classification_loss = (
-            classification_loss * classification_loss_weight
-        )
+            counts = child_count[rank_node_indices]
+            combined = child_sum[rank_node_indices] / counts.sqrt().unsqueeze(-1)
+            combined_buffer[rank_node_indices] = combined
 
-        # Tie the decode path to the encode path: this node's combined
-        # child-predicted embedding is pulled toward the encoder's embedding for
-        # the same node. The encoder-side target is NOT detached, so this loss
-        # backpropagates into both paths. Using cosine distance (rather than MSE)
-        # keeps it bounded in [0, 2] regardless of embedding magnitudes, which
-        # matters here because the combined prediction is sqrt(k)-scaled and
-        # encoder magnitudes can drift during training (an MSE term would explode).
-        decode_buffer_entry.reconstruction_loss = 1.0 - F.cosine_similarity(
-            combined_predicted_embeddings,
-            encoder_buffer[node_idx],
-            dim=0,
-        )
-
-        node_parent_indices = graph.node_inputs_indices[node_idx]
-        if len(node_parent_indices) == 0:
-            return
-
-        node_type = graph.node_types[node_idx]
-        node_autoencoder = node_autoencoders[node_type]
-        predicted_parent_embeddings = node_autoencoder.decode(
-            combined_predicted_embeddings, node_type
-        )
-
-        for parent_idx, parent_embedding in zip(
-            node_parent_indices, predicted_parent_embeddings
-        ):
-            parent_decode_buffer_entry = decode_buffer[parent_idx]
-            parent_decode_buffer_entry.embeddings_predicted_by_children.append(
-                parent_embedding
+            logits = self.node_type_predictor(combined)
+            logits_buffer[rank_node_indices] = logits
+            cross_entropy = F.cross_entropy(
+                logits, labels[rank_node_indices], reduction="none"
             )
+            classification_losses[rank_node_indices] = (
+                cross_entropy * class_weights[rank_node_indices]
+            )
+
+            reconstruction_losses[rank_node_indices] = 1.0 - F.cosine_similarity(
+                combined, encoder_buffer[rank_node_indices], dim=-1
+            )
+
+            # Per group with parents: decode this rank's combined predictions
+            # into predicted parent embeddings and scatter them up the DAG.
+            for group in groups:
+                in_degree = group.parent_buffer_gather_indices.shape[1]
+                if in_degree == 0:
+                    continue
+
+                node_buffer_indices = group.node_buffer_indices.to(device)
+                parent_gather_indices = group.parent_buffer_gather_indices.to(device)
+                subtypes = group.subtypes.to(device)
+
+                node_autoencoder = node_autoencoders[int(group.subtypes[0])]
+                # [G, in_degree, D]: predicted embedding of each ordered parent.
+                predicted_parent_embeddings = node_autoencoder.decode_batch(
+                    combined_buffer[node_buffer_indices], subtypes
+                )
+
+                flat_parent_indices = parent_gather_indices.reshape(-1)
+                flat_predictions = predicted_parent_embeddings.reshape(
+                    -1, self.node_embedding_dim
+                ).to(child_sum.dtype)
+                child_sum.index_add_(0, flat_parent_indices, flat_predictions)
+                child_count.index_add_(
+                    0,
+                    flat_parent_indices,
+                    torch.ones_like(flat_parent_indices, dtype=child_count.dtype),
+                )
+
+        return (
+            combined_buffer,
+            logits_buffer,
+            classification_losses,
+            reconstruction_losses,
+        )
 
     def inference_decode_blind_autoregressive(
         self,

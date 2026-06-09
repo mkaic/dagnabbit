@@ -24,10 +24,10 @@ from dagnabbit.scripts.logging_utils import (
 def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    cc_mean = torch.stack(losses.condenser_node_classification_losses).mean()
-    cr_mean = torch.stack(losses.condenser_node_reconstruction_losses).mean()
-    pc_mean = torch.stack(losses.primary_node_classification_losses).mean()
-    pr_mean = torch.stack(losses.primary_node_reconstruction_losses).mean()
+    cc_mean = losses.condenser_node_classification_losses.mean()
+    cr_mean = losses.condenser_node_reconstruction_losses.mean()
+    pc_mean = losses.primary_node_classification_losses.mean()
+    pr_mean = losses.primary_node_reconstruction_losses.mean()
 
     total = (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean

@@ -120,19 +120,10 @@ def measure_signal_propagation(
             model = build_model()
             for _ in range(graphs_per_model):
                 graph = sample_graph()
-                _, primary_buffer, primary_decode_buffer = model.training_forward(
+                _, primary_buffer, decode_buffer = model.training_forward(
                     graph, return_buffers=True
                 )
                 depths = node_depths(graph)
-
-                decode_rows = [
-                    e.combined_predicted_embedding for e in primary_decode_buffer
-                ]
-                assert all(r is not None for r in decode_rows), (
-                    "every primary node should be decoded and have a combined "
-                    "predicted embedding"
-                )
-                decode_buffer = torch.stack(decode_rows)
 
                 phase_buffers = {"encode": primary_buffer, "decode": decode_buffer}
                 for phase, buffer in phase_buffers.items():
