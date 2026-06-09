@@ -26,11 +26,10 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
 class MLP(nn.Module):
     """Plain MLP: ``Linear`` per layer, GELU activations between layers.
 
-    No LayerNorm lives inside this module. Callers that need normalisation are
-    responsible for adding it at the boundary where it is semantically
-    appropriate (e.g. ``NodeEncoder`` adds one after its MLP output;
-    ``NodeDecoder`` adds one before its MLP input; the classification head uses
-    none).
+    No normalisation lives inside this module. Callers are responsible for
+    adding it at the boundary where it is semantically appropriate (e.g.
+    ``NodeEncoder`` and ``NodeDecoder`` each add an ``AdaLN`` after their MLP
+    output; the classification head uses none).
     """
 
     def __init__(
@@ -62,6 +61,20 @@ class MLP(nn.Module):
                 x = self.activation(x)
 
         return x
+
+
+class AdaLN(nn.Module):
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.proj = nn.Linear(dim, 2 * dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        gamma, beta = self.proj(x).chunk(2, dim=-1)
+        return (1 + gamma) * self.norm(x) + beta
 
 
 def _mlp_dims(
@@ -98,7 +111,7 @@ class NodeEncoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
-        self.output_norm = nn.LayerNorm(node_embedding_dim)
+        self.output_norm = AdaLN(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
@@ -140,7 +153,7 @@ class NodeDecoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
-        self.output_norm = nn.LayerNorm(node_embedding_dim)
+        self.output_norm = AdaLN(node_embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)

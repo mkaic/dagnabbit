@@ -9,7 +9,7 @@ CONDENSER_NODE_TYPE_IN_DEGREE = 2
 NUM_ROOT_NODES = 4
 NUM_OUTPUT_NODES = 4
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
-MLP_DEPTH = 3
+MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
 MLP_EXPANSION_FACTOR = 4.0
 
@@ -20,9 +20,11 @@ NUM_TRUNK_NODES = 64
 NUM_STEPS = 1_000_000
 GRADIENT_ACCUMULATION_STEPS = 8 
 LEARNING_RATE = 1e-3
+
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
 GRADIENT_CLIP_MAX_NORM = 1.0
+
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
 # DEVICE="cpu"
