@@ -12,7 +12,6 @@ class NodeSupertype(Enum):
     ROOT = "root"
     TRUNK = "trunk"
     OUTPUT = "output"
-    CONDENSER = "condenser"
 
 
 def subtype_to_supertype(
@@ -30,10 +29,6 @@ def subtype_to_supertype(
 
     Any layout argument left as ``None`` falls back to the corresponding value
     in ``dagnabbit.scripts.config``, so training callsites can omit them.
-
-    Note that the subtype alone cannot distinguish ``CONDENSER`` from ``TRUNK``
-    (condenser trunk nodes reuse the trunk type space); that distinction is made
-    at the graph level by the caller.
     """
     if num_trunk_node_types is None or num_root_nodes is None or num_output_nodes is None:
         from dagnabbit.scripts import config as cfg
@@ -303,52 +298,3 @@ def make_random_graph_description(
     )
 
 
-def make_condenser_graph_description(
-    primary_graph: FixedInDegreeDAGDescription,
-) -> FixedInDegreeDAGDescription:
-    n_roots = len(primary_graph.leaf_node_indices)
-    assert n_roots > 1, (
-        "condenser graph requires more than one leaf in the primary graph"
-    )
-
-    trunk_node_input_indices: list[NodeInputIndices] = []
-    leaf_node_indices: set[int] = set(range(n_roots))
-
-    while len(leaf_node_indices) > 1:
-        leaf_list = sorted(leaf_node_indices)
-        perm = torch.randperm(len(leaf_list)).tolist()
-        shuffled = [leaf_list[i] for i in perm]
-
-        if len(shuffled) % 2 != 0:
-            shuffled.pop()
-
-        for i in range(0, len(shuffled), 2):
-            input_a = shuffled[i]
-            input_b = shuffled[i + 1]
-            trunk_node_input_indices.append([input_a, input_b])
-            leaf_node_indices.remove(input_a)
-            leaf_node_indices.remove(input_b)
-            leaf_node_indices.add(len(trunk_node_input_indices) - 1 + n_roots)
-
-    num_trunk_nodes = len(trunk_node_input_indices)
-
-    node_inputs_indices: list[NodeInputIndices] = []
-    for _ in range(n_roots):
-        node_inputs_indices.append([])
-    node_inputs_indices.extend(trunk_node_input_indices)
-
-    num_trunk_node_types = 1
-    root_node_types_start = num_trunk_node_types
-    node_types: list[int] = [root_node_types_start + i for i in range(n_roots)] + [
-        0
-    ] * num_trunk_nodes
-
-    return FixedInDegreeDAGDescription(
-        num_root_nodes=n_roots,
-        num_trunk_nodes=num_trunk_nodes,
-        num_output_nodes=0,
-        num_trunk_node_types=num_trunk_node_types,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
-        trunk_node_in_degrees=2,
-    )

@@ -52,7 +52,6 @@ def build_model(device: torch.device) -> DagnabbitAutoEncoder:
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-        condenser_node_type_in_degree=cfg.CONDENSER_NODE_TYPE_IN_DEGREE,
         num_root_nodes=cfg.NUM_ROOT_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,

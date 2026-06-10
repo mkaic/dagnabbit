@@ -56,13 +56,9 @@ def main() -> None:
         worst_rel = max(worst_rel, r)
 
     print("\n-- per-node loss vectors --")
-    for key in (
-        "loss_condenser_classification",
-        "loss_primary_classification",
-    ):
-        a, r = _report_tensor(key, ref[key], cand[key])
-        worst_abs = max(worst_abs, a)
-        worst_rel = max(worst_rel, r)
+    a, r = _report_tensor("loss_primary_classification", ref["loss_primary_classification"], cand["loss_primary_classification"])
+    worst_abs = max(worst_abs, a)
+    worst_rel = max(worst_rel, r)
 
     print("\n-- total loss --")
     total_abs = abs(ref["total_loss"] - cand["total_loss"])

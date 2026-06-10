@@ -52,7 +52,6 @@ from dagnabbit.dag.autoencoder import (
 )
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
-    make_condenser_graph_description,
     make_random_graph_description,
 )
 from dagnabbit.scripts import config as cfg
@@ -156,11 +155,7 @@ def reference_training_forward(
     model: DagnabbitAutoEncoder,
     primary_graph: FixedInDegreeDAGDescription,
 ) -> dict:
-    """Pre-refactor ``training_forward`` body, returning normalized live tensors.
-
-    ``make_condenser_graph_description`` is called here exactly as the original
-    did (so the caller must seed the RNG identically before this and before the
-    batched ``training_forward`` to get the same condenser graph)."""
+    """Pre-refactor ``training_forward`` body, returning normalized live tensors."""
     device = model.root_node_embeddings.weight.device
     D = model.node_embedding_dim
 
@@ -170,51 +165,22 @@ def reference_training_forward(
         model.node_autoencoders,
         D,
     )
-    condenser_graph = make_condenser_graph_description(primary_graph)
-    leaf_embeddings = primary_buffer[primary_graph.leaf_node_indices]
-    condenser_buffer = _reference_evaluate_graph(
-        condenser_graph,
-        leaf_embeddings,
-        {0: model.condenser_node_autoencoder},
-        D,
-    )
-    assert len(condenser_graph.leaf_node_indices) == 1
-    graph_embedding = condenser_buffer[condenser_graph.leaf_node_indices[0]]
 
-    # ---- condenser decode ----
-    condenser_buffer_entries = [
-        _RefEntry() for _ in range(condenser_graph.num_nodes)
-    ]
-    condenser_buffer_entries[-1].embeddings_predicted_by_children = [graph_embedding]
-
-    condenser_weights = _class_balance_weights(list(condenser_graph.node_types))
     primary_weights = _class_balance_weights(list(primary_graph.node_types))
-    condenser_labels = torch.as_tensor(
-        list(condenser_graph.node_types), dtype=torch.long, device=device
-    )
     primary_labels = torch.as_tensor(
         list(primary_graph.node_types), dtype=torch.long, device=device
     )
 
-    for node_idx in reversed(
-        range(condenser_graph.num_root_nodes, condenser_graph.num_nodes)
-    ):
-        _reference_decode_step(
-            model,
-            node_idx,
-            condenser_graph,
-            condenser_buffer_entries,
-            {0: model.condenser_node_autoencoder},
-            condenser_labels[node_idx],
-            condenser_weights[node_idx],
-        )
-
-    # ---- transplant condenser roots -> primary leaves ----
     primary_buffer_entries = [_RefEntry() for _ in range(primary_graph.num_nodes)]
-    for condenser_root_idx in range(condenser_graph.num_root_nodes):
-        primary_leaf_idx = primary_graph.leaf_node_indices[condenser_root_idx]
-        primary_buffer_entries[primary_leaf_idx].embeddings_predicted_by_children = (
-            condenser_buffer_entries[condenser_root_idx].embeddings_predicted_by_children
+
+    # Seed each leaf with its own encode embedding (mirrors the batched
+    # ``_decode_pipeline``): leaves are referenced by no node, so nothing
+    # scatters predictions onto them during decode -- without a seed their
+    # ``embeddings_predicted_by_children`` would be empty and the combine would
+    # divide by zero / stack an empty list.
+    for leaf_idx in primary_graph.leaf_node_indices:
+        primary_buffer_entries[leaf_idx].embeddings_predicted_by_children.append(
+            primary_buffer[leaf_idx]
         )
 
     for node_idx in reversed(range(primary_graph.num_nodes)):
@@ -228,9 +194,6 @@ def reference_training_forward(
             primary_weights[node_idx],
         )
 
-    condenser_trunk = condenser_buffer_entries[condenser_graph.num_root_nodes :]
-
-    cc = torch.stack([e.classification_loss for e in condenser_trunk])
     pc = torch.stack([e.classification_loss for e in primary_buffer_entries])
 
     decode_combined = torch.stack(
@@ -240,7 +203,6 @@ def reference_training_forward(
     return {
         "encode_buffer": primary_buffer,
         "decode_combined": decode_combined,
-        "loss_condenser_classification": cc,
         "loss_primary_classification": pc,
     }
 
@@ -260,19 +222,13 @@ def batched_training_forward(
     return {
         "encode_buffer": primary_buffer,
         "decode_combined": decode_combined,
-        "loss_condenser_classification": losses.condenser_node_classification_losses,
         "loss_primary_classification": losses.primary_node_classification_losses,
     }
 
 
 def _total_loss(out: dict) -> torch.Tensor:
-    """Replicate ``combine_losses`` (classification weights are 1.0)."""
-    return (
-        cfg.W_CONDENSER_DECODED_CLASSIFICATION
-        * out["loss_condenser_classification"].mean()
-        + cfg.W_PRIMARY_DECODED_CLASSIFICATION
-        * out["loss_primary_classification"].mean()
-    )
+    """Replicate ``combine_losses`` (classification weight is 1.0)."""
+    return cfg.W_PRIMARY_DECODED_CLASSIFICATION * out["loss_primary_classification"].mean()
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +241,6 @@ def _build_model(dtype: torch.dtype) -> DagnabbitAutoEncoder:
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-        condenser_node_type_in_degree=cfg.CONDENSER_NODE_TYPE_IN_DEGREE,
         num_root_nodes=cfg.NUM_ROOT_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
@@ -303,8 +258,7 @@ def run_comparison(
 
     Gradients are compared by running both paths on the *same* model: backward
     the reference, snapshot grads, zero them, backward the batched path, snapshot
-    again. The condenser graph is RNG-generated inside each forward, so we reseed
-    identically right before each so both build the same condenser graph.
+    again.
     """
     torch.manual_seed(seed)
     model = _build_model(dtype)
@@ -317,10 +271,6 @@ def run_comparison(
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
     )
 
-    # Capture the RNG state so both forwards build an identical condenser graph.
-    rng_state = torch.get_rng_state()
-
-    torch.set_rng_state(rng_state)
     model.zero_grad(set_to_none=True)
     ref = reference_training_forward(model, primary_graph)
     ref_total = _total_loss(ref)
@@ -331,7 +281,6 @@ def run_comparison(
         if p.grad is not None
     }
 
-    torch.set_rng_state(rng_state)
     model.zero_grad(set_to_none=True)
     bat = batched_training_forward(model, primary_graph)
     bat_total = _total_loss(bat)
@@ -348,7 +297,6 @@ def run_comparison(
     tensor_keys = [
         "encode_buffer",
         "decode_combined",
-        "loss_condenser_classification",
         "loss_primary_classification",
     ]
     diffs = {k: max_abs(ref[k], bat[k]) for k in tensor_keys}
@@ -376,11 +324,7 @@ def test_batched_matches_per_node_reference_float64() -> None:
     assert diffs["encode_buffer"] < 1e-9, diffs
     assert diffs["decode_combined"] < 1e-9, diffs
     assert diffs["total_loss"] < 1e-9, diffs
-    for key in (
-        "loss_condenser_classification",
-        "loss_primary_classification",
-    ):
-        assert diffs[key] < 1e-9, (key, diffs)
+    assert diffs["loss_primary_classification"] < 1e-9, diffs
     assert diffs["grads"] < 1e-7, diffs
 
 

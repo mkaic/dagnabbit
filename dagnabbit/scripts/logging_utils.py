@@ -108,9 +108,7 @@ def log_step_metrics(
     total: float,
     components: dict[str, float],
     decoder_accuracies: dict[int, float],
-    condenser_decoder_accuracies: dict[int, float],
     tf_decoder_accuracies: dict[int, float] | None = None,
-    tf_condenser_decoder_accuracies: dict[int, float] | None = None,
     grad_norm: float | None = None,
     grad_was_clipped: bool | None = None,
 ) -> None:
@@ -137,14 +135,6 @@ def log_step_metrics(
         tag_prefix="accuracy",
         per_class_tag_prefix="accuracy_per_class",
     )
-    log_decoder_accuracies(
-        writer,
-        step,
-        condenser_decoder_accuracies,
-        mean_tag="accuracy/condenser/mean",
-        tag_prefix="accuracy/condenser",
-        per_class_tag_prefix="accuracy/condenser_per_class",
-    )
 
     # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
     # so they sit next to the autoregressive curves in TensorBoard). The whole
@@ -158,15 +148,6 @@ def log_step_metrics(
             mean_tag="accuracy/tf/decoder_mean",
             tag_prefix="accuracy/tf",
             per_class_tag_prefix="accuracy/tf_per_class",
-        )
-    if tf_condenser_decoder_accuracies is not None:
-        log_decoder_accuracies(
-            writer,
-            step,
-            tf_condenser_decoder_accuracies,
-            mean_tag="accuracy/tf_condenser/mean",
-            tag_prefix="accuracy/tf_condenser",
-            per_class_tag_prefix="accuracy/tf_condenser_per_class",
         )
 
 
