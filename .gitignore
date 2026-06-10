@@ -5,6 +5,8 @@ runs/
 profile_out*/
 profile_terminal_output*.txt
 
+.cursor/plans
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

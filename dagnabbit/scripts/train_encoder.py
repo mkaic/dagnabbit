@@ -21,15 +21,31 @@ from dagnabbit.scripts.logging_utils import (
 )
 
 
+def _safe_mean(t: torch.Tensor) -> torch.Tensor:
+    return t.mean() if t.numel() else t.new_zeros(())
+
+
 def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     pc_mean = losses.primary_node_classification_losses.mean()
     tf_pc_mean = losses.teacher_forced_primary_node_classification_losses.mean()
+    pr_mean = _safe_mean(losses.primary_node_parent_reconstruction_losses)
+    tf_pr_mean = _safe_mean(
+        losses.teacher_forced_primary_node_parent_reconstruction_losses
+    )
+    pc_cons_mean = _safe_mean(losses.primary_node_parent_consistency_losses)
+    tf_pc_cons_mean = _safe_mean(
+        losses.teacher_forced_primary_node_parent_consistency_losses
+    )
 
     total = cfg.GLOBAL_LOSS_MULTIPLIER * (
         cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
         + cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
+        + cfg.W_PRIMARY_PARENT_RECONSTRUCTION * pr_mean
+        + cfg.W_TF_PRIMARY_PARENT_RECONSTRUCTION * tf_pr_mean
+        + cfg.W_PRIMARY_PARENT_CONSISTENCY * pc_cons_mean
+        + cfg.W_TF_PRIMARY_PARENT_CONSISTENCY * tf_pc_cons_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
@@ -37,6 +53,10 @@ def combine_losses(
     components = {
         "primary_decoded_classification": pc_mean,
         "tf_primary_decoded_classification": tf_pc_mean,
+        "primary_parent_reconstruction": pr_mean,
+        "tf_primary_parent_reconstruction": tf_pr_mean,
+        "primary_parent_consistency": pc_cons_mean,
+        "tf_primary_parent_consistency": tf_pc_cons_mean,
     }
     return total, components
 
@@ -156,6 +176,7 @@ def main() -> None:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
     ).to(device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

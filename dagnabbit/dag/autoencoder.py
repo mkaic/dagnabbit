@@ -292,6 +292,14 @@ class TrainingStepLossReturnType:
     # ``DagnabbitAutoEncoder._decode_pipeline``.
     teacher_forced_primary_node_classification_losses: Tensor
     teacher_forced_primary_node_predicted_type_logits: Tensor
+    # Per-edge reconstruction: 1 - cos(predicted_parent, encoder_buffer[parent]).
+    # Edge-flat 1-D tensor (empty when no edges exist in the graph).
+    primary_node_parent_reconstruction_losses: Tensor
+    teacher_forced_primary_node_parent_reconstruction_losses: Tensor
+    # Per-node consistency: variance of predictions landing on the same parent,
+    # summed over D. Node-indexed 1-D tensor; zero for count <= 1 nodes.
+    primary_node_parent_consistency_losses: Tensor
+    teacher_forced_primary_node_parent_consistency_losses: Tensor
 
 
 @dataclass
@@ -301,6 +309,10 @@ class _DecodePipelineResult:
     primary_combined: Tensor
     primary_logits: Tensor
     primary_class_losses: Tensor
+    # Edge-flat 1-D tensor of per-edge reconstruction losses.
+    primary_recon: Tensor
+    # Node-indexed 1-D tensor of per-parent consistency losses (zero for count<=1).
+    primary_consistency: Tensor
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -313,6 +325,7 @@ class DagnabbitAutoEncoder(nn.Module):
         num_output_nodes: int,
         mlp_depth: int,
         mlp_expansion_factor: float,
+        reconstruction_detach_target: bool = True,
     ):
         super().__init__()
 
@@ -330,6 +343,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
         self.mlp_depth = mlp_depth
         self.mlp_expansion_factor = mlp_expansion_factor
+        self.reconstruction_detach_target = reconstruction_detach_target
 
         # ---- Trunk node autoencoders (one per node type) ----
         self.trunk_node_autoencoders = nn.ModuleList(
@@ -529,6 +543,14 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_primary_node_predicted_type_logits=(
                 teacher_forced.primary_logits
             ),
+            primary_node_parent_reconstruction_losses=autoregressive.primary_recon,
+            teacher_forced_primary_node_parent_reconstruction_losses=(
+                teacher_forced.primary_recon
+            ),
+            primary_node_parent_consistency_losses=autoregressive.primary_consistency,
+            teacher_forced_primary_node_parent_consistency_losses=(
+                teacher_forced.primary_consistency
+            ),
         )
 
         if return_buffers:
@@ -572,10 +594,20 @@ class DagnabbitAutoEncoder(nn.Module):
                 device=device,
             )
             child_count = torch.zeros(graph.num_nodes, dtype=dtype, device=device)
-            return child_sum, child_count
+            child_sumsq = torch.zeros(
+                graph.num_nodes,
+                self.node_embedding_dim,
+                dtype=dtype,
+                device=device,
+            )
+            return child_sum, child_count, child_sumsq
 
-        ar_primary_sum, ar_primary_count = _zeros(primary_graph, primary_buffer.dtype)
-        tf_primary_sum, tf_primary_count = _zeros(primary_graph, primary_buffer.dtype)
+        ar_primary_sum, ar_primary_count, ar_primary_sumsq = _zeros(
+            primary_graph, primary_buffer.dtype
+        )
+        tf_primary_sum, tf_primary_count, tf_primary_sumsq = _zeros(
+            primary_graph, primary_buffer.dtype
+        )
 
         # Seed the leaf nodes' child buffers with their own encode-side
         # embeddings. Leaves are (by definition) referenced by no other node, so
@@ -589,23 +621,40 @@ class DagnabbitAutoEncoder(nn.Module):
         leaf_indices = torch.as_tensor(
             primary_graph.leaf_node_indices, dtype=torch.long, device=device
         )
-        for child_sum, child_count in (
-            (ar_primary_sum, ar_primary_count),
-            (tf_primary_sum, tf_primary_count),
+        for child_sum, child_count, child_sumsq in (
+            (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
+            (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
         ):
             child_sum[leaf_indices] = primary_buffer[leaf_indices].to(child_sum.dtype)
             child_count[leaf_indices] = 1.0
+            child_sumsq[leaf_indices] = (
+                primary_buffer[leaf_indices].to(child_sumsq.dtype) ** 2
+            )
 
         (
-            (ar_primary_combined, ar_primary_logits, ar_primary_class),
-            (tf_primary_combined, tf_primary_logits, tf_primary_class),
+            (
+                ar_primary_combined,
+                ar_primary_logits,
+                ar_primary_class,
+                ar_primary_recon,
+                ar_primary_consistency,
+            ),
+            (
+                tf_primary_combined,
+                tf_primary_logits,
+                tf_primary_class,
+                tf_primary_recon,
+                tf_primary_consistency,
+            ),
         ) = self._decode_graph(
             graph=primary_graph,
             encoder_buffer=primary_buffer,
             autoregressive_child_sum=ar_primary_sum,
             autoregressive_child_count=ar_primary_count,
+            autoregressive_child_sumsq=ar_primary_sumsq,
             teacher_forced_child_sum=tf_primary_sum,
             teacher_forced_child_count=tf_primary_count,
+            teacher_forced_child_sumsq=tf_primary_sumsq,
             node_autoencoders=self.node_autoencoders,
             labels=primary_labels,
             class_weights=primary_weights,
@@ -617,11 +666,15 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_combined=ar_primary_combined,
             primary_logits=ar_primary_logits,
             primary_class_losses=ar_primary_class,
+            primary_recon=ar_primary_recon,
+            primary_consistency=ar_primary_consistency,
         )
         teacher_forced = _DecodePipelineResult(
             primary_combined=tf_primary_combined,
             primary_logits=tf_primary_logits,
             primary_class_losses=tf_primary_class,
+            primary_recon=tf_primary_recon,
+            primary_consistency=tf_primary_consistency,
         )
         return autoregressive, teacher_forced
 
@@ -631,16 +684,18 @@ class DagnabbitAutoEncoder(nn.Module):
         encoder_buffer: Tensor,
         autoregressive_child_sum: Tensor,
         autoregressive_child_count: Tensor,
+        autoregressive_child_sumsq: Tensor,
         teacher_forced_child_sum: Tensor,
         teacher_forced_child_count: Tensor,
+        teacher_forced_child_sumsq: Tensor,
         node_autoencoders: dict[int, NodeAutoEncoder],
         labels: Tensor,
         class_weights: Tensor,
         process_roots: bool,
         device: torch.device,
     ) -> tuple[
-        tuple[Tensor, Tensor, Tensor],
-        tuple[Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
     ]:
         """Run the batched guided-autoregressive decode over one graph for the
         autoregressive and teacher-forced passes **simultaneously**.
@@ -703,10 +758,16 @@ class DagnabbitAutoEncoder(nn.Module):
             class_losses = torch.zeros(
                 num_nodes, dtype=encoder_buffer.dtype, device=device
             )
-            return combined, logits, class_losses
+            consistency = torch.zeros(
+                num_nodes, dtype=encoder_buffer.dtype, device=device
+            )
+            return combined, logits, class_losses, consistency
 
-        ar_combined, ar_logits, ar_class = _alloc_pass_buffers()
-        tf_combined, tf_logits, tf_class = _alloc_pass_buffers()
+        ar_combined, ar_logits, ar_class, ar_consistency = _alloc_pass_buffers()
+        tf_combined, tf_logits, tf_class, tf_consistency = _alloc_pass_buffers()
+
+        ar_recon_edge_list: list[Tensor] = []
+        tf_recon_edge_list: list[Tensor] = []
 
         for rank in reversed(range(len(graph.rank_groups))):
             if rank == 0 and not process_roots:
@@ -734,6 +795,32 @@ class DagnabbitAutoEncoder(nn.Module):
             )
             ar_combined[rank_node_indices] = ar_combined_rank
             tf_combined[rank_node_indices] = tf_combined_rank
+
+            # Per-node consistency: variance of child predictions summed over D,
+            # masked to nodes that received > 1 prediction.
+            ar_mean = (
+                autoregressive_child_sum[rank_node_indices]
+                / ar_counts.unsqueeze(-1)
+            )
+            ar_var = (
+                autoregressive_child_sumsq[rank_node_indices] / ar_counts.unsqueeze(-1)
+                - ar_mean**2
+            ).sum(dim=-1).clamp(min=0)
+            ar_consistency[rank_node_indices] = torch.where(
+                ar_counts > 1, ar_var, torch.zeros_like(ar_var)
+            )
+
+            tf_mean = (
+                teacher_forced_child_sum[rank_node_indices]
+                / tf_counts.unsqueeze(-1)
+            )
+            tf_var = (
+                teacher_forced_child_sumsq[rank_node_indices] / tf_counts.unsqueeze(-1)
+                - tf_mean**2
+            ).sum(dim=-1).clamp(min=0)
+            tf_consistency[rank_node_indices] = torch.where(
+                tf_counts > 1, tf_var, torch.zeros_like(tf_var)
+            )
 
             # Classify both passes in one launch. Rows ``[:num_rank_nodes]`` are
             # autoregressive, ``[num_rank_nodes:]`` are teacher-forced; the
@@ -799,26 +886,54 @@ class DagnabbitAutoEncoder(nn.Module):
                     flat_parent_indices, dtype=autoregressive_child_count.dtype
                 )
 
+                ar_flat = ar_predicted.reshape(-1, self.node_embedding_dim)
+                tf_flat = tf_predicted.reshape(-1, self.node_embedding_dim)
+
+                # Per-edge reconstruction: 1 - cos(predicted, true_parent_embed).
+                recon_target = encoder_buffer[flat_parent_indices]
+                if self.reconstruction_detach_target:
+                    recon_target = recon_target.detach()
+                ar_recon_edge_list.append(
+                    1.0 - F.cosine_similarity(
+                        ar_flat.to(recon_target.dtype), recon_target, dim=-1
+                    )
+                )
+                tf_recon_edge_list.append(
+                    1.0 - F.cosine_similarity(
+                        tf_flat.to(recon_target.dtype), recon_target, dim=-1
+                    )
+                )
+
                 autoregressive_child_sum.index_add_(
                     0,
                     flat_parent_indices,
-                    ar_predicted.reshape(-1, self.node_embedding_dim).to(
-                        autoregressive_child_sum.dtype
-                    ),
+                    ar_flat.to(autoregressive_child_sum.dtype),
                 )
                 autoregressive_child_count.index_add_(0, flat_parent_indices, ones)
+                autoregressive_child_sumsq.index_add_(
+                    0,
+                    flat_parent_indices,
+                    (ar_flat**2).to(autoregressive_child_sumsq.dtype),
+                )
                 teacher_forced_child_sum.index_add_(
                     0,
                     flat_parent_indices,
-                    tf_predicted.reshape(-1, self.node_embedding_dim).to(
-                        teacher_forced_child_sum.dtype
-                    ),
+                    tf_flat.to(teacher_forced_child_sum.dtype),
                 )
                 teacher_forced_child_count.index_add_(0, flat_parent_indices, ones)
+                teacher_forced_child_sumsq.index_add_(
+                    0,
+                    flat_parent_indices,
+                    (tf_flat**2).to(teacher_forced_child_sumsq.dtype),
+                )
+
+        _empty = encoder_buffer.new_zeros(0)
+        ar_recon = torch.cat(ar_recon_edge_list) if ar_recon_edge_list else _empty
+        tf_recon = torch.cat(tf_recon_edge_list) if tf_recon_edge_list else _empty
 
         return (
-            (ar_combined, ar_logits, ar_class),
-            (tf_combined, tf_logits, tf_class),
+            (ar_combined, ar_logits, ar_class, ar_recon, ar_consistency),
+            (tf_combined, tf_logits, tf_class, tf_recon, tf_consistency),
         )
 
     def inference_decode_blind_autoregressive(
