@@ -297,7 +297,7 @@ class TrainingStepLossReturnType:
     primary_node_parent_reconstruction_losses: Tensor
     teacher_forced_primary_node_parent_reconstruction_losses: Tensor
     # Per-node consistency: variance of predictions landing on the same parent,
-    # summed over D. Node-indexed 1-D tensor; zero for count <= 1 nodes.
+    # averaged over D. Node-indexed 1-D tensor; zero for count <= 1 nodes.
     primary_node_parent_consistency_losses: Tensor
     teacher_forced_primary_node_parent_consistency_losses: Tensor
 
@@ -796,7 +796,8 @@ class DagnabbitAutoEncoder(nn.Module):
             ar_combined[rank_node_indices] = ar_combined_rank
             tf_combined[rank_node_indices] = tf_combined_rank
 
-            # Per-node consistency: variance of child predictions summed over D,
+            # Per-node consistency: variance of child predictions averaged over D
+            # (mean, not sum, so the magnitude is invariant to embedding dim),
             # masked to nodes that received > 1 prediction.
             ar_mean = (
                 autoregressive_child_sum[rank_node_indices]
@@ -805,7 +806,7 @@ class DagnabbitAutoEncoder(nn.Module):
             ar_var = (
                 autoregressive_child_sumsq[rank_node_indices] / ar_counts.unsqueeze(-1)
                 - ar_mean**2
-            ).sum(dim=-1).clamp(min=0)
+            ).mean(dim=-1).clamp(min=0)
             ar_consistency[rank_node_indices] = torch.where(
                 ar_counts > 1, ar_var, torch.zeros_like(ar_var)
             )
@@ -817,7 +818,7 @@ class DagnabbitAutoEncoder(nn.Module):
             tf_var = (
                 teacher_forced_child_sumsq[rank_node_indices] / tf_counts.unsqueeze(-1)
                 - tf_mean**2
-            ).sum(dim=-1).clamp(min=0)
+            ).mean(dim=-1).clamp(min=0)
             tf_consistency[rank_node_indices] = torch.where(
                 tf_counts > 1, tf_var, torch.zeros_like(tf_var)
             )
