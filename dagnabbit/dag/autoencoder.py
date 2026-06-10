@@ -24,13 +24,7 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
 
 
 class MLP(nn.Module):
-    """Plain MLP: ``Linear`` per layer, GELU activations between layers.
-
-    No normalisation lives inside this module. Callers are responsible for
-    adding it at the boundary where it is semantically appropriate (e.g.
-    ``NodeEncoder`` and ``NodeDecoder`` each add an ``AdaLN`` after their MLP
-    output; the classification head uses none).
-    """
+    """Pre-norm MLP: ``LayerNorm -> Linear`` per layer, GELU between layers."""
 
     def __init__(
         self,
@@ -45,6 +39,9 @@ class MLP(nn.Module):
                 for i in range(len(vector_dims) - 1)
             ]
         )
+        self.norms = nn.ModuleList(
+            [nn.LayerNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
+        )
         self.activation = activation if activation is not None else nn.GELU()
 
     # ``dynamic=True``: grouped (rank-batched) evaluation calls every MLP with a
@@ -56,25 +53,12 @@ class MLP(nn.Module):
     @torch.compile(dynamic=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
+            x = self.norms[i](x)
             x = layer(x)
             if i + 1 < len(self.layers):
                 x = self.activation(x)
 
         return x
-
-
-class AdaLN(nn.Module):
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.proj = nn.Linear(dim, 2 * dim)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        gamma, beta = self.proj(x).chunk(2, dim=-1)
-        return (1 + gamma) * self.norm(x) + beta
 
 
 def _mlp_dims(
@@ -111,14 +95,9 @@ class NodeEncoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
-        self.output_norm = AdaLN(node_embedding_dim)
-
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
-        x = self.encoder(x)
-        x = self.output_norm(x)
-
-        return x
+        return self.encoder(x)
 
     def forward_batch(self, x: Tensor) -> Tensor:
         """Batched encode over a leading group axis.
@@ -130,8 +109,7 @@ class NodeEncoder(nn.Module):
         ``[in_degree, D]`` slice (same flatten order, same weights).
         """
         x = x.reshape(x.shape[0], self.in_degree * self.node_embedding_dim)
-        x = self.encoder(x)
-        return self.output_norm(x)
+        return self.encoder(x)
 
 
 class NodeDecoder(nn.Module):
@@ -153,15 +131,10 @@ class NodeDecoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
-        self.output_norm = AdaLN(node_embedding_dim)
-
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)
         x = x.view(self.in_degree, self.node_embedding_dim)
-        x = self.output_norm(x)
-        x = torch.unbind(x, dim=0)
-
-        return x
+        return torch.unbind(x, dim=0)
 
     def forward_batch(self, x: Tensor) -> Tensor:
         """Batched decode over a leading group axis.
@@ -173,8 +146,7 @@ class NodeDecoder(nn.Module):
         calling :meth:`forward` per node.
         """
         x = self.decoder(x)
-        x = x.view(x.shape[0], self.in_degree, self.node_embedding_dim)
-        return self.output_norm(x)
+        return x.view(x.shape[0], self.in_degree, self.node_embedding_dim)
 
 
 class NodeAutoEncoder(nn.Module):
