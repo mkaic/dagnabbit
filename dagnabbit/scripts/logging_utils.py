@@ -111,10 +111,23 @@ def log_step_metrics(
     condenser_decoder_accuracies: dict[int, float],
     tf_decoder_accuracies: dict[int, float] | None = None,
     tf_condenser_decoder_accuracies: dict[int, float] | None = None,
+    grad_norm: float | None = None,
+    grad_was_clipped: bool | None = None,
 ) -> None:
     writer.add_scalar("loss/total", total, step)
     for name, value in components.items():
         writer.add_scalar(f"loss/{name}", value, step)
+
+    if grad_norm is not None:
+        writer.add_scalar("gradients/norm", grad_norm, step)
+        if grad_was_clipped is not None:
+            writer.add_scalar("gradients/was_clipped", float(grad_was_clipped), step)
+            if cfg.GRADIENT_CLIP_MAX_NORM is not None:
+                writer.add_scalar(
+                    "gradients/norm_ratio",
+                    grad_norm / cfg.GRADIENT_CLIP_MAX_NORM,
+                    step,
+                )
 
     log_decoder_accuracies(
         writer,

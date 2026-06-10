@@ -214,6 +214,8 @@ def main() -> None:
         loss_ema: float | None = None
         best_loss: float | None = None
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
+        last_grad_norm: float | None = None
+        last_grad_was_clipped: bool | None = None
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
             graph = make_random_graph_description(
@@ -231,10 +233,19 @@ def main() -> None:
             scaled_loss.backward()
 
             if (step + 1) % cfg.GRADIENT_ACCUMULATION_STEPS == 0:
-                if cfg.GRADIENT_CLIP_MAX_NORM is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), cfg.GRADIENT_CLIP_MAX_NORM
+                clip_max_norm = cfg.GRADIENT_CLIP_MAX_NORM
+                if clip_max_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), clip_max_norm
                     )
+                    last_grad_norm = grad_norm.item()
+                    last_grad_was_clipped = last_grad_norm > clip_max_norm
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), float("inf")
+                    )
+                    last_grad_norm = grad_norm.item()
+                    last_grad_was_clipped = None
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -314,6 +325,8 @@ def main() -> None:
                     condenser_decoder_accuracies,
                     tf_decoder_accuracies,
                     tf_condenser_decoder_accuracies,
+                    grad_norm=last_grad_norm,
+                    grad_was_clipped=last_grad_was_clipped,
                 )
 
             if (step + 1) % cfg.CHECK_BEST_EVERY == 0:
