@@ -49,10 +49,10 @@ GLOBAL_LOSS_MULTIPLIER = 1.0
 # teacher-forced pass' contribution to the loss (it is still computed for
 # logging, so zero them *and* skip logging if you want it fully gone).
 W_CONDENSER_DECODED_CLASSIFICATION = 1.0
-W_CONDENSER_RECONSTRUCTION = 0.2
+W_CONDENSER_RECONSTRUCTION = 0.0
 
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
-W_PRIMARY_RECONSTRUCTION = 0.2
+W_PRIMARY_RECONSTRUCTION = 0.0
 
 # --- teacher-forced decode pass loss weights ---
 W_TF_CONDENSER_DECODED_CLASSIFICATION = 0.0
