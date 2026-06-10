@@ -577,6 +577,25 @@ class DagnabbitAutoEncoder(nn.Module):
         ar_primary_sum, ar_primary_count = _zeros(primary_graph, primary_buffer.dtype)
         tf_primary_sum, tf_primary_count = _zeros(primary_graph, primary_buffer.dtype)
 
+        # Seed the leaf nodes' child buffers with their own encode-side
+        # embeddings. Leaves are (by definition) referenced by no other node, so
+        # nothing scatters predictions onto them during the descending decode --
+        # without a seed their ``child_count`` stays 0 and the combine
+        # ``child_sum / sqrt(child_count)`` divides by zero. Previously the
+        # condenser graph decoded the graph embedding down into these leaves; now
+        # each leaf simply starts the autoregressive chain from its true encode
+        # embedding (one prediction, so its combine is that embedding itself).
+        # Both passes seed identically from the shared encode buffer.
+        leaf_indices = torch.as_tensor(
+            primary_graph.leaf_node_indices, dtype=torch.long, device=device
+        )
+        for child_sum, child_count in (
+            (ar_primary_sum, ar_primary_count),
+            (tf_primary_sum, tf_primary_count),
+        ):
+            child_sum[leaf_indices] = primary_buffer[leaf_indices].to(child_sum.dtype)
+            child_count[leaf_indices] = 1.0
+
         (
             (ar_primary_combined, ar_primary_logits, ar_primary_class),
             (tf_primary_combined, tf_primary_logits, tf_primary_class),

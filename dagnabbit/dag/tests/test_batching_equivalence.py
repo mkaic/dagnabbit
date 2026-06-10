@@ -173,6 +173,16 @@ def reference_training_forward(
 
     primary_buffer_entries = [_RefEntry() for _ in range(primary_graph.num_nodes)]
 
+    # Seed each leaf with its own encode embedding (mirrors the batched
+    # ``_decode_pipeline``): leaves are referenced by no node, so nothing
+    # scatters predictions onto them during decode -- without a seed their
+    # ``embeddings_predicted_by_children`` would be empty and the combine would
+    # divide by zero / stack an empty list.
+    for leaf_idx in primary_graph.leaf_node_indices:
+        primary_buffer_entries[leaf_idx].embeddings_predicted_by_children.append(
+            primary_buffer[leaf_idx]
+        )
+
     for node_idx in reversed(range(primary_graph.num_nodes)):
         _reference_decode_step(
             model,
