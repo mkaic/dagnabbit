@@ -1,0 +1,18 @@
+---
+description: pytest is not installed; run test files directly with uv run
+alwaysApply: true
+---
+
+# Running Tests
+
+pytest is not installed. Run test files directly:
+
+```bash
+# ❌ BAD
+uv run python -m pytest dagnabbit/dag/tests/
+python -m pytest ...
+
+# ✅ GOOD
+uv run python dagnabbit/dag/tests/test_batching_equivalence.py
+uv run python dagnabbit/dag/tests/test_signal_propagation.py
+```
