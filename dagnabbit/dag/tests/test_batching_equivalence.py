@@ -99,7 +99,6 @@ class _RefEntry:
     __slots__ = (
         "embeddings_predicted_by_children",
         "classification_loss",
-        "reconstruction_loss",
         "predicted_type_logits",
         "combined_predicted_embedding",
     )
@@ -107,7 +106,6 @@ class _RefEntry:
     def __init__(self) -> None:
         self.embeddings_predicted_by_children: list[torch.Tensor] = []
         self.classification_loss = None
-        self.reconstruction_loss = None
         self.predicted_type_logits = None
         self.combined_predicted_embedding = None
 
@@ -118,7 +116,6 @@ def _reference_decode_step(
     graph: FixedInDegreeDAGDescription,
     decode_buffer: list[_RefEntry],
     node_autoencoders: dict[int, NodeAutoEncoder],
-    encoder_buffer: torch.Tensor,
     class_label: torch.Tensor,
     classification_loss_weight: float,
 ) -> None:
@@ -137,10 +134,6 @@ def _reference_decode_step(
 
     entry.classification_loss = (
         F.cross_entropy(logits, class_label) * classification_loss_weight
-    )
-
-    entry.reconstruction_loss = 1.0 - F.cosine_similarity(
-        combined, encoder_buffer[node_idx], dim=0
     )
 
     node_parent_indices = graph.node_inputs_indices[node_idx]
@@ -212,7 +205,6 @@ def reference_training_forward(
             condenser_graph,
             condenser_buffer_entries,
             {0: model.condenser_node_autoencoder},
-            condenser_buffer,
             condenser_labels[node_idx],
             condenser_weights[node_idx],
         )
@@ -232,7 +224,6 @@ def reference_training_forward(
             primary_graph,
             primary_buffer_entries,
             model.node_autoencoders,
-            primary_buffer,
             primary_labels[node_idx],
             primary_weights[node_idx],
         )
@@ -240,9 +231,7 @@ def reference_training_forward(
     condenser_trunk = condenser_buffer_entries[condenser_graph.num_root_nodes :]
 
     cc = torch.stack([e.classification_loss for e in condenser_trunk])
-    cr = torch.stack([e.reconstruction_loss for e in condenser_trunk])
     pc = torch.stack([e.classification_loss for e in primary_buffer_entries])
-    pr = torch.stack([e.reconstruction_loss for e in primary_buffer_entries])
 
     decode_combined = torch.stack(
         [e.combined_predicted_embedding for e in primary_buffer_entries]
@@ -252,9 +241,7 @@ def reference_training_forward(
         "encode_buffer": primary_buffer,
         "decode_combined": decode_combined,
         "loss_condenser_classification": cc,
-        "loss_condenser_reconstruction": cr,
         "loss_primary_classification": pc,
-        "loss_primary_reconstruction": pr,
     }
 
 
@@ -274,21 +261,17 @@ def batched_training_forward(
         "encode_buffer": primary_buffer,
         "decode_combined": decode_combined,
         "loss_condenser_classification": losses.condenser_node_classification_losses,
-        "loss_condenser_reconstruction": losses.condenser_node_reconstruction_losses,
         "loss_primary_classification": losses.primary_node_classification_losses,
-        "loss_primary_reconstruction": losses.primary_node_reconstruction_losses,
     }
 
 
 def _total_loss(out: dict) -> torch.Tensor:
-    """Replicate ``combine_losses`` (all four config weights are 1.0)."""
+    """Replicate ``combine_losses`` (classification weights are 1.0)."""
     return (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION
         * out["loss_condenser_classification"].mean()
-        + cfg.W_CONDENSER_RECONSTRUCTION * out["loss_condenser_reconstruction"].mean()
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION
         * out["loss_primary_classification"].mean()
-        + cfg.W_PRIMARY_RECONSTRUCTION * out["loss_primary_reconstruction"].mean()
     )
 
 
@@ -366,9 +349,7 @@ def run_comparison(
         "encode_buffer",
         "decode_combined",
         "loss_condenser_classification",
-        "loss_condenser_reconstruction",
         "loss_primary_classification",
-        "loss_primary_reconstruction",
     ]
     diffs = {k: max_abs(ref[k], bat[k]) for k in tensor_keys}
     diffs["total_loss"] = abs(float(ref_total) - float(bat_total))
@@ -397,9 +378,7 @@ def test_batched_matches_per_node_reference_float64() -> None:
     assert diffs["total_loss"] < 1e-9, diffs
     for key in (
         "loss_condenser_classification",
-        "loss_condenser_reconstruction",
         "loss_primary_classification",
-        "loss_primary_reconstruction",
     ):
         assert diffs[key] < 1e-9, (key, diffs)
     assert diffs["grads"] < 1e-7, diffs

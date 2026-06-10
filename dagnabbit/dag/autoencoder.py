@@ -284,9 +284,7 @@ class TrainingStepLossReturnType:
     # 1-D tensors over the contributing nodes. The condenser excludes its roots
     # (they are not decoded); the primary includes every node.
     condenser_node_classification_losses: Tensor
-    condenser_node_reconstruction_losses: Tensor
     primary_node_classification_losses: Tensor
-    primary_node_reconstruction_losses: Tensor
     # Raw per-node logits ``[N, num_types]`` and true type labels (1-D
     # ``LongTensor``) for downstream diagnostics (e.g. per-node-type accuracy per
     # class). ``*_predicted_type_logits[i]`` corresponds to ``*_true_types[i]``.
@@ -294,14 +292,13 @@ class TrainingStepLossReturnType:
     condenser_node_true_types: Tensor
     primary_node_predicted_type_logits: Tensor
     primary_node_true_types: Tensor
-    # Teacher-forced counterparts of the four loss tensors and the two logit
-    # tensors above (same node alignment, same true labels). These come from a
-    # second decode pass that feeds each node its true encode embedding instead
-    # of its own prediction; see ``DagnabbitAutoEncoder._decode_pipeline``.
+    # Teacher-forced counterparts of the two classification loss tensors and
+    # the two logit tensors above (same node alignment, same true labels). These
+    # come from a second decode pass that feeds each node its true encode
+    # embedding instead of its own prediction; see
+    # ``DagnabbitAutoEncoder._decode_pipeline``.
     teacher_forced_condenser_node_classification_losses: Tensor
-    teacher_forced_condenser_node_reconstruction_losses: Tensor
     teacher_forced_primary_node_classification_losses: Tensor
-    teacher_forced_primary_node_reconstruction_losses: Tensor
     teacher_forced_condenser_node_predicted_type_logits: Tensor
     teacher_forced_primary_node_predicted_type_logits: Tensor
 
@@ -310,18 +307,16 @@ class TrainingStepLossReturnType:
 class _DecodePipelineResult:
     """Dense per-node outputs of a single decode pass (condenser + primary).
 
-    ``*_class_losses`` / ``*_recon_losses`` / ``*_logits`` are node-indexed; the
-    condenser tensors still include their (skipped) root slots at the front, so
-    callers slice ``[num_condenser_roots:]`` exactly as before.
+    ``*_class_losses`` / ``*_logits`` are node-indexed; the condenser tensors
+    still include their (skipped) root slots at the front, so callers slice
+    ``[num_condenser_roots:]`` exactly as before.
     """
 
     condenser_logits: Tensor
     condenser_class_losses: Tensor
-    condenser_recon_losses: Tensor
     primary_combined: Tensor
     primary_logits: Tensor
     primary_class_losses: Tensor
-    primary_recon_losses: Tensor
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -572,8 +567,8 @@ class DagnabbitAutoEncoder(nn.Module):
         # each DAG. The teacher-forced pass instead feeds every node its true
         # encode embedding, severing the autoregressive chain so the decoders are
         # asked to recover each parent's identity from a clean input. The combine
-        # / classify / reconstruct targets are identical between the two; only
-        # what the decoders are fed differs (see ``_decode_graph``).
+        # / classify targets are identical between the two; only what the
+        # decoders are fed differs (see ``_decode_graph``).
         #
         # The two passes are independent of each other at every rank (each only
         # depends on its own higher-rank predictions), so they are run in
@@ -604,11 +599,7 @@ class DagnabbitAutoEncoder(nn.Module):
             condenser_node_classification_losses=autoregressive.condenser_class_losses[
                 num_condenser_roots:
             ],
-            condenser_node_reconstruction_losses=autoregressive.condenser_recon_losses[
-                num_condenser_roots:
-            ],
             primary_node_classification_losses=autoregressive.primary_class_losses,
-            primary_node_reconstruction_losses=autoregressive.primary_recon_losses,
             condenser_node_predicted_type_logits=autoregressive.condenser_logits[
                 num_condenser_roots:
             ],
@@ -618,14 +609,8 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_condenser_node_classification_losses=(
                 teacher_forced.condenser_class_losses[num_condenser_roots:]
             ),
-            teacher_forced_condenser_node_reconstruction_losses=(
-                teacher_forced.condenser_recon_losses[num_condenser_roots:]
-            ),
             teacher_forced_primary_node_classification_losses=(
                 teacher_forced.primary_class_losses
-            ),
-            teacher_forced_primary_node_reconstruction_losses=(
-                teacher_forced.primary_recon_losses
             ),
             teacher_forced_condenser_node_predicted_type_logits=(
                 teacher_forced.condenser_logits[num_condenser_roots:]
@@ -700,8 +685,8 @@ class DagnabbitAutoEncoder(nn.Module):
         tf_condenser_count[-1] = 1.0
 
         (
-            (_, ar_condenser_logits, ar_condenser_class, ar_condenser_recon),
-            (_, tf_condenser_logits, tf_condenser_class, tf_condenser_recon),
+            (_, ar_condenser_logits, ar_condenser_class),
+            (_, tf_condenser_logits, tf_condenser_class),
         ) = self._decode_graph(
             graph=condenser_graph,
             encoder_buffer=condenser_buffer,
@@ -744,8 +729,8 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # ---- Primary decode (both passes) ----
         (
-            (ar_primary_combined, ar_primary_logits, ar_primary_class, ar_primary_recon),
-            (tf_primary_combined, tf_primary_logits, tf_primary_class, tf_primary_recon),
+            (ar_primary_combined, ar_primary_logits, ar_primary_class),
+            (tf_primary_combined, tf_primary_logits, tf_primary_class),
         ) = self._decode_graph(
             graph=primary_graph,
             encoder_buffer=primary_buffer,
@@ -763,20 +748,16 @@ class DagnabbitAutoEncoder(nn.Module):
         autoregressive = _DecodePipelineResult(
             condenser_logits=ar_condenser_logits,
             condenser_class_losses=ar_condenser_class,
-            condenser_recon_losses=ar_condenser_recon,
             primary_combined=ar_primary_combined,
             primary_logits=ar_primary_logits,
             primary_class_losses=ar_primary_class,
-            primary_recon_losses=ar_primary_recon,
         )
         teacher_forced = _DecodePipelineResult(
             condenser_logits=tf_condenser_logits,
             condenser_class_losses=tf_condenser_class,
-            condenser_recon_losses=tf_condenser_recon,
             primary_combined=tf_primary_combined,
             primary_logits=tf_primary_logits,
             primary_class_losses=tf_primary_class,
-            primary_recon_losses=tf_primary_recon,
         )
         return autoregressive, teacher_forced
 
@@ -794,8 +775,8 @@ class DagnabbitAutoEncoder(nn.Module):
         process_roots: bool,
         device: torch.device,
     ) -> tuple[
-        tuple[Tensor, Tensor, Tensor, Tensor],
-        tuple[Tensor, Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor],
     ]:
         """Run the batched guided-autoregressive decode over one graph for the
         autoregressive and teacher-forced passes **simultaneously**.
@@ -806,10 +787,9 @@ class DagnabbitAutoEncoder(nn.Module):
         buffers by the time the node is processed, and no two same-rank nodes are
         parent/child). At each rank it batches:
 
-        1. the variance-preserving combine ``child_sum / sqrt(child_count)``,
+        1. the variance-preserving combine ``child_sum / sqrt(child_count)``, and
         2. classification (``node_type_predictor``) with class-balanced
-           cross-entropy, and
-        3. reconstruction (cosine distance to ``encoder_buffer``);
+           cross-entropy;
 
         then, per supertype group with parents, one ``decode_batch`` whose
         predicted parent embeddings are ``index_add_``-scattered into the
@@ -822,26 +802,25 @@ class DagnabbitAutoEncoder(nn.Module):
         (``encoder_buffer``), so each parent prediction is produced from ground
         truth -- this severs the autoregressive chain and tests whether the
         decoders can recover a parent's identity (e.g. which root) from a clean
-        input. Both passes' combine / classify / reconstruct still use their own
-        *accumulated* predictions, so loss targets match between the two; only
-        the decoder inputs differ.
+        input. Both passes' combine / classify still use their own *accumulated*
+        predictions, so loss targets match between the two; only the decoder
+        inputs differ.
 
         Because the two passes are independent of each other at every rank, their
         inputs are concatenated along the batch axis (autoregressive rows first,
         teacher-forced rows second) for a single ``node_type_predictor`` /
-        ``decode_batch`` (and cross-entropy / cosine) launch, then split back
-        apart. Every op is row-wise, so this is numerically identical to running
-        the two passes separately while roughly halving the kernel-launch count.
+        ``decode_batch`` (and cross-entropy) launch, then split back apart. Every
+        op is row-wise, so this is numerically identical to running the two
+        passes separately while roughly halving the kernel-launch count.
 
         ``process_roots`` controls whether rank-0 (root) nodes are decoded:
-        primary roots are classified/reconstructed (they have no parents, so
-        nothing is scattered), whereas condenser roots are skipped entirely --
-        they only hold accumulated predictions for the transplant.
+        primary roots are classified (they have no parents, so nothing is
+        scattered), whereas condenser roots are skipped entirely -- they only
+        hold accumulated predictions for the transplant.
 
         Returns ``(autoregressive_tensors, teacher_forced_tensors)`` where each
-        is a dense per-node tuple ``(combined, logits, classification_loss,
-        reconstruction_loss)``; entries for nodes that were not processed stay
-        zero.
+        is a dense per-node tuple ``(combined, logits, classification_loss)``;
+        entries for nodes that were not processed stay zero.
         """
         num_nodes = graph.num_nodes
 
@@ -861,22 +840,19 @@ class DagnabbitAutoEncoder(nn.Module):
             class_losses = torch.zeros(
                 num_nodes, dtype=encoder_buffer.dtype, device=device
             )
-            recon_losses = torch.zeros(
-                num_nodes, dtype=encoder_buffer.dtype, device=device
-            )
-            return combined, logits, class_losses, recon_losses
+            return combined, logits, class_losses
 
-        ar_combined, ar_logits, ar_class, ar_recon = _alloc_pass_buffers()
-        tf_combined, tf_logits, tf_class, tf_recon = _alloc_pass_buffers()
+        ar_combined, ar_logits, ar_class = _alloc_pass_buffers()
+        tf_combined, tf_logits, tf_class = _alloc_pass_buffers()
 
         for rank in reversed(range(len(graph.rank_groups))):
             if rank == 0 and not process_roots:
                 continue
             groups = graph.rank_groups[rank]
 
-            # All nodes at this rank, across supertype groups: combine, classify
-            # and reconstruct uniformly (these use the shared type head and the
-            # encoder buffer regardless of supertype).
+            # All nodes at this rank, across supertype groups: combine and
+            # classify uniformly (these use the shared type head regardless of
+            # supertype).
             rank_node_indices = torch.cat(
                 [g.node_buffer_indices for g in groups]
             ).to(device)
@@ -896,10 +872,9 @@ class DagnabbitAutoEncoder(nn.Module):
             ar_combined[rank_node_indices] = ar_combined_rank
             tf_combined[rank_node_indices] = tf_combined_rank
 
-            # Classify + reconstruct both passes in one launch each. Rows
-            # ``[:num_rank_nodes]`` are autoregressive, ``[num_rank_nodes:]`` are
-            # teacher-forced; the type head and cosine are row-wise, so this is
-            # identical to two separate calls.
+            # Classify both passes in one launch. Rows ``[:num_rank_nodes]`` are
+            # autoregressive, ``[num_rank_nodes:]`` are teacher-forced; the
+            # type head is row-wise, so this is identical to two separate calls.
             combined_both = torch.cat([ar_combined_rank, tf_combined_rank], dim=0)
             logits_both = self.node_type_predictor(combined_both)
             ar_logits[rank_node_indices] = logits_both[:num_rank_nodes].to(
@@ -921,17 +896,6 @@ class DagnabbitAutoEncoder(nn.Module):
             )
             tf_class[rank_node_indices] = cross_entropy_both[num_rank_nodes:].to(
                 tf_class.dtype
-            )
-
-            rank_encoder = encoder_buffer[rank_node_indices]
-            recon_both = 1.0 - F.cosine_similarity(
-                combined_both, torch.cat([rank_encoder, rank_encoder]), dim=-1
-            )
-            ar_recon[rank_node_indices] = recon_both[:num_rank_nodes].to(
-                ar_recon.dtype
-            )
-            tf_recon[rank_node_indices] = recon_both[num_rank_nodes:].to(
-                tf_recon.dtype
             )
 
             # Per group with parents: decode this rank's combined predictions
@@ -990,8 +954,8 @@ class DagnabbitAutoEncoder(nn.Module):
                 teacher_forced_child_count.index_add_(0, flat_parent_indices, ones)
 
         return (
-            (ar_combined, ar_logits, ar_class, ar_recon),
-            (tf_combined, tf_logits, tf_class, tf_recon),
+            (ar_combined, ar_logits, ar_class),
+            (tf_combined, tf_logits, tf_class),
         )
 
     def inference_decode_blind_autoregressive(

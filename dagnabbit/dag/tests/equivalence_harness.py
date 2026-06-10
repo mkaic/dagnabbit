@@ -95,25 +95,19 @@ def run_and_normalize(seed: int) -> dict:
     num_nodes = graph.num_nodes
 
     # Live (non-detached) loss tensors -> total, replicating ``combine_losses``
-    # (all four weights are 1.0 in config), so we can backprop through it.
+    # (classification weights are 1.0 in config), so we can backprop through it.
     live_cc = _stack_live(losses.condenser_node_classification_losses)
-    live_cr = _stack_live(losses.condenser_node_reconstruction_losses)
     live_pc = _stack_live(losses.primary_node_classification_losses)
-    live_pr = _stack_live(losses.primary_node_reconstruction_losses)
     total = (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * live_cc.mean()
-        + cfg.W_CONDENSER_RECONSTRUCTION * live_cr.mean()
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * live_pc.mean()
-        + cfg.W_PRIMARY_RECONSTRUCTION * live_pr.mean()
     )
 
     total.backward()
 
     # Detached, normalized copies of the per-node loss vectors for comparison.
     cc = live_cc.detach().float().reshape(-1).clone()
-    cr = live_cr.detach().float().reshape(-1).clone()
     pc = live_pc.detach().float().reshape(-1).clone()
-    pr = live_pr.detach().float().reshape(-1).clone()
 
     grads = {
         name: p.grad.detach().float().clone()
@@ -131,9 +125,7 @@ def run_and_normalize(seed: int) -> dict:
         "decode_combined": _as_2d(decode_buffer, num_nodes),
         "primary_logits": primary_logits,
         "loss_condenser_classification": cc,
-        "loss_condenser_reconstruction": cr,
         "loss_primary_classification": pc,
-        "loss_primary_reconstruction": pr,
         "total_loss": float(total.detach().item()),
         "grads": grads,
     }

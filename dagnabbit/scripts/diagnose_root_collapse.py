@@ -95,8 +95,8 @@ def diagnose(
     # Accumulators.
     agg_cos_matrix = torch.zeros(R, R, device=device)  # mean cos(combined_root_i, root_j)
     agg_cos_count = 0
-    per_root_recon = torch.zeros(R, device=device)
-    per_root_recon_count = torch.zeros(R, device=device)
+    per_root_encode_cos_dist = torch.zeros(R, device=device)
+    per_root_encode_cos_dist_count = torch.zeros(R, device=device)
 
     agg_identity_conf = torch.zeros(R, R, dtype=torch.long)  # [true, argmax-cos-pred]
     edge_identity_conf = torch.zeros(R, R, dtype=torch.long)
@@ -143,12 +143,12 @@ def diagnose(
             cos_to_roots(root_combined, centroid).squeeze(-1).cpu().tolist()
         )
 
-        # Reconstruction loss exactly as training computes it (per root).
-        recon = 1.0 - F.cosine_similarity(
+        # Diagnostic: cosine distance between decode combined and encode embedding.
+        encode_cos_dist = 1.0 - F.cosine_similarity(
             root_combined.float(), encode_buffer[:R].float(), dim=-1
         )
-        per_root_recon += recon.to(per_root_recon.dtype)
-        per_root_recon_count += 1
+        per_root_encode_cos_dist += encode_cos_dist.to(per_root_encode_cos_dist.dtype)
+        per_root_encode_cos_dist_count += 1
 
         # ---- type-head behavior on roots ----
         root_logits = model.node_type_predictor(root_combined)  # [R, num_types]
@@ -203,7 +203,9 @@ def diagnose(
         "R": R,
         "root_embeddings": root_embeddings.cpu(),
         "agg_cos_matrix": (agg_cos_matrix / max(agg_cos_count, 1)).cpu(),
-        "per_root_recon": (per_root_recon / per_root_recon_count.clamp(min=1)).cpu(),
+        "per_root_encode_cos_dist": (
+            per_root_encode_cos_dist / per_root_encode_cos_dist_count.clamp(min=1)
+        ).cpu(),
         "agg_identity_conf": agg_identity_conf,
         "edge_identity_conf": edge_identity_conf,
         "head_root_conf": head_root_conf,
@@ -252,14 +254,14 @@ def report(d: dict) -> None:
     offdiag = pairwise[~torch.eye(R, dtype=torch.bool)]
     centroid = re.float().mean(dim=0, keepdim=True)
     cos_centroid_root = cos_to_roots(re.float(), centroid).squeeze(-1)
-    print("Root embedding geometry (the reconstruction/identity targets):")
+    print("Root embedding geometry (the encode/identity targets):")
     print(f"  mean |pairwise cos| between distinct roots = {offdiag.abs().mean():.3f}")
     print(
         "  cos(root_i, centroid) per root             = "
         + ", ".join(f"{v:.3f}" for v in cos_centroid_root.tolist())
     )
     print(
-        "  => under full centroid collapse we expect recon ~= "
+        "  => under full centroid collapse we expect encode cos dist ~= "
         f"{(1 - cos_centroid_root.mean()).item():.3f} and identity acc ~= {1 / R:.3f}\n"
     )
 
@@ -268,8 +270,8 @@ def report(d: dict) -> None:
     print(_fmt_matrix(d["agg_cos_matrix"]))
     print()
 
-    print("Per-root reconstruction loss (1 - cos(combined, encode target)):")
-    for i, v in enumerate(d["per_root_recon"].tolist()):
+    print("Per-root encode cosine distance (1 - cos(combined, encode target)):")
+    for i, v in enumerate(d["per_root_encode_cos_dist"].tolist()):
         print(f"  root {i}: {v:.4f}")
     print()
 
@@ -329,7 +331,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--ckpt",
-        default="runs/20260608-221714-same-above-recon-0.2weight/best.ckpt",
+        default="runs/best.ckpt",
         help="Path to a best.ckpt to diagnose.",
     )
     p.add_argument("--num-graphs", type=int, default=256)

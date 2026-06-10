@@ -25,37 +25,25 @@ def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     cc_mean = losses.condenser_node_classification_losses.mean()
-    cr_mean = losses.condenser_node_reconstruction_losses.mean()
     pc_mean = losses.primary_node_classification_losses.mean()
-    pr_mean = losses.primary_node_reconstruction_losses.mean()
 
     tf_cc_mean = losses.teacher_forced_condenser_node_classification_losses.mean()
-    tf_cr_mean = losses.teacher_forced_condenser_node_reconstruction_losses.mean()
     tf_pc_mean = losses.teacher_forced_primary_node_classification_losses.mean()
-    tf_pr_mean = losses.teacher_forced_primary_node_reconstruction_losses.mean()
 
     total = cfg.GLOBAL_LOSS_MULTIPLIER * (
         cfg.W_CONDENSER_DECODED_CLASSIFICATION * cc_mean
-        + cfg.W_CONDENSER_RECONSTRUCTION * cr_mean
         + cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
-        + cfg.W_PRIMARY_RECONSTRUCTION * pr_mean
         + cfg.W_TF_CONDENSER_DECODED_CLASSIFICATION * tf_cc_mean
-        + cfg.W_TF_CONDENSER_RECONSTRUCTION * tf_cr_mean
         + cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
-        + cfg.W_TF_PRIMARY_RECONSTRUCTION * tf_pr_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
     # steps that actually log them, rather than every step.
     components = {
         "condenser_decoded_classification": cc_mean,
-        "condenser_reconstruction": cr_mean,
         "primary_decoded_classification": pc_mean,
-        "primary_reconstruction": pr_mean,
         "tf_condenser_decoded_classification": tf_cc_mean,
-        "tf_condenser_reconstruction": tf_cr_mean,
         "tf_primary_decoded_classification": tf_pc_mean,
-        "tf_primary_reconstruction": tf_pr_mean,
     }
     return total, components
 
