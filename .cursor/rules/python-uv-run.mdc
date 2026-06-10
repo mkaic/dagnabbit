@@ -1,0 +1,20 @@
+---
+description: Always use uv run to execute Python commands
+alwaysApply: true
+---
+
+# Python Execution
+
+Always prefix Python commands with `uv run` instead of calling `python` directly.
+
+```bash
+# ❌ BAD
+python script.py
+python -m dagnabbit.scripts.train_encoder
+python -c "import torch; print(torch.__version__)"
+
+# ✅ GOOD
+uv run python script.py
+uv run python -m dagnabbit.scripts.train_encoder
+uv run python -c "import torch; print(torch.__version__)"
+```

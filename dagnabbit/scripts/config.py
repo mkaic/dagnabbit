@@ -5,7 +5,6 @@ import math
 NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
-CONDENSER_NODE_TYPE_IN_DEGREE = 2
 NUM_ROOT_NODES = 4
 NUM_OUTPUT_NODES = 4
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
@@ -41,12 +40,10 @@ GLOBAL_LOSS_MULTIPLIER = 1.0
 #   * teacher-forced (TF): every node decodes its true encode embedding, so the
 #     autoregressive chain is severed and the decoders are scored on recovering
 #     parent identity from clean inputs.
-# The two are weighted independently; set the TF weights to 0.0 to disable the
+# The two are weighted independently; set the TF weight to 0.0 to disable the
 # teacher-forced pass' contribution to the loss (it is still computed for
-# logging, so zero them *and* skip logging if you want it fully gone).
-W_CONDENSER_DECODED_CLASSIFICATION = 1.0
+# logging, so zero it *and* skip logging if you want it fully gone).
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 
 # --- teacher-forced decode pass loss weights ---
-W_TF_CONDENSER_DECODED_CLASSIFICATION = 1.0
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0

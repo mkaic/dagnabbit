@@ -64,7 +64,6 @@ def run_and_normalize(seed: int) -> dict:
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-        condenser_node_type_in_degree=cfg.CONDENSER_NODE_TYPE_IN_DEGREE,
         num_root_nodes=cfg.NUM_ROOT_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
@@ -94,19 +93,14 @@ def run_and_normalize(seed: int) -> dict:
 
     num_nodes = graph.num_nodes
 
-    # Live (non-detached) loss tensors -> total, replicating ``combine_losses``
-    # (classification weights are 1.0 in config), so we can backprop through it.
-    live_cc = _stack_live(losses.condenser_node_classification_losses)
+    # Live (non-detached) loss tensor -> total, replicating ``combine_losses``
+    # (classification weight is 1.0 in config), so we can backprop through it.
     live_pc = _stack_live(losses.primary_node_classification_losses)
-    total = (
-        cfg.W_CONDENSER_DECODED_CLASSIFICATION * live_cc.mean()
-        + cfg.W_PRIMARY_DECODED_CLASSIFICATION * live_pc.mean()
-    )
+    total = cfg.W_PRIMARY_DECODED_CLASSIFICATION * live_pc.mean()
 
     total.backward()
 
-    # Detached, normalized copies of the per-node loss vectors for comparison.
-    cc = live_cc.detach().float().reshape(-1).clone()
+    # Detached, normalized copy of the per-node loss vector for comparison.
     pc = live_pc.detach().float().reshape(-1).clone()
 
     grads = {
@@ -124,7 +118,6 @@ def run_and_normalize(seed: int) -> dict:
         "encode_buffer": primary_buffer.detach().float().clone(),
         "decode_combined": _as_2d(decode_buffer, num_nodes),
         "primary_logits": primary_logits,
-        "loss_condenser_classification": cc,
         "loss_primary_classification": pc,
         "total_loss": float(total.detach().item()),
         "grads": grads,
