@@ -259,6 +259,8 @@ def main() -> None:
                 optimizer.zero_grad()
 
             if writer is not None:
+                writer.add_scalar("graph/num_nodes", graph.num_nodes, step)
+
                 step_preds, step_truth = step_preds_and_truth(
                     losses.primary_node_predicted_type_logits,
                     losses.primary_node_true_types,
