@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
-from dagnabbit.dag.description import make_minimal_random_dag
+from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
     format_param_count,
@@ -227,7 +227,7 @@ def main() -> None:
         last_grad_was_clipped: bool | None = None
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
-            graph = make_minimal_random_dag(
+            graph = make_random_graph_description(
                 num_root_nodes=cfg.NUM_ROOT_NODES,
                 num_trunk_nodes=cfg.NUM_TRUNK_NODES,
                 num_output_nodes=cfg.NUM_OUTPUT_NODES,
