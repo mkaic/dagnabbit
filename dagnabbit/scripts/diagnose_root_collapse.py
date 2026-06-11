@@ -92,7 +92,9 @@ def diagnose(
     centroid = root_embeddings.mean(dim=0, keepdim=True)  # [1, D]
 
     # Accumulators.
-    agg_cos_matrix = torch.zeros(R, R, device=device)  # mean cos(combined_root_i, root_j)
+    agg_cos_matrix = torch.zeros(
+        R, R, device=device
+    )  # mean cos(combined_root_i, root_j)
     agg_cos_count = 0
     per_root_encode_cos_dist = torch.zeros(R, device=device)
     per_root_encode_cos_dist_count = torch.zeros(R, device=device)
@@ -236,7 +238,9 @@ def _conf_rows(conf: torch.Tensor) -> str:
     for i, row in enumerate(conf.tolist()):
         total = sum(row) or 1
         cells = "  ".join(f"{v:5d}" for v in row)
-        rows.append(f"  true {i} | {cells}   (n={sum(row)}, recall={row[i] / total:.3f})")
+        rows.append(
+            f"  true {i} | {cells}   (n={sum(row)}, recall={row[i] / total:.3f})"
+        )
     header = "          " + "  ".join(f"p{j:<4}" for j in range(conf.shape[1]))
     return header + "\n" + "\n".join(rows)
 
@@ -274,23 +278,29 @@ def report(d: dict) -> None:
         print(f"  root {i}: {v:.4f}")
     print()
 
-    print(
-        "Centroid pull  cos(pred, centroid)   (closer to 1.0 = more collapsed):"
-    )
+    print("Centroid pull  cos(pred, centroid)   (closer to 1.0 = more collapsed):")
     agg_c = d["agg_cos_to_centroid"]
     edge_c = d["edge_cos_to_centroid"]
     print(f"  aggregated combined : mean={agg_c.mean():.3f}  std={agg_c.std():.3f}")
     if edge_c.size:
-        print(f"  per-edge predictions: mean={edge_c.mean():.3f}  std={edge_c.std():.3f}")
+        print(
+            f"  per-edge predictions: mean={edge_c.mean():.3f}  std={edge_c.std():.3f}"
+        )
     print()
 
     print("IDENTITY RECOVERY (head-independent: argmax_i cos(pred, root_i))")
     edge_acc = _identity_accuracy(d["edge_identity_conf"])
     agg_acc = _identity_accuracy(d["agg_identity_conf"])
-    print(f"  per-edge  (before aggregation): acc = {edge_acc:.3f}  (chance {1 / R:.3f})")
-    print(f"  aggregated(after  aggregation): acc = {agg_acc:.3f}  (chance {1 / R:.3f})")
+    print(
+        f"  per-edge  (before aggregation): acc = {edge_acc:.3f}  (chance {1 / R:.3f})"
+    )
+    print(
+        f"  aggregated(after  aggregation): acc = {agg_acc:.3f}  (chance {1 / R:.3f})"
+    )
     print("  --> per-edge >> aggregated  ==> aggregation is washing identity out")
-    print("  --> per-edge ~= chance      ==> identifiability problem (aggregator won't help)\n")
+    print(
+        "  --> per-edge ~= chance      ==> identifiability problem (aggregator won't help)\n"
+    )
 
     print("Per-edge identity confusion (true root -> argmax-cos root):")
     print(_conf_rows(d["edge_identity_conf"]))

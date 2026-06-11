@@ -228,7 +228,9 @@ def batched_training_forward(
 
 def _total_loss(out: dict) -> torch.Tensor:
     """Replicate ``combine_losses`` (classification weight is 1.0)."""
-    return cfg.W_PRIMARY_DECODED_CLASSIFICATION * out["loss_primary_classification"].mean()
+    return (
+        cfg.W_PRIMARY_DECODED_CLASSIFICATION * out["loss_primary_classification"].mean()
+    )
 
 
 # --------------------------------------------------------------------------- #

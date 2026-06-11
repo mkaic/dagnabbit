@@ -166,16 +166,12 @@ def cfg_hparams() -> dict[str, bool | int | float | str]:
 
 def log_run_config(writer: SummaryWriter) -> None:
     # Log hparams on this writer (add_hparams opens a nested SummaryWriter subdir).
-    exp, ssi, sei = hparams_summary(
-        cfg_hparams(), {"hparam/started": 0.0}
-    )
+    exp, ssi, sei = hparams_summary(cfg_hparams(), {"hparam/started": 0.0})
     writer.file_writer.add_summary(exp, 0)
     writer.file_writer.add_summary(ssi, 0)
     writer.file_writer.add_summary(sei, 0)
 
     config_text = "\n".join(
-        f"{key}={value}"
-        for key, value in vars(cfg).items()
-        if not key.startswith("_")
+        f"{key}={value}" for key, value in vars(cfg).items() if not key.startswith("_")
     )
     writer.add_text("config", config_text, global_step=0)

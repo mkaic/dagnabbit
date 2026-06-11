@@ -30,7 +30,11 @@ def subtype_to_supertype(
     Any layout argument left as ``None`` falls back to the corresponding value
     in ``dagnabbit.scripts.config``, so training callsites can omit them.
     """
-    if num_trunk_node_types is None or num_root_nodes is None or num_output_nodes is None:
+    if (
+        num_trunk_node_types is None
+        or num_root_nodes is None
+        or num_output_nodes is None
+    ):
         from dagnabbit.scripts import config as cfg
 
         if num_trunk_node_types is None:
@@ -296,5 +300,3 @@ def make_random_graph_description(
         node_inputs_indices=node_inputs_indices,
         node_types=node_types,
     )
-
-

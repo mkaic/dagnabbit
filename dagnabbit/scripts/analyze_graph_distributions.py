@@ -56,9 +56,7 @@ def collect_graph_stats(
         for group in groups:
             size = int(group.node_buffer_indices.numel())
             group_sizes.append(size)
-            batch_keys.add(
-                _batch_key(group.supertype, group.subtypes.numpy())
-            )
+            batch_keys.add(_batch_key(group.supertype, group.subtypes.numpy()))
 
     num_nodes = graph.num_nodes
     num_supertype_groups = len(batch_keys)
@@ -74,9 +72,7 @@ def collect_graph_stats(
     return stats, group_sizes
 
 
-def sample_graphs(
-    num_graphs: int, seed: int
-) -> tuple[list[GraphStats], list[int]]:
+def sample_graphs(num_graphs: int, seed: int) -> tuple[list[GraphStats], list[int]]:
     rng = random.Random(seed)
     stats: list[GraphStats] = []
     all_group_sizes: list[int] = []
@@ -125,9 +121,7 @@ def _save_distribution_plots(
     axes[0, 1].set_xlabel("num supertype groups (unique batch keys)")
     axes[0, 1].set_ylabel("count")
 
-    axes[1, 0].hist(
-        num_execution_groups, bins=50, color="seagreen", edgecolor="white"
-    )
+    axes[1, 0].hist(num_execution_groups, bins=50, color="seagreen", edgecolor="white")
     axes[1, 0].set_title("Execution groups (RankGroups) per graph")
     axes[1, 0].set_xlabel("num execution groups")
     axes[1, 0].set_ylabel("count")
@@ -201,7 +195,9 @@ def _print_summary(stats: list[GraphStats]) -> None:
     num_nodes = [s.num_nodes for s in stats]
 
     print(f"Generated {len(stats):,} graphs")
-    print(f"  nodes: min={min(num_nodes)}, max={max(num_nodes)}, mean={np.mean(num_nodes):.1f}")
+    print(
+        f"  nodes: min={min(num_nodes)}, max={max(num_nodes)}, mean={np.mean(num_nodes):.1f}"
+    )
     print(
         f"  max rank: min={min(max_ranks)}, max={max(max_ranks)}, "
         f"mean={np.mean(max_ranks):.1f}"

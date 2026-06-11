@@ -17,7 +17,7 @@ NUM_TRUNK_NODES = 1024
 
 # --- training ---
 NUM_STEPS = 50_000
-GRADIENT_ACCUMULATION_STEPS = 8 
+GRADIENT_ACCUMULATION_STEPS = 8
 LEARNING_RATE = 1e-3
 
 # Max L2 norm of gradients across all parameters before each optimizer step.

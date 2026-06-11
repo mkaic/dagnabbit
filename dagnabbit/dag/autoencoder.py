@@ -92,6 +92,7 @@ class NodeEncoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+
     def forward(self, x: Tensor) -> Tensor:
         x = x.flatten()
         return self.encoder(x)
@@ -128,6 +129,7 @@ class NodeDecoder(nn.Module):
                 mlp_expansion_factor,
             )
         )
+
     def forward(self, x: Tensor) -> Tensor:
         x = self.decoder(x)
         x = x.view(self.in_degree, self.node_embedding_dim)
@@ -777,48 +779,54 @@ class DagnabbitAutoEncoder(nn.Module):
             # All nodes at this rank, across supertype groups: combine and
             # classify uniformly (these use the shared type head regardless of
             # supertype).
-            rank_node_indices = torch.cat(
-                [g.node_buffer_indices for g in groups]
-            ).to(device)
+            rank_node_indices = torch.cat([g.node_buffer_indices for g in groups]).to(
+                device
+            )
             num_rank_nodes = rank_node_indices.shape[0]
 
             # Per-pass combine (each pass accumulates into its own buffers).
             ar_counts = autoregressive_child_count[rank_node_indices]
             tf_counts = teacher_forced_child_count[rank_node_indices]
-            ar_combined_rank = (
-                autoregressive_child_sum[rank_node_indices]
-                / ar_counts.sqrt().unsqueeze(-1)
-            )
-            tf_combined_rank = (
-                teacher_forced_child_sum[rank_node_indices]
-                / tf_counts.sqrt().unsqueeze(-1)
-            )
+            ar_combined_rank = autoregressive_child_sum[
+                rank_node_indices
+            ] / ar_counts.sqrt().unsqueeze(-1)
+            tf_combined_rank = teacher_forced_child_sum[
+                rank_node_indices
+            ] / tf_counts.sqrt().unsqueeze(-1)
             ar_combined[rank_node_indices] = ar_combined_rank
             tf_combined[rank_node_indices] = tf_combined_rank
 
             # Per-node consistency: variance of child predictions averaged over D
             # (mean, not sum, so the magnitude is invariant to embedding dim),
             # masked to nodes that received > 1 prediction.
-            ar_mean = (
-                autoregressive_child_sum[rank_node_indices]
-                / ar_counts.unsqueeze(-1)
+            ar_mean = autoregressive_child_sum[rank_node_indices] / ar_counts.unsqueeze(
+                -1
             )
             ar_var = (
-                autoregressive_child_sumsq[rank_node_indices] / ar_counts.unsqueeze(-1)
-                - ar_mean**2
-            ).mean(dim=-1).clamp(min=0)
+                (
+                    autoregressive_child_sumsq[rank_node_indices]
+                    / ar_counts.unsqueeze(-1)
+                    - ar_mean**2
+                )
+                .mean(dim=-1)
+                .clamp(min=0)
+            )
             ar_consistency[rank_node_indices] = torch.where(
                 ar_counts > 1, ar_var, torch.zeros_like(ar_var)
             )
 
-            tf_mean = (
-                teacher_forced_child_sum[rank_node_indices]
-                / tf_counts.unsqueeze(-1)
+            tf_mean = teacher_forced_child_sum[rank_node_indices] / tf_counts.unsqueeze(
+                -1
             )
             tf_var = (
-                teacher_forced_child_sumsq[rank_node_indices] / tf_counts.unsqueeze(-1)
-                - tf_mean**2
-            ).mean(dim=-1).clamp(min=0)
+                (
+                    teacher_forced_child_sumsq[rank_node_indices]
+                    / tf_counts.unsqueeze(-1)
+                    - tf_mean**2
+                )
+                .mean(dim=-1)
+                .clamp(min=0)
+            )
             tf_consistency[rank_node_indices] = torch.where(
                 tf_counts > 1, tf_var, torch.zeros_like(tf_var)
             )
@@ -895,12 +903,14 @@ class DagnabbitAutoEncoder(nn.Module):
                 if self.reconstruction_detach_target:
                     recon_target = recon_target.detach()
                 ar_recon_edge_list.append(
-                    1.0 - F.cosine_similarity(
+                    1.0
+                    - F.cosine_similarity(
                         ar_flat.to(recon_target.dtype), recon_target, dim=-1
                     )
                 )
                 tf_recon_edge_list.append(
-                    1.0 - F.cosine_similarity(
+                    1.0
+                    - F.cosine_similarity(
                         tf_flat.to(recon_target.dtype), recon_target, dim=-1
                     )
                 )

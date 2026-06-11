@@ -22,7 +22,9 @@ def _report_tensor(name: str, a: torch.Tensor, b: torch.Tensor) -> tuple[float, 
     max_abs = float(abs_diff.max()) if abs_diff.numel() else 0.0
     denom = b.abs().clamp_min(1e-8)
     max_rel = float((abs_diff / denom).max()) if abs_diff.numel() else 0.0
-    print(f"  {name:38s} shape={tuple(a.shape)!s:14s} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}")
+    print(
+        f"  {name:38s} shape={tuple(a.shape)!s:14s} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}"
+    )
     return max_abs, max_rel
 
 
@@ -45,7 +47,9 @@ def main() -> None:
     for name in ref["param_fingerprint"]:
         d = abs(ref["param_fingerprint"][name] - cand["param_fingerprint"][name])
         fp_max = max(fp_max, d)
-    print(f"  max |param_sum diff| over {len(ref['param_fingerprint'])} params = {fp_max:.3e}")
+    print(
+        f"  max |param_sum diff| over {len(ref['param_fingerprint'])} params = {fp_max:.3e}"
+    )
 
     print("\n-- forward activations --")
     worst_abs = 0.0
@@ -56,7 +60,11 @@ def main() -> None:
         worst_rel = max(worst_rel, r)
 
     print("\n-- per-node loss vectors --")
-    a, r = _report_tensor("loss_primary_classification", ref["loss_primary_classification"], cand["loss_primary_classification"])
+    a, r = _report_tensor(
+        "loss_primary_classification",
+        ref["loss_primary_classification"],
+        cand["loss_primary_classification"],
+    )
     worst_abs = max(worst_abs, a)
     worst_rel = max(worst_rel, r)
 
@@ -85,9 +93,7 @@ def main() -> None:
             grad_worst_name = name
         grad_worst_rel = max(grad_worst_rel, rel)
     print(f"  num_grad_tensors = {len(ref['grads'])}")
-    print(
-        f"  worst grad max_abs = {grad_worst_abs:.3e} (param: {grad_worst_name})"
-    )
+    print(f"  worst grad max_abs = {grad_worst_abs:.3e} (param: {grad_worst_name})")
     print(f"  worst grad max_rel (vs that tensor's max|grad|) = {grad_worst_rel:.3e}")
 
     print("\n==== SUMMARY ====")
