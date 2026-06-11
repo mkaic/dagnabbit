@@ -300,3 +300,119 @@ def make_random_graph_description(
         node_inputs_indices=node_inputs_indices,
         node_types=node_types,
     )
+
+
+def _prune_to_output_ancestors(
+    graph: FixedInDegreeDAGDescription,
+) -> FixedInDegreeDAGDescription:
+    """Drop trunk nodes that are not in any output's ancestor cone.
+
+    Roots are always retained so root/output type-index layout remains stable.
+    Surviving trunk nodes keep their original topological order, and outputs stay
+    in their original slot order at the tail.
+    """
+    output_start = graph.num_root_nodes + graph.num_trunk_nodes
+
+    reachable: set[int] = set(range(output_start, graph.num_nodes))
+    stack = list(reachable)
+    while stack:
+        node_idx = stack.pop()
+        for parent_idx in graph.node_inputs_indices[node_idx]:
+            if parent_idx not in reachable:
+                reachable.add(parent_idx)
+                stack.append(parent_idx)
+
+    kept_roots = list(range(graph.num_root_nodes))
+    kept_trunks = [
+        node_idx
+        for node_idx in range(graph.num_root_nodes, output_start)
+        if node_idx in reachable
+    ]
+    kept_outputs = list(range(output_start, graph.num_nodes))
+    kept_nodes = kept_roots + kept_trunks + kept_outputs
+
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_nodes)}
+    node_inputs_indices = [
+        [old_to_new[parent_idx] for parent_idx in graph.node_inputs_indices[old_idx]]
+        for old_idx in kept_nodes
+    ]
+    node_types = [graph.node_types[old_idx] for old_idx in kept_nodes]
+
+    return FixedInDegreeDAGDescription(
+        num_root_nodes=graph.num_root_nodes,
+        num_trunk_nodes=len(kept_trunks),
+        num_output_nodes=graph.num_output_nodes,
+        num_trunk_node_types=graph.num_trunk_node_types,
+        trunk_node_in_degrees=graph.trunk_node_in_degrees,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
+    )
+
+
+def make_minimal_random_dag(
+    num_root_nodes: int,
+    num_trunk_nodes: int,
+    num_output_nodes: int,
+    trunk_node_in_degrees: int | list[int],
+    num_trunk_node_types: int,
+) -> FixedInDegreeDAGDescription:
+    """Generate a random DAG pruned to roots plus the output ancestor cone."""
+    graph = make_random_graph_description(
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        trunk_node_in_degrees=trunk_node_in_degrees,
+        num_trunk_node_types=num_trunk_node_types,
+    )
+    return _prune_to_output_ancestors(graph)
+
+
+def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:
+    """Return bottom-up structural ids for every node in topological order."""
+    canonical_ids: list[tuple] = []
+    memo: dict[tuple, tuple] = {}
+
+    def intern(key: tuple) -> tuple:
+        existing = memo.get(key)
+        if existing is not None:
+            return existing
+        memo[key] = key
+        return key
+
+    for node_idx, node_type in enumerate(graph.node_types):
+        supertype = subtype_to_supertype(
+            node_type,
+            num_trunk_node_types=graph.num_trunk_node_types,
+            num_root_nodes=graph.num_root_nodes,
+            num_output_nodes=graph.num_output_nodes,
+        )
+        if supertype is NodeSupertype.ROOT:
+            root_slot = node_type - graph.root_node_types_start
+            canonical_ids.append(intern(("root", root_slot)))
+        elif supertype is NodeSupertype.TRUNK:
+            parent_ids = tuple(canonical_ids[p] for p in graph.node_inputs_indices[node_idx])
+            canonical_ids.append(intern(("trunk", node_type, parent_ids)))
+        else:
+            output_slot = node_type - graph.output_node_types_start
+            parent_ids = tuple(canonical_ids[p] for p in graph.node_inputs_indices[node_idx])
+            canonical_ids.append(intern(("output", output_slot, parent_ids)))
+
+    return canonical_ids
+
+
+def graphs_match(
+    a: FixedInDegreeDAGDescription,
+    b: FixedInDegreeDAGDescription,
+) -> bool:
+    """Compare graphs by ordered output canonical ids, ignoring dead nodes."""
+    if a.num_output_nodes != b.num_output_nodes:
+        return False
+
+    a_ids = canonicalize(a)
+    b_ids = canonicalize(b)
+    a_output_start = a.num_root_nodes + a.num_trunk_nodes
+    b_output_start = b.num_root_nodes + b.num_trunk_nodes
+    return (
+        tuple(a_ids[a_output_start : a_output_start + a.num_output_nodes])
+        == tuple(b_ids[b_output_start : b_output_start + b.num_output_nodes])
+    )

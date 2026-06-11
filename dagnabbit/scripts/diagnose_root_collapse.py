@@ -43,7 +43,7 @@ import torch
 import torch.nn.functional as F
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.description import make_minimal_random_dag
 from dagnabbit.scripts import config as cfg
 
 
@@ -116,7 +116,7 @@ def diagnose(
     root_block_start = model.num_trunk_node_types  # roots occupy [start, start+R)
 
     for _ in range(num_graphs):
-        graph = make_random_graph_description(
+        graph = make_minimal_random_dag(
             num_root_nodes=cfg.NUM_ROOT_NODES,
             num_trunk_nodes=cfg.NUM_TRUNK_NODES,
             num_output_nodes=cfg.NUM_OUTPUT_NODES,

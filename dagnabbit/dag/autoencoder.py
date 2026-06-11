@@ -3,7 +3,11 @@ from torch import Tensor
 import torch.nn as nn
 from typing import Iterable
 from dataclasses import dataclass
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
+from dagnabbit.dag.description import (
+    FixedInDegreeDAGDescription,
+    NodeSupertype,
+    subtype_to_supertype,
+)
 import torch.nn.functional as F
 
 
@@ -315,6 +319,24 @@ class _DecodePipelineResult:
     primary_recon: Tensor
     # Node-indexed 1-D tensor of per-parent consistency losses (zero for count<=1).
     primary_consistency: Tensor
+
+
+@dataclass
+class _DecodeNode:
+    id: int
+    embedding: Tensor
+    type_id: int | None
+    is_root: bool
+    is_output: bool
+    parents: list[int | None]
+    expanded: bool = False
+
+
+@dataclass
+class _ParentPrediction:
+    child_id: int
+    slot: int
+    embedding: Tensor
 
 
 class DagnabbitAutoEncoder(nn.Module):
@@ -947,8 +969,454 @@ class DagnabbitAutoEncoder(nn.Module):
             (tf_combined, tf_logits, tf_class, tf_recon, tf_consistency),
         )
 
+    @torch.no_grad()
+    def blind_autoregressive_decode(
+        self,
+        output_embeddings: Tensor,
+        *,
+        similarity_threshold: float = 0.99,
+        root_match_margin: float | None = None,
+        max_nodes: int = 4096,
+        return_diagnostics: bool = False,
+    ) -> FixedInDegreeDAGDescription | tuple[FixedInDegreeDAGDescription, dict]:
+        """Recover a DAG from ordered output-node embeddings via a global pool.
+
+        The decode walks backward from the fixed output slots. Each discovered
+        trunk node is expanded once from the embedding that created it; duplicate
+        parent predictions are merged by cosine similarity against one global
+        match-target pool (roots plus discovered trunks, never outputs).
+        """
+        if output_embeddings.ndim != 2:
+            raise ValueError("output_embeddings must have shape [num_outputs, D]")
+        if output_embeddings.shape != (self.num_output_nodes, self.node_embedding_dim):
+            raise ValueError(
+                "output_embeddings must have shape "
+                f"({self.num_output_nodes}, {self.node_embedding_dim}); got "
+                f"{tuple(output_embeddings.shape)}"
+            )
+        if max_nodes <= 0:
+            raise ValueError("max_nodes must be positive")
+
+        root_table = self.root_node_embeddings.weight.detach()
+        device = root_table.device
+        dtype = root_table.dtype
+        output_embeddings = output_embeddings.to(device=device, dtype=dtype)
+
+        pool: list[_DecodeNode] = []
+        root_start = self.num_trunk_node_types
+        output_start = self.num_trunk_node_types + self.num_root_nodes
+
+        for root_slot in range(self.num_root_nodes):
+            pool.append(
+                _DecodeNode(
+                    id=len(pool),
+                    embedding=root_table[root_slot].detach().clone(),
+                    type_id=root_start + root_slot,
+                    is_root=True,
+                    is_output=False,
+                    parents=[],
+                    expanded=True,
+                )
+            )
+
+        frontier: list[int] = []
+        for output_slot in range(self.num_output_nodes):
+            node_id = len(pool)
+            pool.append(
+                _DecodeNode(
+                    id=node_id,
+                    embedding=output_embeddings[output_slot].detach().clone(),
+                    type_id=output_start + output_slot,
+                    is_root=False,
+                    is_output=True,
+                    parents=[None],
+                )
+            )
+            frontier.append(node_id)
+
+        termination_reason = "natural"
+        if len(pool) > max_nodes:
+            termination_reason = "max_nodes"
+            frontier = []
+
+        while frontier:
+            if len(pool) >= max_nodes:
+                termination_reason = "max_nodes"
+                break
+
+            predictions = self._blind_decode_expand(pool, frontier)
+            frontier = self._blind_decode_integrate(
+                pool,
+                predictions,
+                similarity_threshold=similarity_threshold,
+                root_match_margin=root_match_margin,
+            )
+
+            if len(pool) >= max_nodes and frontier:
+                termination_reason = "max_nodes"
+                break
+
+        description = self._decode_pool_to_description(pool, termination_reason)
+        description.termination_reason = termination_reason
+        description.decode_pool_size = len(pool)
+
+        if return_diagnostics:
+            diagnostics = {
+                "termination_reason": termination_reason,
+                "pool_size": len(pool),
+                "recovered_nodes": description.num_nodes,
+                "dropped_pool_nodes": getattr(
+                    description, "decode_dropped_pool_nodes", []
+                ),
+            }
+            return description, diagnostics
+        return description
+
     def inference_decode_blind_autoregressive(
         self,
         graph_embedding: Tensor,
-    ):
-        pass
+    ) -> FixedInDegreeDAGDescription:
+        return self.blind_autoregressive_decode(graph_embedding)
+
+    def _blind_decode_expand(
+        self,
+        pool: list[_DecodeNode],
+        frontier: list[int],
+    ) -> list[_ParentPrediction]:
+        groups: dict[int, list[int]] = {}
+        for node_id in frontier:
+            node = pool[node_id]
+            if node.expanded:
+                continue
+            if node.is_root:
+                continue
+            if node.type_id is None:
+                raise ValueError(f"frontier node {node_id} has unknown type")
+            groups.setdefault(node.type_id, []).append(node_id)
+
+        predictions: list[_ParentPrediction] = []
+        for type_id, node_ids in groups.items():
+            node_autoencoder = self.node_autoencoders[type_id]
+            node_embeddings = torch.stack([pool[node_id].embedding for node_id in node_ids])
+            subtypes = torch.full(
+                (len(node_ids),),
+                type_id,
+                dtype=torch.long,
+                device=node_embeddings.device,
+            )
+            parent_embeddings = node_autoencoder.decode_batch(node_embeddings, subtypes)
+
+            for row_idx, child_id in enumerate(node_ids):
+                pool[child_id].expanded = True
+                for slot in range(parent_embeddings.shape[1]):
+                    predictions.append(
+                        _ParentPrediction(
+                            child_id=child_id,
+                            slot=slot,
+                            embedding=parent_embeddings[row_idx, slot]
+                            .detach()
+                            .clone(),
+                        )
+                    )
+
+        return predictions
+
+    def _blind_decode_integrate(
+        self,
+        pool: list[_DecodeNode],
+        predictions: list[_ParentPrediction],
+        *,
+        similarity_threshold: float,
+        root_match_margin: float | None,
+    ) -> list[int]:
+        if not predictions:
+            return []
+
+        pred_embs = torch.stack([p.embedding for p in predictions])
+        target_ids, target_embs = self._decode_match_targets(pool, pred_embs)
+        assignments, new_components = self._assign_node_ids(
+            pool=pool,
+            pred_embs=pred_embs,
+            target_ids=target_ids,
+            target_embs=target_embs,
+            threshold=similarity_threshold,
+            root_match_margin=root_match_margin,
+        )
+
+        next_frontier: list[int] = []
+        for component in new_components:
+            representative = pred_embs[component[0]].detach().clone()
+            node_id = self._classify_and_add_decode_node(pool, representative)
+            if not pool[node_id].is_root:
+                next_frontier.append(node_id)
+            for pred_idx in component:
+                assignments[pred_idx] = node_id
+
+        for prediction, node_id in zip(predictions, assignments):
+            if node_id is None:
+                raise RuntimeError("unassigned decode prediction")
+            pool[prediction.child_id].parents[prediction.slot] = node_id
+
+        return next_frontier
+
+    def _decode_match_targets(
+        self,
+        pool: list[_DecodeNode],
+        pred_embs: Tensor,
+    ) -> tuple[list[int], Tensor]:
+        target_ids = [node.id for node in pool if not node.is_output]
+        if not target_ids:
+            return target_ids, pred_embs.new_zeros((0, self.node_embedding_dim))
+        return target_ids, torch.stack([pool[node_id].embedding for node_id in target_ids])
+
+    def _assign_node_ids(
+        self,
+        *,
+        pool: list[_DecodeNode],
+        pred_embs: Tensor,
+        target_ids: list[int],
+        target_embs: Tensor,
+        threshold: float,
+        root_match_margin: float | None,
+    ) -> tuple[list[int | None], list[list[int]]]:
+        assignments: list[int | None] = [None] * pred_embs.shape[0]
+
+        if target_embs.numel():
+            pred_norm = F.normalize(pred_embs.float(), dim=-1)
+            target_norm = F.normalize(target_embs.float(), dim=-1)
+            similarities = pred_norm @ target_norm.t()
+            best_similarities, best_target_positions = similarities.max(dim=1)
+
+            nonroot_target_positions = [
+                i for i, node_id in enumerate(target_ids) if not pool[node_id].is_root
+            ]
+            for pred_idx, best_similarity in enumerate(best_similarities.tolist()):
+                if best_similarity <= threshold:
+                    continue
+                target_pos = int(best_target_positions[pred_idx])
+                target_id = target_ids[target_pos]
+
+                if root_match_margin is not None and pool[target_id].is_root:
+                    best_nonroot_similarity = float("-inf")
+                    if nonroot_target_positions:
+                        nonroot_sims = similarities[pred_idx, nonroot_target_positions]
+                        best_nonroot_similarity = float(nonroot_sims.max())
+                    if best_similarity < best_nonroot_similarity + root_match_margin:
+                        continue
+
+                assignments[pred_idx] = target_id
+
+        unmatched = [idx for idx, node_id in enumerate(assignments) if node_id is None]
+        if not unmatched:
+            return assignments, []
+
+        parent = list(range(len(unmatched)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri = find(i)
+            rj = find(j)
+            if ri != rj:
+                parent[max(ri, rj)] = min(ri, rj)
+
+        unmatched_embs = pred_embs[unmatched]
+        if unmatched_embs.shape[0] > 1:
+            unmatched_norm = F.normalize(unmatched_embs.float(), dim=-1)
+            similarities = unmatched_norm @ unmatched_norm.t()
+            for i in range(unmatched_embs.shape[0]):
+                for j in range(i + 1, unmatched_embs.shape[0]):
+                    if float(similarities[i, j]) > threshold:
+                        union(i, j)
+
+        components_by_root: dict[int, list[int]] = {}
+        for local_idx, pred_idx in enumerate(unmatched):
+            components_by_root.setdefault(find(local_idx), []).append(pred_idx)
+
+        components = sorted(
+            components_by_root.values(),
+            key=lambda component: component[0],
+        )
+        return assignments, components
+
+    def _classify_and_add_decode_node(
+        self,
+        pool: list[_DecodeNode],
+        representative: Tensor,
+    ) -> int:
+        root_start = self.num_trunk_node_types
+        output_start = self.num_trunk_node_types + self.num_root_nodes
+
+        logits = self.node_type_predictor(representative.unsqueeze(0))[0].float()
+        logits = logits.clone()
+        logits[output_start:] = float("-inf")
+        type_id = int(logits.argmax())
+
+        supertype = subtype_to_supertype(
+            type_id,
+            num_trunk_node_types=self.num_trunk_node_types,
+            num_root_nodes=self.num_root_nodes,
+            num_output_nodes=self.num_output_nodes,
+        )
+
+        if supertype is NodeSupertype.ROOT:
+            root_embeddings = self.root_node_embeddings.weight.detach()
+            root_sims = F.normalize(representative.float(), dim=-1).unsqueeze(0) @ F.normalize(
+                root_embeddings.float(), dim=-1
+            ).t()
+            root_slot = int(root_sims.argmax())
+            return root_slot
+
+        if supertype is not NodeSupertype.TRUNK:
+            raise RuntimeError(f"masked classifier selected non-parent type {type_id}")
+
+        node_id = len(pool)
+        pool.append(
+            _DecodeNode(
+                id=node_id,
+                embedding=representative.detach().clone(),
+                type_id=type_id,
+                is_root=False,
+                is_output=False,
+                parents=[None] * self.trunk_node_in_degrees[type_id],
+            )
+        )
+        return node_id
+
+    def _decode_pool_to_description(
+        self,
+        pool: list[_DecodeNode],
+        termination_reason: str,
+    ) -> FixedInDegreeDAGDescription:
+        live = self._live_decode_node_ids(pool)
+
+        trunk_ids = [
+            node.id
+            for node in pool
+            if node.id in live and not node.is_root and not node.is_output
+        ]
+        trunk_order = self._toposort_decode_trunks(pool, trunk_ids)
+        output_ids = [
+            node.id
+            for node in sorted(
+                pool,
+                key=lambda n: (
+                    n.type_id if n.type_id is not None else self.num_node_types,
+                    n.id,
+                ),
+            )
+            if node.id in live and node.is_output
+        ]
+
+        root_start = self.num_trunk_node_types
+        output_start = self.num_trunk_node_types + self.num_root_nodes
+
+        node_inputs_indices: list[list[int]] = [[] for _ in range(self.num_root_nodes)]
+        node_types: list[int] = [
+            root_start + root_slot for root_slot in range(self.num_root_nodes)
+        ]
+
+        final_index: dict[int, int] = {
+            root_slot: root_slot for root_slot in range(self.num_root_nodes)
+        }
+        for old_id in trunk_order:
+            final_index[old_id] = len(node_types)
+            node = pool[old_id]
+            if node.type_id is None:
+                raise ValueError(f"live trunk node {old_id} has unknown type")
+            parents = self._require_live_parents(node, final_index)
+            node_inputs_indices.append(parents)
+            node_types.append(node.type_id)
+
+        for output_slot, old_id in enumerate(output_ids):
+            final_index[old_id] = len(node_types)
+            node = pool[old_id]
+            parents = self._require_live_parents(node, final_index)
+            if len(parents) != 1:
+                raise ValueError(f"output node {old_id} has {len(parents)} parents")
+            node_inputs_indices.append(parents)
+            node_types.append(output_start + output_slot)
+
+        description = FixedInDegreeDAGDescription(
+            num_root_nodes=self.num_root_nodes,
+            num_trunk_nodes=len(trunk_order),
+            num_output_nodes=len(output_ids),
+            num_trunk_node_types=self.num_trunk_node_types,
+            trunk_node_in_degrees=self.trunk_node_in_degrees,
+            node_inputs_indices=node_inputs_indices,
+            node_types=node_types,
+        )
+        description.termination_reason = termination_reason
+        description.decode_live_pool_nodes = sorted(live)
+        description.decode_dropped_pool_nodes = [
+            node.id for node in pool if node.id not in live
+        ]
+        return description
+
+    def _live_decode_node_ids(self, pool: list[_DecodeNode]) -> set[int]:
+        live = {node.id for node in pool if node.is_root}
+        changed = True
+        while changed:
+            changed = False
+            for node in pool:
+                if node.id in live or node.is_root:
+                    continue
+                if not node.expanded:
+                    continue
+                if any(parent is None or parent not in live for parent in node.parents):
+                    continue
+                live.add(node.id)
+                changed = True
+        return live
+
+    def _toposort_decode_trunks(
+        self,
+        pool: list[_DecodeNode],
+        trunk_ids: list[int],
+    ) -> list[int]:
+        trunk_set = set(trunk_ids)
+        indegree = {node_id: 0 for node_id in trunk_ids}
+        children: dict[int, list[int]] = {node_id: [] for node_id in trunk_ids}
+
+        for node_id in trunk_ids:
+            for parent_id in pool[node_id].parents:
+                if parent_id in trunk_set:
+                    indegree[node_id] += 1
+                    children[parent_id].append(node_id)
+
+        ready = sorted(node_id for node_id, degree in indegree.items() if degree == 0)
+        order: list[int] = []
+        while ready:
+            node_id = ready.pop(0)
+            order.append(node_id)
+            for child_id in sorted(children[node_id]):
+                indegree[child_id] -= 1
+                if indegree[child_id] == 0:
+                    ready.append(child_id)
+                    ready.sort()
+
+        if len(order) != len(trunk_ids):
+            stalled = sorted(set(trunk_ids) - set(order))
+            raise ValueError(f"cycle or invalid parent relation among trunks: {stalled}")
+
+        return order
+
+    def _require_live_parents(
+        self,
+        node: _DecodeNode,
+        final_index: dict[int, int],
+    ) -> list[int]:
+        parents: list[int] = []
+        for parent_id in node.parents:
+            if parent_id is None:
+                raise ValueError(f"live node {node.id} has an unfilled parent slot")
+            if parent_id not in final_index:
+                raise ValueError(
+                    f"live node {node.id} references non-live parent {parent_id}"
+                )
+            parents.append(final_index[parent_id])
+        return parents
