@@ -3,9 +3,9 @@
 Because ``evaluate_graph`` recursively composes a ``NodeEncoder`` MLP at every
 non-root node, the effective depth of the computation equals the depth of the
 DAG -- so a freshly-initialized model is really a very deep, weight-shared,
-residual-free network. Each ``NodeEncoder`` uses ``RMSNorm`` inside its MLP,
-which re-scales embeddings before they are passed through each linear layer.
-This keeps the per-node embedding norm roughly flat
+residual-free network. Each ``NodeEncoder`` applies a ``LayerNorm`` after its
+MLP output, which re-centres and re-scales the embedding before it is passed as
+input to the next rank's encoders, keeping the per-node embedding norm flat
 around ``sqrt(node_embedding_dim)`` as DAG depth increases.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
@@ -178,8 +178,9 @@ def test_norms_stay_bounded() -> None:
             )
 
 
-def test_mean_stays_bounded() -> None:
-    """Per-element mean should remain bounded on both passes."""
+def test_no_mean_shift() -> None:
+    """Per-element mean should stay near zero on both passes (LayerNorm
+    re-centering removes mean-shift)."""
     stats_by_phase = measure_signal_propagation()
     for phase, stats_by_depth in stats_by_phase.items():
         for depth, s in stats_by_depth.items():
@@ -201,7 +202,7 @@ def main() -> None:
     print(format_table("decode", stats_by_phase["decode"]))
 
     test_norms_stay_bounded()
-    test_mean_stays_bounded()
+    test_no_mean_shift()
     print("\nALL SIGNAL-PROPAGATION CHECKS PASSED")
 
 
