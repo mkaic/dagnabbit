@@ -14,6 +14,8 @@ MLP_EXPANSION_FACTOR = 4.0
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 1024
+# None defaults to NUM_TRUNK_NODES in make_random_graph_description.
+NUM_MCMC_MIXING_STEPS: int | None = None
 
 # --- training ---
 NUM_STEPS = 1_000_000

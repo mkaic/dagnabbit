@@ -265,6 +265,23 @@ def _descendants_from_children(children: list[list[int]], node: int) -> set[int]
     return descendants
 
 
+def _can_reach(children: list[list[int]], src: int, dst: int) -> bool:
+    if src == dst:
+        return True
+
+    seen: set[int] = set()
+    stack = list(children[src])
+    while stack:
+        node = stack.pop()
+        if node == dst:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(children[node])
+    return False
+
+
 def _sample_valid_parent(
     eligible: list[int],
     forbidden: set[int],
@@ -414,6 +431,82 @@ def _build_edge_split_graph(
     )
 
 
+def _mcmc_rewire(graph: _EdgeSplitGraph, num_steps: int, rng: random.Random) -> None:
+    nonleaf = [
+        node for node, role in enumerate(graph.roles) if role is not _EdgeSplitRole.LEAF
+    ]
+    edges = [
+        (parent, node, parent_slot)
+        for node, parent_list in enumerate(graph.parents)
+        for parent_slot, parent in enumerate(parent_list)
+    ]
+
+    for _ in range(num_steps):
+        if len(edges) >= 2 and rng.randrange(2) == 0:
+            _mcmc_double_swap_step(graph, edges, rng)
+            continue
+        _mcmc_single_rewire_step(graph, nonleaf, edges, rng)
+
+
+def _mcmc_single_rewire_step(
+    graph: _EdgeSplitGraph,
+    nonleaf: list[int],
+    edges: list[tuple[int, int, int]],
+    rng: random.Random,
+) -> None:
+    edge_idx = rng.randrange(len(edges))
+    parent, node, parent_slot = edges[edge_idx]
+    new_parent = rng.choice(nonleaf)
+
+    if new_parent == node or new_parent == parent:
+        return
+    if len(graph.children[parent]) == 1:
+        return
+    if _can_reach(graph.children, node, new_parent):
+        return
+
+    edges[edge_idx] = (new_parent, node, parent_slot)
+    graph.parents[node][parent_slot] = new_parent
+    graph.children[parent].remove(node)
+    graph.children[new_parent].append(node)
+
+
+def _mcmc_double_swap_step(
+    graph: _EdgeSplitGraph,
+    edges: list[tuple[int, int, int]],
+    rng: random.Random,
+) -> None:
+    first_idx = rng.randrange(len(edges))
+    second_idx = rng.randrange(len(edges) - 1)
+    if second_idx >= first_idx:
+        second_idx += 1
+
+    first_parent, first_child, first_parent_slot = edges[first_idx]
+    second_parent, second_child, second_parent_slot = edges[second_idx]
+
+    if first_child == second_child or first_parent == second_parent:
+        return
+    if first_parent == second_child or second_parent == first_child:
+        return
+
+    graph.children[first_parent].remove(first_child)
+    graph.children[second_parent].remove(second_child)
+
+    if _can_reach(graph.children, second_child, first_parent) or _can_reach(
+        graph.children, first_child, second_parent
+    ):
+        graph.children[first_parent].append(first_child)
+        graph.children[second_parent].append(second_child)
+        return
+
+    edges[first_idx] = (first_parent, second_child, second_parent_slot)
+    edges[second_idx] = (second_parent, first_child, first_parent_slot)
+    graph.parents[first_child][first_parent_slot] = second_parent
+    graph.parents[second_child][second_parent_slot] = first_parent
+    graph.children[first_parent].append(second_child)
+    graph.children[second_parent].append(first_child)
+
+
 def _assemble_edge_split_description(
     graph: _EdgeSplitGraph,
     num_root_nodes: int,
@@ -486,6 +579,7 @@ def make_random_graph_description(
     num_output_nodes: int,
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
+    num_mixing_steps: int | None = None,
 ) -> FixedInDegreeDAGDescription:
     """Generate a random DAG with exact root, trunk, and output-node counts."""
     if isinstance(trunk_node_in_degrees, int):
@@ -507,6 +601,8 @@ def make_random_graph_description(
         trunk_node_in_degrees=trunk_node_in_degrees,
         rng=rng,
     )
+    steps = num_mixing_steps if num_mixing_steps is not None else num_trunk_nodes * 3
+    _mcmc_rewire(raw_graph, num_steps=steps, rng=rng)
     return _assemble_edge_split_description(
         graph=raw_graph,
         num_root_nodes=num_root_nodes,
