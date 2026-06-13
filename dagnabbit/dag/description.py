@@ -686,7 +686,7 @@ def _make_random_graph_description_python(
         trunk_node_in_degrees=trunk_node_in_degrees,
         rng=rng,
     )
-    steps = num_mixing_steps if num_mixing_steps is not None else num_trunk_nodes * 8
+    steps = num_mixing_steps if num_mixing_steps is not None else num_trunk_nodes * 16
     _mcmc_rewire(raw_graph, num_steps=steps, rng=rng)
     return _assemble_edge_split_description(
         graph=raw_graph,
