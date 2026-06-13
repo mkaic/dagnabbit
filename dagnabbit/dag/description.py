@@ -1,3 +1,5 @@
+import random
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -237,6 +239,247 @@ class FixedInDegreeDAGDescription:
         return rank_groups
 
 
+class _EdgeSplitRole(Enum):
+    ROOT = "root"
+    TRUNK = "trunk"
+    LEAF = "leaf"
+
+
+@dataclass
+class _EdgeSplitGraph:
+    parents: list[list[int]]
+    children: list[list[int]]
+    roles: list[_EdgeSplitRole]
+    trunk_types: dict[int, int]
+
+
+def _descendants_from_children(children: list[list[int]], node: int) -> set[int]:
+    descendants: set[int] = set()
+    stack = list(children[node])
+    while stack:
+        child = stack.pop()
+        if child in descendants:
+            continue
+        descendants.add(child)
+        stack.extend(children[child])
+    return descendants
+
+
+def _sample_valid_parent(
+    eligible: list[int],
+    forbidden: set[int],
+    rng: random.Random,
+) -> int:
+    for _ in range(max(8, len(eligible) * 2)):
+        candidate = rng.choice(eligible)
+        if candidate not in forbidden:
+            return candidate
+
+    valid = [node for node in eligible if node not in forbidden]
+    assert valid
+    return rng.choice(valid)
+
+
+def _pick_kth_set_bit(mask: int, k: int) -> int:
+    while k:
+        mask &= mask - 1
+        k -= 1
+    return (mask & -mask).bit_length() - 1
+
+
+def _sample_valid_parent_bitmask(
+    eligible: list[int],
+    eligible_mask: int,
+    forbidden_mask: int,
+    rng: random.Random,
+) -> int:
+    if forbidden_mask.bit_count() * 4 < len(eligible):
+        for _ in range(max(8, len(eligible) * 2)):
+            candidate = rng.choice(eligible)
+            if not ((forbidden_mask >> candidate) & 1):
+                return candidate
+
+    valid_mask = eligible_mask & ~forbidden_mask
+    valid_count = valid_mask.bit_count()
+    assert valid_count > 0
+    return _pick_kth_set_bit(valid_mask, rng.randrange(valid_count))
+
+
+def _propagate_descendant_mask(
+    parents: list[list[int]],
+    desc_masks: list[int],
+    start: int,
+    new_descendants: int,
+) -> None:
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        added = new_descendants & ~desc_masks[node]
+        if not added:
+            continue
+        desc_masks[node] |= added
+        stack.extend(parents[node])
+
+
+def _build_edge_split_graph(
+    num_root_nodes: int,
+    num_trunk_nodes: int,
+    num_output_nodes: int,
+    num_trunk_node_types: int,
+    trunk_node_in_degrees: list[int],
+    rng: random.Random,
+    *,
+    use_incremental_tc: bool = False,
+) -> _EdgeSplitGraph:
+    num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
+    parents: list[list[int]] = [[] for _ in range(num_nodes)]
+    children: list[list[int]] = [[] for _ in range(num_nodes)]
+    roles = [_EdgeSplitRole.TRUNK for _ in range(num_nodes)]
+    trunk_types: dict[int, int] = {}
+    edges: list[tuple[int, int]] = []
+    eligible = list(range(num_root_nodes))
+    eligible_mask = (1 << num_root_nodes) - 1
+    desc_masks = [0] * num_nodes
+
+    for root in range(num_root_nodes):
+        roles[root] = _EdgeSplitRole.ROOT
+
+    leaf_start = num_root_nodes
+    trunk_start = num_root_nodes + num_output_nodes
+    for leaf in range(leaf_start, trunk_start):
+        roles[leaf] = _EdgeSplitRole.LEAF
+        root = rng.randrange(num_root_nodes)
+        parents[leaf] = [root]
+        children[root].append(leaf)
+        edges.append((root, leaf))
+        if use_incremental_tc:
+            desc_masks[root] |= 1 << leaf
+
+    for split_idx in range(num_trunk_nodes):
+        edge_idx = rng.randrange(len(edges))
+        u, v = edges[edge_idx]
+        w = trunk_start + split_idx
+
+        trunk_type = rng.randrange(num_trunk_node_types)
+        trunk_types[w] = trunk_type
+        k = trunk_node_in_degrees[trunk_type]
+
+        if use_incremental_tc:
+            forbidden_mask = desc_masks[v] | (1 << v)
+            extras = [
+                _sample_valid_parent_bitmask(
+                    eligible=eligible,
+                    eligible_mask=eligible_mask,
+                    forbidden_mask=forbidden_mask,
+                    rng=rng,
+                )
+                for _ in range(k - 1)
+            ]
+        else:
+            forbidden = _descendants_from_children(children, v)
+            forbidden.add(v)
+            extras = [_sample_valid_parent(eligible, forbidden, rng) for _ in range(k - 1)]
+
+        roles[w] = _EdgeSplitRole.TRUNK
+
+        children[u].remove(v)
+        children[u].append(w)
+        parents[v][parents[v].index(u)] = w
+        parents[w] = [u, *extras]
+        children[w] = [v]
+        for extra in extras:
+            children[extra].append(w)
+
+        edges[edge_idx] = (u, w)
+        edges.append((w, v))
+        edges.extend((extra, w) for extra in extras)
+
+        if use_incremental_tc:
+            desc_masks[w] = (1 << v) | desc_masks[v]
+            _propagate_descendant_mask(parents, desc_masks, u, 1 << w)
+            extra_reachability = (1 << w) | desc_masks[w]
+            for extra in extras:
+                _propagate_descendant_mask(
+                    parents, desc_masks, extra, extra_reachability
+                )
+
+        eligible.append(w)
+        eligible_mask |= 1 << w
+
+    return _EdgeSplitGraph(
+        parents=parents,
+        children=children,
+        roles=roles,
+        trunk_types=trunk_types,
+    )
+
+
+def _assemble_edge_split_description(
+    graph: _EdgeSplitGraph,
+    num_root_nodes: int,
+    num_trunk_nodes: int,
+    num_output_nodes: int,
+    num_trunk_node_types: int,
+    trunk_node_in_degrees: list[int],
+    rng: random.Random,
+) -> FixedInDegreeDAGDescription:
+    in_degrees = [len(parent_list) for parent_list in graph.parents]
+    ready = deque(node for node, in_degree in enumerate(in_degrees) if in_degree == 0)
+    topo_order: list[int] = []
+
+    while ready:
+        node = ready.popleft()
+        topo_order.append(node)
+        for child in graph.children[node]:
+            in_degrees[child] -= 1
+            if in_degrees[child] == 0:
+                ready.append(child)
+
+    assert len(topo_order) == len(graph.parents)
+
+    final_order = (
+        [node for node in topo_order if graph.roles[node] is _EdgeSplitRole.ROOT]
+        + [node for node in topo_order if graph.roles[node] is _EdgeSplitRole.TRUNK]
+        + [node for node in topo_order if graph.roles[node] is _EdgeSplitRole.LEAF]
+    )
+    old_to_new = {old: new for new, old in enumerate(final_order)}
+
+    node_inputs_indices: list[list[int]] = []
+    node_types: list[int] = []
+    root_node_types_start = num_trunk_node_types
+    output_node_types_start = num_trunk_node_types + num_root_nodes
+    root_slot = 0
+    output_slot = 0
+
+    for old_node in final_order:
+        parent_list = list(graph.parents[old_node])
+        if graph.roles[old_node] is _EdgeSplitRole.TRUNK:
+            rng.shuffle(parent_list)
+        node_inputs_indices.append([old_to_new[parent] for parent in parent_list])
+
+        if graph.roles[old_node] is _EdgeSplitRole.ROOT:
+            node_types.append(root_node_types_start + root_slot)
+            root_slot += 1
+        elif graph.roles[old_node] is _EdgeSplitRole.TRUNK:
+            node_types.append(graph.trunk_types[old_node])
+        else:
+            node_types.append(output_node_types_start + output_slot)
+            output_slot += 1
+
+    assert root_slot == num_root_nodes
+    assert output_slot == num_output_nodes
+
+    return FixedInDegreeDAGDescription(
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        num_trunk_node_types=num_trunk_node_types,
+        trunk_node_in_degrees=trunk_node_in_degrees,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
+    )
+
+
 def make_random_graph_description(
     num_root_nodes: int,
     num_trunk_nodes: int,
@@ -244,127 +487,35 @@ def make_random_graph_description(
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
-    """
-    Generate a random DAG where each trunk node can reference any previous
-    node (root or trunk). Each output node is guaranteed to be a leaf and
-    has exactly one input sampled from any previously emitted node (root or
-    trunk).
-    """
+    """Generate a random DAG with exact root, trunk, and output-node counts."""
     if isinstance(trunk_node_in_degrees, int):
         trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
 
-    trunk_node_types = torch.randint(
-        0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8
-    ).tolist()
+    assert len(trunk_node_in_degrees) == num_trunk_node_types
+    assert all(in_degree >= 1 for in_degree in trunk_node_in_degrees)
+    assert num_root_nodes >= 1
+    assert num_output_nodes >= 1
+    assert num_trunk_node_types >= 1
 
-    max_in_degree = max(trunk_node_in_degrees)
-    max_allowed_node_indices = (
-        torch.arange(num_trunk_nodes, dtype=torch.int32) + num_root_nodes
-    )
-
-    noise = torch.rand(max_in_degree, num_trunk_nodes, dtype=torch.float32)
-    trunk_all_indices = (noise * max_allowed_node_indices.float()).floor().int()
-
-    node_inputs_indices: list[list[int]] = []
-
-    for _ in range(num_root_nodes):
-        node_inputs_indices.append([])
-
-    for i in range(num_trunk_nodes):
-        node_in_degree = trunk_node_in_degrees[trunk_node_types[i]]
-        node_inputs_indices.append(trunk_all_indices[:node_in_degree, i].tolist())
-
-    num_candidate_inputs = num_root_nodes + num_trunk_nodes
-    if num_output_nodes > 0:
-        assert num_candidate_inputs > 0
-        output_inputs = torch.randint(
-            0, num_candidate_inputs, (num_output_nodes,), dtype=torch.int32
-        ).tolist()
-        for idx in output_inputs:
-            node_inputs_indices.append([idx])
-
-    root_node_types_start = num_trunk_node_types
-    output_node_types_start = num_trunk_node_types + num_root_nodes
-    node_types: list[int] = (
-        [root_node_types_start + i for i in range(num_root_nodes)]
-        + trunk_node_types
-        + [output_node_types_start + i for i in range(num_output_nodes)]
-    )
-
-    return FixedInDegreeDAGDescription(
+    seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+    rng = random.Random(seed)
+    raw_graph = _build_edge_split_graph(
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         num_trunk_node_types=num_trunk_node_types,
         trunk_node_in_degrees=trunk_node_in_degrees,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
+        rng=rng,
     )
-
-
-def _prune_to_output_ancestors(
-    graph: FixedInDegreeDAGDescription,
-) -> FixedInDegreeDAGDescription:
-    """Drop trunk nodes that are not in any output's ancestor cone.
-
-    Roots are always retained so root/output type-index layout remains stable.
-    Surviving trunk nodes keep their original topological order, and outputs stay
-    in their original slot order at the tail.
-    """
-    output_start = graph.num_root_nodes + graph.num_trunk_nodes
-
-    reachable: set[int] = set(range(output_start, graph.num_nodes))
-    stack = list(reachable)
-    while stack:
-        node_idx = stack.pop()
-        for parent_idx in graph.node_inputs_indices[node_idx]:
-            if parent_idx not in reachable:
-                reachable.add(parent_idx)
-                stack.append(parent_idx)
-
-    kept_roots = list(range(graph.num_root_nodes))
-    kept_trunks = [
-        node_idx
-        for node_idx in range(graph.num_root_nodes, output_start)
-        if node_idx in reachable
-    ]
-    kept_outputs = list(range(output_start, graph.num_nodes))
-    kept_nodes = kept_roots + kept_trunks + kept_outputs
-
-    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_nodes)}
-    node_inputs_indices = [
-        [old_to_new[parent_idx] for parent_idx in graph.node_inputs_indices[old_idx]]
-        for old_idx in kept_nodes
-    ]
-    node_types = [graph.node_types[old_idx] for old_idx in kept_nodes]
-
-    return FixedInDegreeDAGDescription(
-        num_root_nodes=graph.num_root_nodes,
-        num_trunk_nodes=len(kept_trunks),
-        num_output_nodes=graph.num_output_nodes,
-        num_trunk_node_types=graph.num_trunk_node_types,
-        trunk_node_in_degrees=graph.trunk_node_in_degrees,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
-    )
-
-
-def make_minimal_random_dag(
-    num_root_nodes: int,
-    num_trunk_nodes: int,
-    num_output_nodes: int,
-    trunk_node_in_degrees: int | list[int],
-    num_trunk_node_types: int,
-) -> FixedInDegreeDAGDescription:
-    """Generate a random DAG pruned to roots plus the output ancestor cone."""
-    graph = make_random_graph_description(
+    return _assemble_edge_split_description(
+        graph=raw_graph,
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
-        trunk_node_in_degrees=trunk_node_in_degrees,
         num_trunk_node_types=num_trunk_node_types,
+        trunk_node_in_degrees=trunk_node_in_degrees,
+        rng=rng,
     )
-    return _prune_to_output_ancestors(graph)
 
 
 def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:

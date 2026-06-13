@@ -2,16 +2,13 @@ import argparse
 
 import torch
 
-from dagnabbit.dag.description import (
-    make_minimal_random_dag,
-    make_random_graph_description,
-)
+from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.dag.render import render_dag
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render a random DAG and its output-ancestor-pruned counterpart."
+        description="Render a random edge-splitting DAG."
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-root-nodes", type=int, default=8)
@@ -29,25 +26,13 @@ def main():
         num_trunk_node_types=args.num_trunk_node_types,
     )
 
-    # Seed before each construction so the pruned graph is the pruned version of
-    # the exact same random full graph (make_minimal_random_dag builds the full
-    # graph internally with the same RNG draws, then prunes it).
     torch.manual_seed(args.seed)
     primary = make_random_graph_description(**kwargs)
 
-    torch.manual_seed(args.seed)
-    pruned = make_minimal_random_dag(**kwargs)
-
     primary_path = render_dag(primary, output_path="dag_primary", fmt="png")
     print(
-        f"Rendered full graph to {primary_path} "
+        f"Rendered graph to {primary_path} "
         f"({primary.num_trunk_nodes} trunk nodes)"
-    )
-
-    pruned_path = render_dag(pruned, output_path="dag_pruned", fmt="png")
-    print(
-        f"Rendered pruned graph to {pruned_path} "
-        f"({pruned.num_trunk_nodes} trunk nodes kept)"
     )
 
 

@@ -25,7 +25,7 @@ from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     canonicalize,
     graphs_match,
-    make_minimal_random_dag,
+    make_random_graph_description,
 )
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.diagnose_root_collapse import build_model, load_checkpoint
@@ -79,7 +79,7 @@ def run_roundtrip(
     buckets: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "survived": 0})
 
     for _ in tqdm(range(num_graphs), desc="Round-tripping graphs"):
-        graph = make_minimal_random_dag(
+        graph = make_random_graph_description(
             num_root_nodes=cfg.NUM_ROOT_NODES,
             num_trunk_nodes=cfg.NUM_TRUNK_NODES,
             num_output_nodes=cfg.NUM_OUTPUT_NODES,
