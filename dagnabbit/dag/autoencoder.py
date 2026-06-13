@@ -25,7 +25,7 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
 
 
 class MLP(nn.Module):
-    """Pre-norm MLP: ``LayerNorm -> Linear`` per layer, GELU between layers."""
+    """Pre-norm MLP: ``RMSNorm -> Linear`` per layer, GELU between layers."""
 
     def __init__(
         self,
@@ -41,7 +41,7 @@ class MLP(nn.Module):
             ]
         )
         self.norms = nn.ModuleList(
-            [nn.LayerNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
+            [nn.RMSNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
         )
         self.activation = activation if activation is not None else nn.GELU()
 
