@@ -13,7 +13,7 @@ MLP_DEPTH = 2
 MLP_EXPANSION_FACTOR = 4.0
 
 # --- DAG sampling ---
-NUM_TRUNK_NODES = 1024
+NUM_TRUNK_NODES = 128
 # Full round-robin MCMC passes over active nodes after each edge-splitting pass.
 MCMC_PASSES_PER_SPLIT_ROUND = 2
 
