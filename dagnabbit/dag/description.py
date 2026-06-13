@@ -11,6 +11,7 @@ except ImportError:
     _native = None
 
 NodeInputIndices = list[int]
+DEFAULT_MCMC_PASSES_PER_SPLIT_ROUND = 8
 
 
 class NodeSupertype(Enum):
@@ -263,18 +264,6 @@ class _EdgeSplitGraph:
     trunk_types: dict[int, int]
 
 
-def _descendants_from_children(children: list[list[int]], node: int) -> set[int]:
-    descendants: set[int] = set()
-    stack = list(children[node])
-    while stack:
-        child = stack.pop()
-        if child in descendants:
-            continue
-        descendants.add(child)
-        stack.extend(children[child])
-    return descendants
-
-
 def _can_reach(children: list[list[int]], src: int, dst: int) -> bool:
     if src == dst:
         return True
@@ -316,81 +305,16 @@ def _can_reach_with_scratch(
     return False
 
 
-def _sample_valid_parent(
-    eligible: list[int],
-    forbidden: set[int],
-    rng: random.Random,
-) -> int:
-    for _ in range(max(8, len(eligible) * 2)):
-        candidate = rng.choice(eligible)
-        if candidate not in forbidden:
-            return candidate
-
-    valid = [node for node in eligible if node not in forbidden]
-    assert valid
-    return rng.choice(valid)
-
-
-def _pick_kth_set_bit(mask: int, k: int) -> int:
-    while k:
-        mask &= mask - 1
-        k -= 1
-    return (mask & -mask).bit_length() - 1
-
-
-def _sample_valid_parent_bitmask(
-    eligible: list[int],
-    eligible_mask: int,
-    forbidden_mask: int,
-    rng: random.Random,
-) -> int:
-    if forbidden_mask.bit_count() * 4 < len(eligible):
-        for _ in range(max(8, len(eligible) * 2)):
-            candidate = rng.choice(eligible)
-            if not ((forbidden_mask >> candidate) & 1):
-                return candidate
-
-    valid_mask = eligible_mask & ~forbidden_mask
-    valid_count = valid_mask.bit_count()
-    assert valid_count > 0
-    return _pick_kth_set_bit(valid_mask, rng.randrange(valid_count))
-
-
-def _propagate_descendant_mask(
-    parents: list[list[int]],
-    desc_masks: list[int],
-    start: int,
-    new_descendants: int,
-) -> None:
-    stack = [start]
-    while stack:
-        node = stack.pop()
-        added = new_descendants & ~desc_masks[node]
-        if not added:
-            continue
-        desc_masks[node] |= added
-        stack.extend(parents[node])
-
-
-def _build_edge_split_graph(
+def _initialize_edge_split_graph(
     num_root_nodes: int,
     num_trunk_nodes: int,
     num_output_nodes: int,
-    num_trunk_node_types: int,
-    trunk_node_in_degrees: list[int],
     rng: random.Random,
-    *,
-    use_incremental_tc: bool = False,
 ) -> _EdgeSplitGraph:
     num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
     parents: list[list[int]] = [[] for _ in range(num_nodes)]
     children: list[list[int]] = [[] for _ in range(num_nodes)]
     roles = [_EdgeSplitRole.TRUNK for _ in range(num_nodes)]
-    trunk_types: dict[int, int] = {}
-    edges: list[tuple[int, int]] = []
-    eligible = list(range(num_root_nodes))
-    eligible_mask = (1 << num_root_nodes) - 1
-    desc_masks = [0] * num_nodes
 
     for root in range(num_root_nodes):
         roles[root] = _EdgeSplitRole.ROOT
@@ -402,143 +326,227 @@ def _build_edge_split_graph(
         root = rng.randrange(num_root_nodes)
         parents[leaf] = [root]
         children[root].append(leaf)
-        edges.append((root, leaf))
-        if use_incremental_tc:
-            desc_masks[root] |= 1 << leaf
-
-    split_idx = 0
-    while split_idx < num_trunk_nodes:
-        round_edge_indices = list(range(len(edges)))
-        rng.shuffle(round_edge_indices)
-        for edge_idx in round_edge_indices:
-            if split_idx >= num_trunk_nodes:
-                break
-
-            u, v = edges[edge_idx]
-            w = trunk_start + split_idx
-
-            trunk_type = rng.randrange(num_trunk_node_types)
-            trunk_types[w] = trunk_type
-            k = trunk_node_in_degrees[trunk_type]
-
-            if use_incremental_tc:
-                forbidden_mask = desc_masks[v] | (1 << v)
-                extras = [
-                    _sample_valid_parent_bitmask(
-                        eligible=eligible,
-                        eligible_mask=eligible_mask,
-                        forbidden_mask=forbidden_mask,
-                        rng=rng,
-                    )
-                    for _ in range(k - 1)
-                ]
-            else:
-                forbidden = _descendants_from_children(children, v)
-                forbidden.add(v)
-                extras = [
-                    _sample_valid_parent(eligible, forbidden, rng) for _ in range(k - 1)
-                ]
-
-            roles[w] = _EdgeSplitRole.TRUNK
-
-            children[u].remove(v)
-            children[u].append(w)
-            parents[v][parents[v].index(u)] = w
-            parents[w] = [u, *extras]
-            children[w] = [v]
-            for extra in extras:
-                children[extra].append(w)
-
-            edges[edge_idx] = (u, w)
-            edges.append((w, v))
-            edges.extend((extra, w) for extra in extras)
-
-            if use_incremental_tc:
-                desc_masks[w] = (1 << v) | desc_masks[v]
-                _propagate_descendant_mask(parents, desc_masks, u, 1 << w)
-                extra_reachability = (1 << w) | desc_masks[w]
-                for extra in extras:
-                    _propagate_descendant_mask(
-                        parents, desc_masks, extra, extra_reachability
-                    )
-
-            eligible.append(w)
-            eligible_mask |= 1 << w
-            split_idx += 1
 
     return _EdgeSplitGraph(
         parents=parents,
         children=children,
         roles=roles,
-        trunk_types=trunk_types,
+        trunk_types={},
     )
 
 
-def _mcmc_rewire(graph: _EdgeSplitGraph, num_steps: int, rng: random.Random) -> None:
+def _active_nodes(
+    num_root_nodes: int,
+    num_output_nodes: int,
+    inserted_trunks: int,
+) -> list[int]:
+    trunk_start = num_root_nodes + num_output_nodes
+    return [
+        *range(num_root_nodes),
+        *range(num_root_nodes, trunk_start),
+        *range(trunk_start, trunk_start + inserted_trunks),
+    ]
+
+
+def _active_nonleaf_nodes(
+    num_root_nodes: int,
+    num_output_nodes: int,
+    inserted_trunks: int,
+) -> list[int]:
+    trunk_start = num_root_nodes + num_output_nodes
+    return [
+        *range(num_root_nodes),
+        *range(trunk_start, trunk_start + inserted_trunks),
+    ]
+
+
+def _active_edges(
+    graph: _EdgeSplitGraph,
+    active_nodes: list[int],
+) -> list[tuple[int, int]]:
+    active = set(active_nodes)
+    return [
+        (parent, child)
+        for parent in active_nodes
+        for child in graph.children[parent]
+        if child in active
+    ]
+
+
+def _sample_valid_parent_by_reachability(
+    graph: _EdgeSplitGraph,
+    eligible: list[int],
+    forbidden_node: int,
+    rng: random.Random,
+) -> int:
+    for _ in range(max(8, len(eligible) * 2)):
+        candidate = rng.choice(eligible)
+        if not _can_reach(graph.children, forbidden_node, candidate):
+            return candidate
+
+    valid = [
+        candidate
+        for candidate in eligible
+        if not _can_reach(graph.children, forbidden_node, candidate)
+    ]
+    assert valid
+    return rng.choice(valid)
+
+
+def _split_active_edge(
+    graph: _EdgeSplitGraph,
+    edge: tuple[int, int],
+    inserted_trunks: int,
+    num_root_nodes: int,
+    num_output_nodes: int,
+    num_trunk_node_types: int,
+    trunk_node_in_degrees: list[int],
+    rng: random.Random,
+) -> None:
+    u, v = edge
+    trunk_start = num_root_nodes + num_output_nodes
+    w = trunk_start + inserted_trunks
+
+    trunk_type = rng.randrange(num_trunk_node_types)
+    graph.trunk_types[w] = trunk_type
+    in_degree = trunk_node_in_degrees[trunk_type]
+    eligible = _active_nonleaf_nodes(
+        num_root_nodes=num_root_nodes,
+        num_output_nodes=num_output_nodes,
+        inserted_trunks=inserted_trunks,
+    )
+    extras = [
+        _sample_valid_parent_by_reachability(
+            graph=graph,
+            eligible=eligible,
+            forbidden_node=v,
+            rng=rng,
+        )
+        for _ in range(in_degree - 1)
+    ]
+
+    graph.children[u].remove(v)
+    graph.children[u].append(w)
+    graph.parents[v][graph.parents[v].index(u)] = w
+    graph.parents[w] = [u, *extras]
+    graph.children[w] = [v]
+    for extra in extras:
+        graph.children[extra].append(w)
+
+
+def _build_interleaved_edge_split_graph(
+    num_root_nodes: int,
+    num_trunk_nodes: int,
+    num_output_nodes: int,
+    num_trunk_node_types: int,
+    trunk_node_in_degrees: list[int],
+    mcmc_passes_per_split_round: int,
+    rng: random.Random,
+) -> _EdgeSplitGraph:
+    raw = _initialize_edge_split_graph(
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        rng=rng,
+    )
+
+    inserted_trunks = 0
+    while inserted_trunks < num_trunk_nodes:
+        active = _active_nodes(
+            num_root_nodes=num_root_nodes,
+            num_output_nodes=num_output_nodes,
+            inserted_trunks=inserted_trunks,
+        )
+        edges = _active_edges(raw, active)
+        assert edges
+        rng.shuffle(edges)
+
+        for edge in edges:
+            if inserted_trunks >= num_trunk_nodes:
+                break
+            _split_active_edge(
+                graph=raw,
+                edge=edge,
+                inserted_trunks=inserted_trunks,
+                num_root_nodes=num_root_nodes,
+                num_output_nodes=num_output_nodes,
+                num_trunk_node_types=num_trunk_node_types,
+                trunk_node_in_degrees=trunk_node_in_degrees,
+                rng=rng,
+            )
+            inserted_trunks += 1
+
+        active = _active_nodes(
+            num_root_nodes=num_root_nodes,
+            num_output_nodes=num_output_nodes,
+            inserted_trunks=inserted_trunks,
+        )
+        _mcmc_rewire(
+            raw,
+            num_steps=mcmc_passes_per_split_round * len(active),
+            rng=rng,
+            active_nodes=active,
+        )
+
+    if num_trunk_nodes == 0:
+        active = _active_nodes(
+            num_root_nodes=num_root_nodes,
+            num_output_nodes=num_output_nodes,
+            inserted_trunks=0,
+        )
+        _mcmc_rewire(
+            raw,
+            num_steps=mcmc_passes_per_split_round * len(active),
+            rng=rng,
+            active_nodes=active,
+        )
+
+    return raw
+
+
+def _mcmc_rewire(
+    graph: _EdgeSplitGraph,
+    num_steps: int,
+    rng: random.Random,
+    active_nodes: list[int] | None = None,
+) -> None:
+    if num_steps <= 0:
+        return
+
+    if active_nodes is None:
+        active_nodes = list(range(len(graph.parents)))
+
     nonleaf = [
-        node for node, role in enumerate(graph.roles) if role is not _EdgeSplitRole.LEAF
+        node for node in active_nodes if graph.roles[node] is not _EdgeSplitRole.LEAF
     ]
-    edges = [
-        (parent, node, parent_slot)
-        for node, parent_list in enumerate(graph.parents)
-        for parent_slot, parent in enumerate(parent_list)
-    ]
+    if not nonleaf:
+        return
 
     children = graph.children
     parents = graph.parents
-    edge_count = len(edges)
     can_reach = _can_reach_with_scratch
     seen = [0] * len(children)
     seen_token = 0
     stack: list[int] = []
     randrange = rng.randrange
-    choice = rng.choice
+    node_order = list(active_nodes)
+    rng.shuffle(node_order)
+    node_order_idx = 0
 
     for _ in range(num_steps):
-        if edge_count >= 2 and randrange(2) == 0:
-            first_idx = randrange(edge_count)
-            second_idx = randrange(edge_count - 1)
-            if second_idx >= first_idx:
-                second_idx += 1
+        if node_order_idx == len(node_order):
+            rng.shuffle(node_order)
+            node_order_idx = 0
+        node = node_order[node_order_idx]
+        node_order_idx += 1
 
-            first_parent, first_child, first_parent_slot = edges[first_idx]
-            second_parent, second_child, second_parent_slot = edges[second_idx]
-
-            if first_child == second_child or first_parent == second_parent:
-                continue
-            if first_parent == second_child or second_parent == first_child:
-                continue
-
-            children[first_parent].remove(first_child)
-            children[second_parent].remove(second_child)
-
-            seen_token += 1
-            reaches_first_parent = can_reach(
-                children, second_child, first_parent, seen, seen_token, stack
-            )
-            reaches_second_parent = False
-            if not reaches_first_parent:
-                seen_token += 1
-                reaches_second_parent = can_reach(
-                    children, first_child, second_parent, seen, seen_token, stack
-                )
-
-            if reaches_first_parent or reaches_second_parent:
-                children[first_parent].append(first_child)
-                children[second_parent].append(second_child)
-                continue
-
-            edges[first_idx] = (first_parent, second_child, second_parent_slot)
-            edges[second_idx] = (second_parent, first_child, first_parent_slot)
-            parents[first_child][first_parent_slot] = second_parent
-            parents[second_child][second_parent_slot] = first_parent
-            children[first_parent].append(second_child)
-            children[second_parent].append(first_child)
+        parent_list = parents[node]
+        if not parent_list:
             continue
 
-        edge_idx = randrange(edge_count)
-        parent, node, parent_slot = edges[edge_idx]
-        new_parent = choice(nonleaf)
+        parent_slot = randrange(len(parent_list))
+        parent = parent_list[parent_slot]
+        new_parent = nonleaf[randrange(len(nonleaf))]
 
         if new_parent == node or new_parent == parent:
             continue
@@ -549,7 +557,6 @@ def _mcmc_rewire(graph: _EdgeSplitGraph, num_steps: int, rng: random.Random) -> 
         if can_reach(children, node, new_parent, seen, seen_token, stack):
             continue
 
-        edges[edge_idx] = (new_parent, node, parent_slot)
         parents[node][parent_slot] = new_parent
         children[parent].remove(node)
         children[new_parent].append(node)
@@ -674,20 +681,19 @@ def _make_random_graph_description_python(
     num_output_nodes: int,
     trunk_node_in_degrees: list[int],
     num_trunk_node_types: int,
-    num_mixing_steps: int | None,
+    mcmc_passes_per_split_round: int,
     seed: int,
 ) -> FixedInDegreeDAGDescription:
     rng = random.Random(seed)
-    raw_graph = _build_edge_split_graph(
+    raw_graph = _build_interleaved_edge_split_graph(
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         num_trunk_node_types=num_trunk_node_types,
         trunk_node_in_degrees=trunk_node_in_degrees,
+        mcmc_passes_per_split_round=mcmc_passes_per_split_round,
         rng=rng,
     )
-    steps = num_mixing_steps if num_mixing_steps is not None else num_trunk_nodes * 16
-    _mcmc_rewire(raw_graph, num_steps=steps, rng=rng)
     return _assemble_edge_split_description(
         graph=raw_graph,
         num_root_nodes=num_root_nodes,
@@ -705,7 +711,7 @@ def make_random_graph_description(
     num_output_nodes: int,
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
-    num_mixing_steps: int | None = None,
+    mcmc_passes_per_split_round: int = DEFAULT_MCMC_PASSES_PER_SPLIT_ROUND,
 ) -> FixedInDegreeDAGDescription:
     """Generate a random DAG with exact root, trunk, and output-node counts."""
     if isinstance(trunk_node_in_degrees, int):
@@ -718,20 +724,19 @@ def make_random_graph_description(
     assert num_root_nodes >= 1
     assert num_output_nodes >= 1
     assert num_trunk_node_types >= 1
+    assert mcmc_passes_per_split_round >= 0
 
     seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
 
     if _native is not None:
-        parent_offsets, parent_indices, node_types = (
-            _native.generate_random_graph_arrays(
-                num_root_nodes=num_root_nodes,
-                num_trunk_nodes=num_trunk_nodes,
-                num_output_nodes=num_output_nodes,
-                trunk_node_in_degrees=trunk_node_in_degrees,
-                num_trunk_node_types=num_trunk_node_types,
-                seed=seed,
-                num_mixing_steps=num_mixing_steps,
-            )
+        parent_offsets, parent_indices, node_types = _native.generate_random_graph_arrays(
+            num_root_nodes=num_root_nodes,
+            num_trunk_nodes=num_trunk_nodes,
+            num_output_nodes=num_output_nodes,
+            trunk_node_in_degrees=trunk_node_in_degrees,
+            num_trunk_node_types=num_trunk_node_types,
+            seed=seed,
+            mcmc_passes_per_split_round=mcmc_passes_per_split_round,
         )
         return _description_from_flat_parent_arrays(
             num_root_nodes=num_root_nodes,
@@ -750,7 +755,7 @@ def make_random_graph_description(
         num_output_nodes=num_output_nodes,
         trunk_node_in_degrees=trunk_node_in_degrees,
         num_trunk_node_types=num_trunk_node_types,
-        num_mixing_steps=num_mixing_steps,
+        mcmc_passes_per_split_round=mcmc_passes_per_split_round,
         seed=seed,
     )
 

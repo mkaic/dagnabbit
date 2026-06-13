@@ -17,12 +17,6 @@ from dagnabbit.dag.description import (
 from dagnabbit.scripts import config as cfg
 
 
-def _optional_int(value: str) -> int | None:
-    if value.lower() == "none":
-        return None
-    return int(value)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=cfg.SEED)
@@ -45,10 +39,10 @@ def parse_args() -> argparse.Namespace:
         default=cfg.NUM_TRUNK_NODE_TYPES,
     )
     parser.add_argument(
-        "--num-mixing-steps",
-        type=_optional_int,
-        default=cfg.NUM_MCMC_MIXING_STEPS,
-        help="'none' uses num_trunk_nodes * 8, matching make_random_graph_description.",
+        "--mcmc-passes-per-split-round",
+        type=int,
+        default=cfg.MCMC_PASSES_PER_SPLIT_ROUND,
+        help="Full round-robin MCMC passes over active nodes after each split pass.",
     )
     parser.add_argument(
         "--implementation",
@@ -84,7 +78,7 @@ def main() -> None:
         num_output_nodes=args.num_output_nodes,
         trunk_node_in_degrees=trunk_node_in_degrees,
         num_trunk_node_types=args.num_trunk_node_types,
-        num_mixing_steps=args.num_mixing_steps,
+        mcmc_passes_per_split_round=args.mcmc_passes_per_split_round,
     )
 
     def make_graph() -> None:
@@ -96,7 +90,7 @@ def main() -> None:
                 num_output_nodes=args.num_output_nodes,
                 trunk_node_in_degrees=normalized_trunk_in_degrees,
                 num_trunk_node_types=args.num_trunk_node_types,
-                num_mixing_steps=args.num_mixing_steps,
+                mcmc_passes_per_split_round=args.mcmc_passes_per_split_round,
                 seed=seed,
             )
             return
@@ -118,12 +112,6 @@ def main() -> None:
 
     seconds_per_graph = elapsed / count
     graphs_per_second = count / elapsed
-    effective_mixing_steps = (
-        args.num_trunk_nodes * 8
-        if args.num_mixing_steps is None
-        else args.num_mixing_steps
-    )
-
     print("DAG generation benchmark")
     print(f"  implementation:        {args.implementation}")
     print(f"  seed:                 {args.seed}")
@@ -132,8 +120,7 @@ def main() -> None:
     print(f"  outputs:              {args.num_output_nodes}")
     print(f"  trunk types:          {args.num_trunk_node_types}")
     print(f"  trunk in-degrees:     {trunk_node_in_degrees}")
-    print(f"  mixing steps:         {args.num_mixing_steps}")
-    print(f"  effective mixing:     {effective_mixing_steps}")
+    print(f"  mcmc passes/round:    {args.mcmc_passes_per_split_round}")
     print(f"  warmup graphs:        {args.warmup_graphs}")
     print(f"  measured graphs:      {count}")
     print(f"  elapsed seconds:      {elapsed:.6f}")

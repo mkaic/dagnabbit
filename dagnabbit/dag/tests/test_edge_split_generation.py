@@ -14,11 +14,10 @@ from dagnabbit.dag.description import (
     _EdgeSplitGraph,
     _EdgeSplitRole,
     _assemble_edge_split_description,
-    _build_edge_split_graph,
+    _build_interleaved_edge_split_graph,
     _description_from_flat_parent_arrays,
     _mcmc_rewire,
     _native,
-    _sample_valid_parent,
     make_random_graph_description,
 )
 
@@ -88,6 +87,13 @@ def _assert_raw_acyclic(raw: _EdgeSplitGraph) -> None:
     assert visited == len(raw.parents)
 
 
+def _build_unmixed_interleaved_graph(**params) -> _EdgeSplitGraph:
+    return _build_interleaved_edge_split_graph(
+        **params,
+        mcmc_passes_per_split_round=0,
+    )
+
+
 def test_exact_counts_and_degrees() -> None:
     parameter_sets = [
         dict(
@@ -119,7 +125,7 @@ def test_exact_counts_and_degrees() -> None:
             _assert_edge_split_invariants(graph)
 
 
-def test_invariants_survive_mcmc_mixing() -> None:
+def test_invariants_survive_interleaved_mcmc_mixing() -> None:
     parameter_sets = [
         dict(
             num_root_nodes=2,
@@ -146,7 +152,10 @@ def test_invariants_survive_mcmc_mixing() -> None:
     for params in parameter_sets:
         for seed in range(10):
             torch.manual_seed(seed)
-            graph = make_random_graph_description(**params, num_mixing_steps=200)
+            graph = make_random_graph_description(
+                **params,
+                mcmc_passes_per_split_round=2,
+            )
             _assert_edge_split_invariants(graph)
 
 
@@ -159,7 +168,7 @@ def test_mcmc_rewire_preserves_raw_in_degrees_roles_and_acyclicity() -> None:
         num_trunk_node_types=2,
     )
     rng = random.Random(0)
-    raw = _build_edge_split_graph(**params, rng=rng)
+    raw = _build_unmixed_interleaved_graph(**params, rng=rng)
     in_degrees = [len(parents) for parents in raw.parents]
     roles = list(raw.roles)
 
@@ -192,8 +201,8 @@ class _ReverseShuffleRng(_FirstChoiceRng):
         seq.reverse()
 
 
-def test_edge_split_builder_round_robins_frozen_edges() -> None:
-    raw = _build_edge_split_graph(
+def test_interleaved_builder_round_robins_frozen_edges() -> None:
+    raw = _build_unmixed_interleaved_graph(
         num_root_nodes=1,
         num_trunk_nodes=4,
         num_output_nodes=3,
@@ -213,8 +222,8 @@ def test_edge_split_builder_round_robins_frozen_edges() -> None:
     _assert_raw_acyclic(raw)
 
 
-def test_edge_split_builder_shuffles_each_round() -> None:
-    raw = _build_edge_split_graph(
+def test_interleaved_builder_shuffles_each_split_round() -> None:
+    raw = _build_unmixed_interleaved_graph(
         num_root_nodes=1,
         num_trunk_nodes=3,
         num_output_nodes=3,
@@ -249,13 +258,13 @@ class _DuplicateParentProposalRng:
         self.randrange_calls += 1
         if self.randrange_calls == 1:
             assert stop == 2
-            return 1
-        assert stop == 4
-        return 0
-
-    def choice(self, seq: list[int]) -> int:
-        assert seq == [0, 1, 2]
+            return 0
+        assert stop == 3
         return 1
+
+    def shuffle(self, seq: list[int]) -> None:
+        assert seq == [0, 1, 2, 3, 4]
+        seq[:] = [2, 0, 1, 3, 4]
 
 
 def test_mcmc_rewire_allows_duplicate_parent_proposals() -> None:
@@ -277,6 +286,115 @@ def test_mcmc_rewire_allows_duplicate_parent_proposals() -> None:
     assert raw.parents[2] == [1, 1]
     _assert_raw_parent_child_multisets(raw)
     _assert_raw_acyclic(raw)
+
+
+class _McmcRoundRobinRng:
+    def __init__(self) -> None:
+        self.new_parents = iter([3, 2, 1, 3])
+        self.shuffle_calls = 0
+
+    def randrange(self, stop: int) -> int:
+        if stop == 1:
+            return 0
+        assert stop == 4
+        return next(self.new_parents)
+
+    def shuffle(self, seq: list[int]) -> None:
+        self.shuffle_calls += 1
+        if self.shuffle_calls == 1:
+            seq.reverse()
+        else:
+            seq.sort()
+
+
+def test_mcmc_rewire_round_robins_target_nodes() -> None:
+    raw = _EdgeSplitGraph(
+        parents=[[], [], [], [], [0], [0], [0], [0]],
+        children=[[4, 5, 6, 7], [], [], [], [], [], [], []],
+        roles=[
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.LEAF,
+            _EdgeSplitRole.LEAF,
+            _EdgeSplitRole.LEAF,
+            _EdgeSplitRole.LEAF,
+        ],
+        trunk_types={},
+    )
+    rng = _McmcRoundRobinRng()
+
+    _mcmc_rewire(raw, num_steps=9, rng=rng)  # type: ignore[arg-type]
+
+    assert [raw.parents[leaf][0] for leaf in (4, 5, 6, 7)] == [0, 1, 2, 3]
+    assert rng.shuffle_calls == 2
+    _assert_raw_parent_child_multisets(raw)
+    _assert_raw_acyclic(raw)
+
+
+class _ActiveNodeMcmcRng:
+    def randrange(self, stop: int) -> int:
+        if stop == 1:
+            return 0
+        assert stop == 3
+        return 1
+
+    def shuffle(self, seq: list[int]) -> None:
+        assert seq == [0, 1, 2, 3]
+        seq[:] = [3, 0, 1, 2]
+
+
+def test_mcmc_rewire_excludes_inactive_future_trunks() -> None:
+    raw = _EdgeSplitGraph(
+        parents=[[], [], [0], [0], []],
+        children=[[2, 3], [], [], [], []],
+        roles=[
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.ROOT,
+            _EdgeSplitRole.LEAF,
+            _EdgeSplitRole.TRUNK,
+            _EdgeSplitRole.TRUNK,
+        ],
+        trunk_types={3: 0},
+    )
+
+    _mcmc_rewire(
+        raw,
+        num_steps=1,
+        rng=_ActiveNodeMcmcRng(),  # type: ignore[arg-type]
+        active_nodes=[0, 1, 2, 3],
+    )
+
+    assert raw.parents[3] == [1]
+    assert raw.children[4] == []
+    _assert_raw_parent_child_multisets(raw)
+    _assert_raw_acyclic(raw)
+
+
+class _ShuffleRecordingRng(_FirstChoiceRng):
+    def __init__(self) -> None:
+        self.node_order_shuffle_lengths: list[int] = []
+
+    def shuffle(self, seq) -> None:
+        if seq and isinstance(seq[0], int):
+            self.node_order_shuffle_lengths.append(len(seq))
+
+
+def test_interleaved_builder_runs_configured_final_full_size_mcmc_passes() -> None:
+    rng = _ShuffleRecordingRng()
+
+    _build_interleaved_edge_split_graph(
+        num_root_nodes=1,
+        num_trunk_nodes=2,
+        num_output_nodes=1,
+        num_trunk_node_types=1,
+        trunk_node_in_degrees=[1],
+        mcmc_passes_per_split_round=2,
+        rng=rng,  # type: ignore[arg-type]
+    )
+
+    assert rng.node_order_shuffle_lengths == [3, 3, 4, 4]
 
 
 def test_torch_seed_determinism() -> None:
@@ -309,7 +427,7 @@ def test_mcmc_torch_seed_determinism() -> None:
         num_output_nodes=3,
         trunk_node_in_degrees=[1, 3],
         num_trunk_node_types=2,
-        num_mixing_steps=500,
+        mcmc_passes_per_split_round=3,
     )
     torch.manual_seed(123)
     first = make_random_graph_description(**params)
@@ -337,7 +455,7 @@ def test_mcmc_chain_moves_from_edge_split_seed() -> None:
     moved = False
     for seed in range(20):
         rng = random.Random(seed)
-        raw = _build_edge_split_graph(**params, rng=rng)
+        raw = _build_unmixed_interleaved_graph(**params, rng=rng)
         before = _raw_parent_signature(raw)
         _mcmc_rewire(raw, num_steps=2_000, rng=rng)
         if _raw_parent_signature(raw) != before:
@@ -345,39 +463,6 @@ def test_mcmc_chain_moves_from_edge_split_seed() -> None:
             break
 
     assert moved
-
-
-def test_incremental_tc_path_is_structurally_valid() -> None:
-    params = dict(
-        num_root_nodes=4,
-        num_trunk_nodes=80,
-        num_output_nodes=3,
-        trunk_node_in_degrees=[1, 3],
-        num_trunk_node_types=2,
-    )
-    for seed in range(20):
-        rng = random.Random(seed)
-        raw = _build_edge_split_graph(**params, rng=rng, use_incremental_tc=True)
-        graph = _assemble_edge_split_description(graph=raw, rng=rng, **params)
-        _assert_edge_split_invariants(graph)
-
-
-def test_valid_parent_sampler_is_uniform_over_bruteforce_valid_set() -> None:
-    eligible = [0, 1, 2, 3]
-    forbidden = {2}
-    valid = [node for node in eligible if node not in forbidden]
-    assert valid == [0, 1, 3]
-
-    rng = random.Random(0)
-    counts = {node: 0 for node in eligible}
-    draws = 12_000
-    for _ in range(draws):
-        counts[_sample_valid_parent(eligible, forbidden, rng)] += 1
-
-    expected = draws / len(valid)
-    assert counts[2] == 0
-    for node in valid:
-        assert abs(counts[node] - expected) < expected * 0.08, counts
 
 
 def test_native_flat_arrays_round_trip_when_available() -> None:
@@ -394,7 +479,7 @@ def test_native_flat_arrays_round_trip_when_available() -> None:
     parent_offsets, parent_indices, node_types = _native.generate_random_graph_arrays(
         **params,
         seed=123,
-        num_mixing_steps=200,
+        mcmc_passes_per_split_round=2,
     )
     graph = _description_from_flat_parent_arrays(
         **params,
@@ -408,17 +493,18 @@ def test_native_flat_arrays_round_trip_when_available() -> None:
 
 def main() -> None:
     test_exact_counts_and_degrees()
-    test_invariants_survive_mcmc_mixing()
+    test_invariants_survive_interleaved_mcmc_mixing()
     test_mcmc_rewire_preserves_raw_in_degrees_roles_and_acyclicity()
-    test_edge_split_builder_round_robins_frozen_edges()
-    test_edge_split_builder_shuffles_each_round()
+    test_interleaved_builder_round_robins_frozen_edges()
+    test_interleaved_builder_shuffles_each_split_round()
     test_duplicate_parents_are_accepted()
     test_mcmc_rewire_allows_duplicate_parent_proposals()
+    test_mcmc_rewire_round_robins_target_nodes()
+    test_mcmc_rewire_excludes_inactive_future_trunks()
+    test_interleaved_builder_runs_configured_final_full_size_mcmc_passes()
     test_torch_seed_determinism()
     test_mcmc_torch_seed_determinism()
     test_mcmc_chain_moves_from_edge_split_seed()
-    test_incremental_tc_path_is_structurally_valid()
-    test_valid_parent_sampler_is_uniform_over_bruteforce_valid_set()
     test_native_flat_arrays_round_trip_when_available()
     print("ALL EDGE-SPLIT GENERATION CHECKS PASSED")
 

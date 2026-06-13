@@ -12,6 +12,8 @@ enum Role {
     Leaf,
 }
 
+const DEFAULT_MCMC_PASSES_PER_SPLIT_ROUND: usize = 8;
+
 struct EdgeSplitGraph {
     parents: Vec<Vec<usize>>,
     children: Vec<Vec<usize>>,
@@ -47,88 +49,6 @@ fn replace_first(values: &mut [usize], needle: usize, replacement: usize) -> Res
         .ok_or_else(|| format!("missing edge parent {needle}"))?;
     values[index] = replacement;
     Ok(())
-}
-
-struct DescendantBitsets {
-    words: usize,
-    bits: Vec<u64>,
-    scratch_bits: Vec<u64>,
-    stack: Vec<usize>,
-}
-
-impl DescendantBitsets {
-    fn new(num_nodes: usize) -> Self {
-        let words = num_nodes.div_ceil(u64::BITS as usize);
-        Self {
-            words,
-            bits: vec![0; num_nodes * words],
-            scratch_bits: vec![0; words],
-            stack: Vec::new(),
-        }
-    }
-
-    fn row_start(&self, node: usize) -> usize {
-        node * self.words
-    }
-
-    fn contains(&self, node: usize, descendant: usize) -> bool {
-        let word = descendant / u64::BITS as usize;
-        let bit = descendant % u64::BITS as usize;
-        (self.bits[self.row_start(node) + word] & (1_u64 << bit)) != 0
-    }
-
-    fn set(&mut self, node: usize, descendant: usize) {
-        let word = descendant / u64::BITS as usize;
-        let bit = descendant % u64::BITS as usize;
-        let index = self.row_start(node) + word;
-        self.bits[index] |= 1_u64 << bit;
-    }
-
-    fn clear_row(&mut self, node: usize) {
-        let start = self.row_start(node);
-        self.bits[start..start + self.words].fill(0);
-    }
-
-    fn copy_descendants_with_node_to_scratch(&mut self, node: usize) {
-        let start = self.row_start(node);
-        self.scratch_bits
-            .copy_from_slice(&self.bits[start..start + self.words]);
-        let word = node / u64::BITS as usize;
-        let bit = node % u64::BITS as usize;
-        self.scratch_bits[word] |= 1_u64 << bit;
-    }
-
-    fn copy_scratch_to_row(&mut self, node: usize) {
-        let start = self.row_start(node);
-        self.bits[start..start + self.words].copy_from_slice(&self.scratch_bits);
-    }
-
-    fn set_only_scratch(&mut self, node: usize) {
-        self.scratch_bits.fill(0);
-        let word = node / u64::BITS as usize;
-        let bit = node % u64::BITS as usize;
-        self.scratch_bits[word] = 1_u64 << bit;
-    }
-
-    fn propagate_scratch_to_ancestors(&mut self, parents: &[Vec<usize>], start: usize) {
-        self.stack.clear();
-        self.stack.push(start);
-        while let Some(node) = self.stack.pop() {
-            let row_start = self.row_start(node);
-            let mut added = false;
-            for word in 0..self.words {
-                let index = row_start + word;
-                let combined = self.bits[index] | self.scratch_bits[word];
-                if combined != self.bits[index] {
-                    self.bits[index] = combined;
-                    added = true;
-                }
-            }
-            if added {
-                self.stack.extend(parents[node].iter().copied());
-            }
-        }
-    }
 }
 
 struct ReachScratch {
@@ -206,58 +126,17 @@ impl ReachScratch {
     }
 }
 
-fn sample_valid_parent(
-    eligible: &[usize],
-    descendants: &DescendantBitsets,
-    forbidden_node: usize,
-    rng: &mut StdRng,
-) -> usize {
-    for _ in 0..usize::max(8, eligible.len() * 2) {
-        let candidate = eligible[randrange(rng, eligible.len())];
-        if candidate != forbidden_node && !descendants.contains(forbidden_node, candidate) {
-            return candidate;
-        }
-    }
-
-    let valid_count = eligible
-        .iter()
-        .filter(|candidate| {
-            **candidate != forbidden_node && !descendants.contains(forbidden_node, **candidate)
-        })
-        .count();
-    debug_assert!(valid_count > 0);
-
-    let selected = randrange(rng, valid_count);
-    let mut seen_valid = 0;
-    for candidate in eligible {
-        if *candidate == forbidden_node || descendants.contains(forbidden_node, *candidate) {
-            continue;
-        }
-        if seen_valid == selected {
-            return *candidate;
-        }
-        seen_valid += 1;
-    }
-
-    unreachable!("valid parent count was nonzero");
-}
-
-fn build_edge_split_graph(
+fn initialize_edge_split_graph(
     num_root_nodes: usize,
     num_trunk_nodes: usize,
     num_output_nodes: usize,
-    num_trunk_node_types: usize,
-    trunk_node_in_degrees: &[usize],
     rng: &mut StdRng,
-) -> Result<EdgeSplitGraph, String> {
+) -> EdgeSplitGraph {
     let num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes;
     let mut parents = vec![Vec::new(); num_nodes];
     let mut children = vec![Vec::new(); num_nodes];
     let mut roles = vec![Role::Trunk; num_nodes];
-    let mut trunk_types = vec![None; num_nodes];
-    let mut edges: Vec<(usize, usize)> = Vec::new();
-    let mut eligible: Vec<usize> = (0..num_root_nodes).collect();
-    let mut descendants = DescendantBitsets::new(num_nodes);
+    let trunk_types = vec![None; num_nodes];
 
     for role in roles.iter_mut().take(num_root_nodes) {
         *role = Role::Root;
@@ -270,131 +149,227 @@ fn build_edge_split_graph(
         let root = randrange(rng, num_root_nodes);
         parents[leaf].push(root);
         children[root].push(leaf);
-        edges.push((root, leaf));
-        descendants.set(root, leaf);
     }
 
-    let mut split_idx = 0;
-    while split_idx < num_trunk_nodes {
-        let mut round_edge_indices: Vec<usize> = (0..edges.len()).collect();
-        shuffle(&mut round_edge_indices, rng);
-
-        for edge_idx in round_edge_indices {
-            if split_idx >= num_trunk_nodes {
-                break;
-            }
-
-            let (u, v) = edges[edge_idx];
-            let w = trunk_start + split_idx;
-            let trunk_type = randrange(rng, num_trunk_node_types);
-            trunk_types[w] = Some(trunk_type);
-            let in_degree = trunk_node_in_degrees[trunk_type];
-
-            let extras: Vec<usize> = (0..in_degree.saturating_sub(1))
-                .map(|_| sample_valid_parent(&eligible, &descendants, v, rng))
-                .collect();
-
-            roles[w] = Role::Trunk;
-            remove_first(&mut children[u], v)?;
-            children[u].push(w);
-            replace_first(&mut parents[v], u, w)?;
-            parents[w].push(u);
-            parents[w].extend(extras.iter().copied());
-            children[w].push(v);
-            for extra in &extras {
-                children[*extra].push(w);
-            }
-
-            edges[edge_idx] = (u, w);
-            edges.push((w, v));
-            edges.extend(extras.iter().map(|extra| (*extra, w)));
-
-            descendants.clear_row(w);
-            descendants.copy_descendants_with_node_to_scratch(v);
-            descendants.copy_scratch_to_row(w);
-            descendants.set_only_scratch(w);
-            descendants.propagate_scratch_to_ancestors(&parents, u);
-            descendants.copy_descendants_with_node_to_scratch(w);
-            for extra in &extras {
-                descendants.propagate_scratch_to_ancestors(&parents, *extra);
-            }
-
-            eligible.push(w);
-            split_idx += 1;
-        }
-    }
-
-    Ok(EdgeSplitGraph {
+    EdgeSplitGraph {
         parents,
         children,
         roles,
         trunk_types,
-    })
+    }
 }
 
-fn mcmc_rewire(
+fn active_nodes(
+    num_root_nodes: usize,
+    num_output_nodes: usize,
+    inserted_trunks: usize,
+) -> Vec<usize> {
+    let trunk_start = num_root_nodes + num_output_nodes;
+    let mut nodes = Vec::with_capacity(num_root_nodes + num_output_nodes + inserted_trunks);
+    nodes.extend(0..num_root_nodes);
+    nodes.extend(num_root_nodes..trunk_start);
+    nodes.extend(trunk_start..trunk_start + inserted_trunks);
+    nodes
+}
+
+fn active_nonleaf_nodes(
+    num_root_nodes: usize,
+    num_output_nodes: usize,
+    inserted_trunks: usize,
+) -> Vec<usize> {
+    let trunk_start = num_root_nodes + num_output_nodes;
+    let mut nodes = Vec::with_capacity(num_root_nodes + inserted_trunks);
+    nodes.extend(0..num_root_nodes);
+    nodes.extend(trunk_start..trunk_start + inserted_trunks);
+    nodes
+}
+
+fn active_edges(graph: &EdgeSplitGraph, active_nodes: &[usize]) -> Vec<(usize, usize)> {
+    let mut is_active = vec![false; graph.parents.len()];
+    for node in active_nodes {
+        is_active[*node] = true;
+    }
+
+    let mut edges = Vec::new();
+    for parent in active_nodes {
+        for child in &graph.children[*parent] {
+            if is_active[*child] {
+                edges.push((*parent, *child));
+            }
+        }
+    }
+    edges
+}
+
+fn sample_valid_parent_by_reachability(
+    eligible: &[usize],
+    graph: &EdgeSplitGraph,
+    forbidden_node: usize,
+    reach: &mut ReachScratch,
+    rng: &mut StdRng,
+) -> usize {
+    for _ in 0..usize::max(8, eligible.len() * 2) {
+        let candidate = eligible[randrange(rng, eligible.len())];
+        if !reach.can_reach(
+            &graph.children,
+            &graph.parents,
+            forbidden_node,
+            candidate,
+        ) {
+            return candidate;
+        }
+    }
+
+    let mut valid = Vec::new();
+    for candidate in eligible {
+        if !reach.can_reach(
+            &graph.children,
+            &graph.parents,
+            forbidden_node,
+            *candidate,
+        ) {
+            valid.push(*candidate);
+        }
+    }
+    debug_assert!(!valid.is_empty());
+    valid[randrange(rng, valid.len())]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_active_edge(
     graph: &mut EdgeSplitGraph,
+    edge: (usize, usize),
+    inserted_trunks: usize,
+    num_root_nodes: usize,
+    num_output_nodes: usize,
+    num_trunk_node_types: usize,
+    trunk_node_in_degrees: &[usize],
+    reach: &mut ReachScratch,
+    rng: &mut StdRng,
+) -> Result<(), String> {
+    let (u, v) = edge;
+    let trunk_start = num_root_nodes + num_output_nodes;
+    let w = trunk_start + inserted_trunks;
+    let trunk_type = randrange(rng, num_trunk_node_types);
+    graph.trunk_types[w] = Some(trunk_type);
+    let in_degree = trunk_node_in_degrees[trunk_type];
+    let eligible = active_nonleaf_nodes(num_root_nodes, num_output_nodes, inserted_trunks);
+
+    let extras: Vec<usize> = (0..in_degree.saturating_sub(1))
+        .map(|_| sample_valid_parent_by_reachability(&eligible, graph, v, reach, rng))
+        .collect();
+
+    remove_first(&mut graph.children[u], v)?;
+    graph.children[u].push(w);
+    replace_first(&mut graph.parents[v], u, w)?;
+    graph.parents[w].push(u);
+    graph.parents[w].extend(extras.iter().copied());
+    graph.children[w].push(v);
+    for extra in extras {
+        graph.children[extra].push(w);
+    }
+
+    Ok(())
+}
+
+fn build_interleaved_edge_split_graph(
+    num_root_nodes: usize,
+    num_trunk_nodes: usize,
+    num_output_nodes: usize,
+    num_trunk_node_types: usize,
+    trunk_node_in_degrees: &[usize],
+    mcmc_passes_per_split_round: usize,
+    rng: &mut StdRng,
+) -> Result<EdgeSplitGraph, String> {
+    let mut graph =
+        initialize_edge_split_graph(num_root_nodes, num_trunk_nodes, num_output_nodes, rng);
+    let mut reach = ReachScratch::new(graph.parents.len());
+    let mut inserted_trunks = 0;
+
+    while inserted_trunks < num_trunk_nodes {
+        let active = active_nodes(num_root_nodes, num_output_nodes, inserted_trunks);
+        let mut edges = active_edges(&graph, &active);
+        debug_assert!(!edges.is_empty());
+        shuffle(&mut edges, rng);
+
+        for edge in edges {
+            if inserted_trunks >= num_trunk_nodes {
+                break;
+            }
+            split_active_edge(
+                &mut graph,
+                edge,
+                inserted_trunks,
+                num_root_nodes,
+                num_output_nodes,
+                num_trunk_node_types,
+                trunk_node_in_degrees,
+                &mut reach,
+                rng,
+            )?;
+            inserted_trunks += 1;
+        }
+
+        let active = active_nodes(num_root_nodes, num_output_nodes, inserted_trunks);
+        mcmc_rewire_active(
+            &mut graph,
+            &active,
+            mcmc_passes_per_split_round * active.len(),
+            rng,
+        )?;
+    }
+
+    if num_trunk_nodes == 0 {
+        let active = active_nodes(num_root_nodes, num_output_nodes, 0);
+        mcmc_rewire_active(
+            &mut graph,
+            &active,
+            mcmc_passes_per_split_round * active.len(),
+            rng,
+        )?;
+    }
+
+    Ok(graph)
+}
+
+fn mcmc_rewire_active(
+    graph: &mut EdgeSplitGraph,
+    active_nodes: &[usize],
     num_steps: usize,
     rng: &mut StdRng,
 ) -> Result<(), String> {
-    let nonleaf: Vec<usize> = graph
-        .roles
-        .iter()
-        .enumerate()
-        .filter_map(|(node, role)| (*role != Role::Leaf).then_some(node))
-        .collect();
-    let mut edges: Vec<(usize, usize, usize)> = graph
-        .parents
-        .iter()
-        .enumerate()
-        .flat_map(|(node, parent_list)| {
-            parent_list
-                .iter()
-                .enumerate()
-                .map(move |(parent_slot, parent)| (*parent, node, parent_slot))
-        })
-        .collect();
+    if num_steps == 0 {
+        return Ok(());
+    }
 
-    let edge_count = edges.len();
+    let nonleaf: Vec<usize> = active_nodes
+        .iter()
+        .filter_map(|node| (graph.roles[*node] != Role::Leaf).then_some(*node))
+        .collect();
+    if nonleaf.is_empty() {
+        return Ok(());
+    }
+
     let mut reach = ReachScratch::new(graph.children.len());
+    let mut node_order: Vec<usize> = active_nodes.to_vec();
+    shuffle(&mut node_order, rng);
+    let mut node_order_idx = 0;
 
     for _ in 0..num_steps {
-        if edge_count >= 2 && randrange(rng, 2) == 0 {
-            let first_idx = randrange(rng, edge_count);
-            let mut second_idx = randrange(rng, edge_count - 1);
-            if second_idx >= first_idx {
-                second_idx += 1;
-            }
+        if node_order_idx == node_order.len() {
+            shuffle(&mut node_order, rng);
+            node_order_idx = 0;
+        }
+        let node = node_order[node_order_idx];
+        node_order_idx += 1;
 
-            let (first_parent, first_child, first_parent_slot) = edges[first_idx];
-            let (second_parent, second_child, second_parent_slot) = edges[second_idx];
-
-            if first_child == second_child || first_parent == second_parent {
-                continue;
-            }
-            if first_parent == second_child || second_parent == first_child {
-                continue;
-            }
-
-            if reach.can_reach(&graph.children, &graph.parents, second_child, first_parent)
-                || reach.can_reach(&graph.children, &graph.parents, first_child, second_parent)
-            {
-                continue;
-            }
-
-            remove_first(&mut graph.children[first_parent], first_child)?;
-            remove_first(&mut graph.children[second_parent], second_child)?;
-            edges[first_idx] = (first_parent, second_child, second_parent_slot);
-            edges[second_idx] = (second_parent, first_child, first_parent_slot);
-            graph.parents[first_child][first_parent_slot] = second_parent;
-            graph.parents[second_child][second_parent_slot] = first_parent;
-            graph.children[first_parent].push(second_child);
-            graph.children[second_parent].push(first_child);
+        let parent_count = graph.parents[node].len();
+        if parent_count == 0 {
             continue;
         }
 
-        let edge_idx = randrange(rng, edge_count);
-        let (parent, node, parent_slot) = edges[edge_idx];
+        let parent_slot = randrange(rng, parent_count);
+        let parent = graph.parents[node][parent_slot];
         let new_parent = nonleaf[randrange(rng, nonleaf.len())];
 
         if new_parent == node || new_parent == parent {
@@ -408,7 +383,6 @@ fn mcmc_rewire(
             continue;
         }
 
-        edges[edge_idx] = (new_parent, node, parent_slot);
         graph.parents[node][parent_slot] = new_parent;
         remove_first(&mut graph.children[parent], node)?;
         graph.children[new_parent].push(node);
@@ -523,7 +497,7 @@ fn assemble_graph_arrays(
     trunk_node_in_degrees,
     num_trunk_node_types,
     seed,
-    num_mixing_steps=None
+    mcmc_passes_per_split_round=DEFAULT_MCMC_PASSES_PER_SPLIT_ROUND
 ))]
 fn generate_random_graph_arrays(
     num_root_nodes: usize,
@@ -532,7 +506,7 @@ fn generate_random_graph_arrays(
     trunk_node_in_degrees: Vec<usize>,
     num_trunk_node_types: usize,
     seed: u64,
-    num_mixing_steps: Option<usize>,
+    mcmc_passes_per_split_round: usize,
 ) -> PyResult<(Vec<usize>, Vec<usize>, Vec<usize>)> {
     if trunk_node_in_degrees.len() != num_trunk_node_types {
         return Err(PyValueError::new_err(
@@ -556,18 +530,17 @@ fn generate_random_graph_arrays(
     }
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut graph = build_edge_split_graph(
+    let graph = build_interleaved_edge_split_graph(
         num_root_nodes,
         num_trunk_nodes,
         num_output_nodes,
         num_trunk_node_types,
         &trunk_node_in_degrees,
+        mcmc_passes_per_split_round,
         &mut rng,
     )
     .map_err(PyValueError::new_err)?;
 
-    let steps = num_mixing_steps.unwrap_or(num_trunk_nodes * 8);
-    mcmc_rewire(&mut graph, steps, &mut rng).map_err(PyValueError::new_err)?;
     assemble_graph_arrays(
         &graph,
         num_root_nodes,

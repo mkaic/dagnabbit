@@ -14,8 +14,8 @@ MLP_EXPANSION_FACTOR = 4.0
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 1024
-# None defaults to NUM_TRUNK_NODES in make_random_graph_description.
-NUM_MCMC_MIXING_STEPS: int | None = 20_000
+# Full round-robin MCMC passes over active nodes after each edge-splitting pass.
+MCMC_PASSES_PER_SPLIT_ROUND = 2
 
 # --- training ---
 NUM_STEPS = 1_000_000

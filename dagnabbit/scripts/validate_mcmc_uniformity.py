@@ -13,7 +13,7 @@ from itertools import product
 
 from dagnabbit.dag.description import (
     _EdgeSplitGraph,
-    _build_edge_split_graph,
+    _build_interleaved_edge_split_graph,
     _mcmc_rewire,
 )
 
@@ -145,12 +145,13 @@ def _tiny_uniformity(args: argparse.Namespace) -> None:
         trunk_in_degree=args.tiny_in_degree,
     )
     rng = random.Random(args.seed)
-    raw = _build_edge_split_graph(
+    raw = _build_interleaved_edge_split_graph(
         num_root_nodes=args.tiny_roots,
         num_trunk_nodes=args.tiny_trunks,
         num_output_nodes=args.tiny_outputs,
         num_trunk_node_types=1,
         trunk_node_in_degrees=[args.tiny_in_degree],
+        mcmc_passes_per_split_round=0,
         rng=rng,
     )
 
@@ -194,12 +195,13 @@ def _max_ancestor_fraction(graph: _EdgeSplitGraph) -> float:
 
 def _bias_diagnostic(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
-    raw = _build_edge_split_graph(
+    raw = _build_interleaved_edge_split_graph(
         num_root_nodes=args.scale_roots,
         num_trunk_nodes=args.scale_trunks,
         num_output_nodes=args.scale_outputs,
         num_trunk_node_types=1,
         trunk_node_in_degrees=[args.scale_in_degree],
+        mcmc_passes_per_split_round=0,
         rng=rng,
     )
 
