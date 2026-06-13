@@ -10,7 +10,10 @@ import time
 
 import torch
 
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.description import (
+    _make_random_graph_description_python,
+    make_random_graph_description,
+)
 from dagnabbit.scripts import config as cfg
 
 
@@ -45,7 +48,13 @@ def parse_args() -> argparse.Namespace:
         "--num-mixing-steps",
         type=_optional_int,
         default=cfg.NUM_MCMC_MIXING_STEPS,
-        help="'none' uses num_trunk_nodes, matching make_random_graph_description.",
+        help="'none' uses num_trunk_nodes * 8, matching make_random_graph_description.",
+    )
+    parser.add_argument(
+        "--implementation",
+        choices=["auto", "python"],
+        default="auto",
+        help="'auto' uses the public native-backed wrapper; 'python' forces fallback.",
     )
     parser.add_argument("--warmup-graphs", type=int, default=5)
     parser.add_argument("--min-graphs", type=int, default=20)
@@ -62,6 +71,12 @@ def main() -> None:
         trunk_node_in_degrees = args.trunk_node_in_degrees[0]
     else:
         trunk_node_in_degrees = args.trunk_node_in_degrees
+    if isinstance(trunk_node_in_degrees, int):
+        normalized_trunk_in_degrees = [
+            trunk_node_in_degrees
+        ] * args.num_trunk_node_types
+    else:
+        normalized_trunk_in_degrees = list(trunk_node_in_degrees)
 
     params = dict(
         num_root_nodes=args.num_root_nodes,
@@ -72,14 +87,30 @@ def main() -> None:
         num_mixing_steps=args.num_mixing_steps,
     )
 
+    def make_graph() -> None:
+        if args.implementation == "python":
+            seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+            _make_random_graph_description_python(
+                num_root_nodes=args.num_root_nodes,
+                num_trunk_nodes=args.num_trunk_nodes,
+                num_output_nodes=args.num_output_nodes,
+                trunk_node_in_degrees=normalized_trunk_in_degrees,
+                num_trunk_node_types=args.num_trunk_node_types,
+                num_mixing_steps=args.num_mixing_steps,
+                seed=seed,
+            )
+            return
+
+        make_random_graph_description(**params)
+
     torch.manual_seed(args.seed)
     for _ in range(args.warmup_graphs):
-        make_random_graph_description(**params)
+        make_graph()
 
     count = 0
     start = time.perf_counter()
     while True:
-        make_random_graph_description(**params)
+        make_graph()
         count += 1
         elapsed = time.perf_counter() - start
         if count >= args.min_graphs and elapsed >= args.min_seconds:
@@ -88,10 +119,13 @@ def main() -> None:
     seconds_per_graph = elapsed / count
     graphs_per_second = count / elapsed
     effective_mixing_steps = (
-        args.num_trunk_nodes if args.num_mixing_steps is None else args.num_mixing_steps
+        args.num_trunk_nodes * 8
+        if args.num_mixing_steps is None
+        else args.num_mixing_steps
     )
 
     print("DAG generation benchmark")
+    print(f"  implementation:        {args.implementation}")
     print(f"  seed:                 {args.seed}")
     print(f"  roots:                {args.num_root_nodes}")
     print(f"  trunks:               {args.num_trunk_nodes}")

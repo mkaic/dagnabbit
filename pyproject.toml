@@ -1,3 +1,7 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
 [project]
 name = "dagnabbit"
 version = "0.1.0"
@@ -17,7 +21,12 @@ dependencies = [
     "graphviz==0.21",
     "scikit-learn>=1.8.0",
     "tensorboard>=2.18.0",
+    "maturin>=1.14.0",
 ]
 
 [tool.setuptools.packages.find]
 include = ["dagnabbit*"]
+
+[tool.maturin]
+module-name = "dagnabbit._native"
+python-source = "."

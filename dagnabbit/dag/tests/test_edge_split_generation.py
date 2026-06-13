@@ -15,7 +15,9 @@ from dagnabbit.dag.description import (
     _EdgeSplitRole,
     _assemble_edge_split_description,
     _build_edge_split_graph,
+    _description_from_flat_parent_arrays,
     _mcmc_rewire,
+    _native,
     _sample_valid_parent,
     make_random_graph_description,
 )
@@ -172,6 +174,60 @@ def test_mcmc_rewire_preserves_raw_in_degrees_roles_and_acyclicity() -> None:
     _assert_raw_acyclic(raw)
 
 
+class _FirstChoiceRng:
+    def randrange(self, stop: int) -> int:
+        assert stop > 0
+        return 0
+
+    def choice(self, seq: list[int]) -> int:
+        assert seq
+        return seq[0]
+
+    def shuffle(self, seq: list[int]) -> None:
+        return
+
+
+class _ReverseShuffleRng(_FirstChoiceRng):
+    def shuffle(self, seq: list[int]) -> None:
+        seq.reverse()
+
+
+def test_edge_split_builder_round_robins_frozen_edges() -> None:
+    raw = _build_edge_split_graph(
+        num_root_nodes=1,
+        num_trunk_nodes=4,
+        num_output_nodes=3,
+        num_trunk_node_types=1,
+        trunk_node_in_degrees=[1],
+        rng=_FirstChoiceRng(),  # type: ignore[arg-type]
+    )
+
+    # The first round sees the three initial root->output edges and splits each
+    # once; the fourth split starts a refreshed round at the first updated edge.
+    assert [raw.parents[leaf][0] for leaf in (1, 2, 3)] == [4, 5, 6]
+    assert raw.parents[4] == [7]
+    assert raw.parents[5] == [0]
+    assert raw.parents[6] == [0]
+    assert raw.parents[7] == [0]
+    _assert_raw_parent_child_multisets(raw)
+    _assert_raw_acyclic(raw)
+
+
+def test_edge_split_builder_shuffles_each_round() -> None:
+    raw = _build_edge_split_graph(
+        num_root_nodes=1,
+        num_trunk_nodes=3,
+        num_output_nodes=3,
+        num_trunk_node_types=1,
+        trunk_node_in_degrees=[1],
+        rng=_ReverseShuffleRng(),  # type: ignore[arg-type]
+    )
+
+    assert [raw.parents[leaf][0] for leaf in (1, 2, 3)] == [6, 5, 4]
+    _assert_raw_parent_child_multisets(raw)
+    _assert_raw_acyclic(raw)
+
+
 def test_duplicate_parents_are_accepted() -> None:
     torch.manual_seed(0)
     graph = make_random_graph_description(
@@ -324,10 +380,38 @@ def test_valid_parent_sampler_is_uniform_over_bruteforce_valid_set() -> None:
         assert abs(counts[node] - expected) < expected * 0.08, counts
 
 
+def test_native_flat_arrays_round_trip_when_available() -> None:
+    if _native is None:
+        return
+
+    params = dict(
+        num_root_nodes=4,
+        num_trunk_nodes=40,
+        num_output_nodes=3,
+        trunk_node_in_degrees=[1, 3],
+        num_trunk_node_types=2,
+    )
+    parent_offsets, parent_indices, node_types = _native.generate_random_graph_arrays(
+        **params,
+        seed=123,
+        num_mixing_steps=200,
+    )
+    graph = _description_from_flat_parent_arrays(
+        **params,
+        parent_offsets=parent_offsets,
+        parent_indices=parent_indices,
+        node_types=node_types,
+    )
+
+    _assert_edge_split_invariants(graph)
+
+
 def main() -> None:
     test_exact_counts_and_degrees()
     test_invariants_survive_mcmc_mixing()
     test_mcmc_rewire_preserves_raw_in_degrees_roles_and_acyclicity()
+    test_edge_split_builder_round_robins_frozen_edges()
+    test_edge_split_builder_shuffles_each_round()
     test_duplicate_parents_are_accepted()
     test_mcmc_rewire_allows_duplicate_parent_proposals()
     test_torch_seed_determinism()
@@ -335,6 +419,7 @@ def main() -> None:
     test_mcmc_chain_moves_from_edge_split_seed()
     test_incremental_tc_path_is_structurally_valid()
     test_valid_parent_sampler_is_uniform_over_bruteforce_valid_set()
+    test_native_flat_arrays_round_trip_when_available()
     print("ALL EDGE-SPLIT GENERATION CHECKS PASSED")
 
 
