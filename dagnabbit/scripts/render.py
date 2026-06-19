@@ -8,11 +8,11 @@ from dagnabbit.dag.render import render_dag
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Render a random edge-splitting DAG."
+        description="Render a random fixed-in-degree DAG."
     )
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--num-root-nodes", type=int, default=8)
-    parser.add_argument("--num-trunk-nodes", type=int, default=128)
+    parser.add_argument("--num-root-nodes", type=int, default=4)
+    parser.add_argument("--num-trunk-nodes", type=int, default=32)
     parser.add_argument("--num-output-nodes", type=int, default=4)
     parser.add_argument("--trunk-node-in-degrees", type=int, default=2)
     parser.add_argument("--num-trunk-node-types", type=int, default=2)

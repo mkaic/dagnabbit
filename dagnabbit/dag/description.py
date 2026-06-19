@@ -1,3 +1,4 @@
+import random
 from dataclasses import dataclass
 from enum import Enum
 
@@ -247,26 +248,161 @@ def make_random_graph_description(
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
-    """Generate a random DAG with exact root, trunk, and output-node counts.
+    """Generate a random fixed-in-degree DAG via two-pass construction (Algorithm A).
 
-    The previous edge-splitting + MCMC generator (and its Rust port) has been
-    removed; this is the clean seam where the new sampler will live. It must
-    return a :class:`FixedInDegreeDAGDescription` whose node arrays satisfy the
-    representation's invariants:
+    1. Lay nodes out in topological order: ``num_root_nodes`` roots (in-degree
+       0), then ``num_trunk_nodes`` trunk nodes each with a random type (its
+       type fixes its in-degree), then ``num_output_nodes`` outputs (in-degree
+       1). A consumer's input slots may only point at strictly earlier nodes, so
+       the graph is acyclic by construction.
+    2. **Coverage pass** (producers walked latest-first): every root and trunk
+       must end up with at least one child. Each still-childless producer is
+       wired into one open input slot of a randomly chosen *later* consumer.
+       Walking latest-first claims the scarce late slots before the plentiful
+       early ones.
+    3. **Fill pass**: every still-open input slot is filled with a random
+       *earlier* producer, distinct from that consumer's existing parents.
 
-    - ``num_root_nodes`` roots first (in-degree 0), then ``num_trunk_nodes``
-      trunk nodes, then ``num_output_nodes`` outputs (in-degree 1), all in
-      topological order (every node references only earlier indices).
-    - Each trunk node's in-degree matches its type's entry in
-      ``trunk_node_in_degrees``; trunk types are drawn from
-      ``[0, num_trunk_node_types)``.
+    Because the only sinks are outputs, "every trunk is an ancestor of some
+    output" is equivalent to "every trunk has a child", which the coverage pass
+    enforces locally. Full coverage of *all* producers (roots included) is
+    guaranteed for any random type assignment as long as there are enough
+    downstream slots::
 
-    See the conversation notes for the two candidate algorithms to implement
-    here: (A) forward straight-line construction with coverage repair, and
-    (B) exactly-uniform sampling via the recursive method / Boltzmann samplers.
+        num_root_nodes <= num_trunk_nodes * (min_in_degree - 1) + num_output_nodes
+
+    (the worst case is every trunk taking the smallest in-degree). Since a
+    producer can only be consumed by strictly-later nodes, the producer->slot
+    neighbourhoods are nested, so the latest-first greedy assignment saturates
+    whenever that inequality holds; it is asserted up front. The resulting
+    distribution is the natural generative model (not uniform over all such
+    DAGs), but it is O(edges) and respects every count / in-degree / coverage
+    constraint exactly.
     """
-    raise NotImplementedError(
-        "random DAG generation has been removed; implement the new sampler here"
+    if isinstance(trunk_node_in_degrees, int):
+        trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
+    else:
+        trunk_node_in_degrees = list(trunk_node_in_degrees)
+
+    assert len(trunk_node_in_degrees) == num_trunk_node_types
+    assert all(in_degree >= 1 for in_degree in trunk_node_in_degrees)
+    assert num_root_nodes >= 1
+    assert num_output_nodes >= 1
+    assert num_trunk_node_types >= 1
+    if num_trunk_nodes > 0:
+        # The earliest trunk can draw distinct inputs only from the roots, so
+        # there must be at least max-in-degree of them for every gate to be
+        # given distinct parents.
+        assert num_root_nodes >= max(trunk_node_in_degrees), (
+            "num_root_nodes must be >= the largest trunk in-degree so every "
+            "gate can be given distinct inputs"
+        )
+
+    # Coverage feasibility: with every trunk at the smallest possible in-degree,
+    # the downstream input slots must still outnumber the producers enough to
+    # give each root (and trunk) a child. See the docstring for the derivation.
+    min_in_degree = min(trunk_node_in_degrees)
+    max_coverable_roots = num_trunk_nodes * (min_in_degree - 1) + num_output_nodes
+    assert num_root_nodes <= max_coverable_roots, (
+        f"to guarantee every root is used, need num_root_nodes "
+        f"({num_root_nodes}) <= num_trunk_nodes * (min_in_degree - 1) + "
+        f"num_output_nodes ({num_trunk_nodes} * {min_in_degree - 1} + "
+        f"{num_output_nodes} = {max_coverable_roots}); add trunk nodes "
+        "(ideally with in-degree > 1) or output nodes"
+    )
+
+    seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+    rng = random.Random(seed)
+
+    num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
+    output_start = num_root_nodes + num_trunk_nodes
+
+    # Node types and per-node input-slot count (the node's in-degree).
+    node_types = [0] * num_nodes
+    in_degrees = [0] * num_nodes
+    for root_idx in range(num_root_nodes):
+        # root_node_types_start (== num_trunk_node_types) + slot.
+        node_types[root_idx] = num_trunk_node_types + root_idx
+    for trunk_offset in range(num_trunk_nodes):
+        node_idx = num_root_nodes + trunk_offset
+        trunk_type = rng.randrange(num_trunk_node_types)
+        node_types[node_idx] = trunk_type
+        in_degrees[node_idx] = trunk_node_in_degrees[trunk_type]
+    for output_offset in range(num_output_nodes):
+        node_idx = output_start + output_offset
+        # output_node_types_start (== num_trunk_node_types + num_root_nodes) + slot.
+        node_types[node_idx] = num_trunk_node_types + num_root_nodes + output_offset
+        in_degrees[node_idx] = 1
+
+    # Input slots per node; ``None`` marks an unfilled slot. Roots have none.
+    parents: list[list[int | None]] = [
+        [None] * in_degrees[node_idx] for node_idx in range(num_nodes)
+    ]
+    # A producer (root or trunk) is "used" once some consumer slot points at it.
+    has_child = [False] * num_nodes
+
+    def open_slot(consumer: int) -> int | None:
+        for slot, value in enumerate(parents[consumer]):
+            if value is None:
+                return slot
+        return None
+
+    # Pass 1 -- coverage. Producers (roots + trunks) processed latest-first.
+    for producer in range(output_start - 1, -1, -1):
+        if has_child[producer]:
+            continue
+        candidates = [
+            consumer
+            for consumer in range(producer + 1, num_nodes)
+            if open_slot(consumer) is not None and producer not in parents[consumer]
+        ]
+        # The feasibility precondition guarantees a later open slot always
+        # exists here; this is a defensive safety net.
+        assert candidates, f"coverage failed for producer {producer} (internal bug)"
+        consumer = rng.choice(candidates)
+        slot = open_slot(consumer)
+        assert slot is not None
+        parents[consumer][slot] = producer
+        has_child[producer] = True
+
+    # Pass 2 -- fill every remaining slot with a random earlier producer.
+    for consumer in range(num_root_nodes, num_nodes):
+        for slot in range(len(parents[consumer])):
+            if parents[consumer][slot] is not None:
+                continue
+            existing = {value for value in parents[consumer] if value is not None}
+            # Every node before ``output_start`` is a producer, and a consumer
+            # may only reference strictly earlier nodes.
+            pool = [
+                candidate
+                for candidate in range(min(consumer, output_start))
+                if candidate not in existing
+            ]
+            chosen = rng.choice(pool)
+            parents[consumer][slot] = chosen
+            has_child[chosen] = True
+
+    assert all(has_child[p] for p in range(output_start)), "uncovered producer remains"
+
+    # Shuffle each consumer's parent order to erase the slot-position artifact
+    # left by the two passes, then hand the flat arrays to the representation.
+    node_inputs_indices: list[list[int]] = []
+    for node_idx in range(num_nodes):
+        slot_values = parents[node_idx]
+        assert all(value is not None for value in slot_values)
+        ordered_parents: list[int] = [value for value in slot_values if value is not None]
+        if node_idx >= num_root_nodes:
+            rng.shuffle(ordered_parents)
+        node_inputs_indices.append(ordered_parents)
+
+    return FixedInDegreeDAGDescription(
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        num_trunk_node_types=num_trunk_node_types,
+        trunk_node_in_degrees=trunk_node_in_degrees,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
     )
 
 
