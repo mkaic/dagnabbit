@@ -2,18 +2,18 @@ import torch
 import math
 
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 128
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
-NUM_OUTPUT_NODES = 8
+NUM_OUTPUT_NODES = 32
 # Number of hidden layers in every MLP (encoders, decoders, type predictor).
 MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
 MLP_EXPANSION_FACTOR = 4.0
 
 # --- DAG sampling ---
-NUM_TRUNK_NODES = 1024
+NUM_TRUNK_NODES = 128
 
 # --- training ---
 NUM_STEPS = 1_000_000
@@ -49,8 +49,8 @@ W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
 
 # parent-reconstruction (per-edge: predicted parent vs true encode embedding)
-W_PRIMARY_PARENT_RECONSTRUCTION = 1.0
-W_TF_PRIMARY_PARENT_RECONSTRUCTION = 1.0
+W_PRIMARY_PARENT_RECONSTRUCTION = 0.0
+W_TF_PRIMARY_PARENT_RECONSTRUCTION = 0.0
 # parent-consistency (per-parent agreement among child predictions); opt-in
 W_PRIMARY_PARENT_CONSISTENCY = 1.0
 W_TF_PRIMARY_PARENT_CONSISTENCY = 1.0

@@ -3,8 +3,6 @@ from enum import Enum
 
 import torch
 
-NodeInputIndices = list[int]
-
 
 class NodeSupertype(Enum):
     """Module-level role of a node, used as a batch key for grouped evaluation."""
@@ -150,10 +148,11 @@ class FixedInDegreeDAGDescription:
         other node. Output nodes are guaranteed to be leaves. Returns array
         indices of all leaf nodes as a sorted list of integers.
         """
-        referenced: set[int] = set()
+        referenced = [False] * self.num_nodes
         for inputs in self.node_inputs_indices:
-            referenced.update(inputs)
-        return sorted(n for n in range(self.num_nodes) if n not in referenced)
+            for parent in inputs:
+                referenced[parent] = True
+        return [n for n, is_referenced in enumerate(referenced) if not is_referenced]
 
     def compute_node_ranks(self) -> list[int]:
         """Longest-path depth of each node (roots are rank 0).
@@ -164,8 +163,10 @@ class FixedInDegreeDAGDescription:
         """
         ranks = [0] * self.num_nodes
         for node_idx in range(self.num_root_nodes, self.num_nodes):
-            parents = self.node_inputs_indices[node_idx]
-            ranks[node_idx] = 1 + max((ranks[p] for p in parents), default=0)
+            parent_rank = 0
+            for parent in self.node_inputs_indices[node_idx]:
+                parent_rank = max(parent_rank, ranks[parent])
+            ranks[node_idx] = parent_rank + 1
         return ranks
 
     def build_rank_groups(self) -> list[list[RankGroup]]:
@@ -187,20 +188,22 @@ class FixedInDegreeDAGDescription:
         nodes_by_rank_and_key: list[dict[tuple, list[int]]] = [
             {} for _ in range(max_rank + 1)
         ]
-        for node_idx, (subtype, rank) in enumerate(
-            zip(self.node_types, self.node_ranks)
-        ):
-            supertype = subtype_to_supertype(
-                subtype,
-                num_trunk_node_types=self.num_trunk_node_types,
-                num_root_nodes=self.num_root_nodes,
-                num_output_nodes=self.num_output_nodes,
-            )
-            # Trunk types live at the start of the type space, so the raw subtype
-            # is already the trunk-local subtype; use it directly to split trunk
-            # groups (each trunk type has its own module + in-degree). Roots and
-            # outputs collapse into one group per supertype.
-            trunk_subtype = subtype if supertype is NodeSupertype.TRUNK else None
+        output_start = self.num_root_nodes + self.num_trunk_nodes
+        for node_idx, rank in enumerate(self.node_ranks):
+            if node_idx < self.num_root_nodes:
+                supertype = NodeSupertype.ROOT
+                trunk_subtype = None
+            elif node_idx < output_start:
+                supertype = NodeSupertype.TRUNK
+                # Trunk types live at the start of the type space, so the raw
+                # subtype is already the trunk-local subtype; use it directly to
+                # split trunk groups (each trunk type has its own module +
+                # in-degree). Roots and outputs collapse into one group per
+                # supertype.
+                trunk_subtype = self.node_types[node_idx]
+            else:
+                supertype = NodeSupertype.OUTPUT
+                trunk_subtype = None
             key = (supertype, trunk_subtype)
             nodes_by_rank_and_key[rank].setdefault(key, []).append(node_idx)
 
@@ -244,59 +247,78 @@ def make_random_graph_description(
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
-    """
-    Generate a random DAG where each trunk node can reference any previous
-    node (root or trunk). Each output node is guaranteed to be a leaf and
-    has exactly one input sampled from any previously emitted node (root or
-    trunk).
-    """
-    if isinstance(trunk_node_in_degrees, int):
-        trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
+    """Generate a random DAG with exact root, trunk, and output-node counts.
 
-    trunk_node_types = torch.randint(
-        0, num_trunk_node_types, (num_trunk_nodes,), dtype=torch.uint8
-    ).tolist()
+    The previous edge-splitting + MCMC generator (and its Rust port) has been
+    removed; this is the clean seam where the new sampler will live. It must
+    return a :class:`FixedInDegreeDAGDescription` whose node arrays satisfy the
+    representation's invariants:
 
-    max_in_degree = max(trunk_node_in_degrees)
-    max_allowed_node_indices = (
-        torch.arange(num_trunk_nodes, dtype=torch.int32) + num_root_nodes
+    - ``num_root_nodes`` roots first (in-degree 0), then ``num_trunk_nodes``
+      trunk nodes, then ``num_output_nodes`` outputs (in-degree 1), all in
+      topological order (every node references only earlier indices).
+    - Each trunk node's in-degree matches its type's entry in
+      ``trunk_node_in_degrees``; trunk types are drawn from
+      ``[0, num_trunk_node_types)``.
+
+    See the conversation notes for the two candidate algorithms to implement
+    here: (A) forward straight-line construction with coverage repair, and
+    (B) exactly-uniform sampling via the recursive method / Boltzmann samplers.
+    """
+    raise NotImplementedError(
+        "random DAG generation has been removed; implement the new sampler here"
     )
 
-    noise = torch.rand(max_in_degree, num_trunk_nodes, dtype=torch.float32)
-    trunk_all_indices = (noise * max_allowed_node_indices.float()).floor().int()
 
-    node_inputs_indices: list[list[int]] = []
+def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:
+    """Return bottom-up structural ids for every node in topological order."""
+    canonical_ids: list[tuple] = []
+    memo: dict[tuple, tuple] = {}
 
-    for _ in range(num_root_nodes):
-        node_inputs_indices.append([])
+    def intern(key: tuple) -> tuple:
+        existing = memo.get(key)
+        if existing is not None:
+            return existing
+        memo[key] = key
+        return key
 
-    for i in range(num_trunk_nodes):
-        node_in_degree = trunk_node_in_degrees[trunk_node_types[i]]
-        node_inputs_indices.append(trunk_all_indices[:node_in_degree, i].tolist())
+    for node_idx, node_type in enumerate(graph.node_types):
+        supertype = subtype_to_supertype(
+            node_type,
+            num_trunk_node_types=graph.num_trunk_node_types,
+            num_root_nodes=graph.num_root_nodes,
+            num_output_nodes=graph.num_output_nodes,
+        )
+        if supertype is NodeSupertype.ROOT:
+            root_slot = node_type - graph.root_node_types_start
+            canonical_ids.append(intern(("root", root_slot)))
+        elif supertype is NodeSupertype.TRUNK:
+            parent_ids = tuple(
+                canonical_ids[p] for p in graph.node_inputs_indices[node_idx]
+            )
+            canonical_ids.append(intern(("trunk", node_type, parent_ids)))
+        else:
+            output_slot = node_type - graph.output_node_types_start
+            parent_ids = tuple(
+                canonical_ids[p] for p in graph.node_inputs_indices[node_idx]
+            )
+            canonical_ids.append(intern(("output", output_slot, parent_ids)))
 
-    num_candidate_inputs = num_root_nodes + num_trunk_nodes
-    if num_output_nodes > 0:
-        assert num_candidate_inputs > 0
-        output_inputs = torch.randint(
-            0, num_candidate_inputs, (num_output_nodes,), dtype=torch.int32
-        ).tolist()
-        for idx in output_inputs:
-            node_inputs_indices.append([idx])
+    return canonical_ids
 
-    root_node_types_start = num_trunk_node_types
-    output_node_types_start = num_trunk_node_types + num_root_nodes
-    node_types: list[int] = (
-        [root_node_types_start + i for i in range(num_root_nodes)]
-        + trunk_node_types
-        + [output_node_types_start + i for i in range(num_output_nodes)]
-    )
 
-    return FixedInDegreeDAGDescription(
-        num_root_nodes=num_root_nodes,
-        num_trunk_nodes=num_trunk_nodes,
-        num_output_nodes=num_output_nodes,
-        num_trunk_node_types=num_trunk_node_types,
-        trunk_node_in_degrees=trunk_node_in_degrees,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
+def graphs_match(
+    a: FixedInDegreeDAGDescription,
+    b: FixedInDegreeDAGDescription,
+) -> bool:
+    """Compare graphs by ordered output canonical ids, ignoring dead nodes."""
+    if a.num_output_nodes != b.num_output_nodes:
+        return False
+
+    a_ids = canonicalize(a)
+    b_ids = canonicalize(b)
+    a_output_start = a.num_root_nodes + a.num_trunk_nodes
+    b_output_start = b.num_root_nodes + b.num_trunk_nodes
+    return tuple(a_ids[a_output_start : a_output_start + a.num_output_nodes]) == tuple(
+        b_ids[b_output_start : b_output_start + b.num_output_nodes]
     )
