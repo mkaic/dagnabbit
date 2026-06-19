@@ -6,13 +6,13 @@ TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
 NUM_OUTPUT_NODES = 8
-# Number of hidden layers in the node-type predictor MLP.
+# Fallback transformer layer count when TRANSFORMER_NUM_LAYERS is None.
 MLP_DEPTH = 2
-# Hidden-layer width as a multiplicative expansion factor of each MLP/transformer
+# Hidden-layer width as a multiplicative expansion factor of each transformer
 # feed-forward input dim.
-MLP_EXPANSION_FACTOR = 12.0
+MLP_EXPANSION_FACTOR = 4.0
 # Shared residual-free transformer settings for the encoder and decoder.
-TRANSFORMER_NUM_LAYERS = 4
+TRANSFORMER_NUM_LAYERS = 2
 # Number of expanded hidden layers inside each transformer feed-forward MLP.
 TRANSFORMER_MLP_DEPTH = 1
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
@@ -29,7 +29,7 @@ LEARNING_RATE = 1e-3
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = None
+GRADIENT_CLIP_MAX_NORM = 1.0
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
