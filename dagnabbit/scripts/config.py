@@ -27,7 +27,7 @@ LEARNING_RATE = 1e-3
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 1.0
+GRADIENT_CLIP_MAX_NORM = None
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
