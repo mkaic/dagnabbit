@@ -233,7 +233,6 @@ def main() -> None:
                 num_output_nodes=cfg.NUM_OUTPUT_NODES,
                 trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
                 num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-                mcmc_passes_per_split_round=cfg.MCMC_PASSES_PER_SPLIT_ROUND,
             )
 
             losses = model.training_forward(graph)

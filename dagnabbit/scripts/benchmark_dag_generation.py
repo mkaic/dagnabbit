@@ -10,10 +10,7 @@ import time
 
 import torch
 
-from dagnabbit.dag.description import (
-    _make_random_graph_description_python,
-    make_random_graph_description,
-)
+from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
 
 
@@ -38,18 +35,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=cfg.NUM_TRUNK_NODE_TYPES,
     )
-    parser.add_argument(
-        "--mcmc-passes-per-split-round",
-        type=int,
-        default=cfg.MCMC_PASSES_PER_SPLIT_ROUND,
-        help="Full round-robin MCMC passes over active nodes after each split pass.",
-    )
-    parser.add_argument(
-        "--implementation",
-        choices=["auto", "python"],
-        default="auto",
-        help="'auto' uses the public native-backed wrapper; 'python' forces fallback.",
-    )
     parser.add_argument("--warmup-graphs", type=int, default=5)
     parser.add_argument("--min-graphs", type=int, default=20)
     parser.add_argument("--min-seconds", type=float, default=5.0)
@@ -65,12 +50,6 @@ def main() -> None:
         trunk_node_in_degrees = args.trunk_node_in_degrees[0]
     else:
         trunk_node_in_degrees = args.trunk_node_in_degrees
-    if isinstance(trunk_node_in_degrees, int):
-        normalized_trunk_in_degrees = [
-            trunk_node_in_degrees
-        ] * args.num_trunk_node_types
-    else:
-        normalized_trunk_in_degrees = list(trunk_node_in_degrees)
 
     params = dict(
         num_root_nodes=args.num_root_nodes,
@@ -78,23 +57,9 @@ def main() -> None:
         num_output_nodes=args.num_output_nodes,
         trunk_node_in_degrees=trunk_node_in_degrees,
         num_trunk_node_types=args.num_trunk_node_types,
-        mcmc_passes_per_split_round=args.mcmc_passes_per_split_round,
     )
 
     def make_graph() -> None:
-        if args.implementation == "python":
-            seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
-            _make_random_graph_description_python(
-                num_root_nodes=args.num_root_nodes,
-                num_trunk_nodes=args.num_trunk_nodes,
-                num_output_nodes=args.num_output_nodes,
-                trunk_node_in_degrees=normalized_trunk_in_degrees,
-                num_trunk_node_types=args.num_trunk_node_types,
-                mcmc_passes_per_split_round=args.mcmc_passes_per_split_round,
-                seed=seed,
-            )
-            return
-
         make_random_graph_description(**params)
 
     torch.manual_seed(args.seed)
@@ -113,14 +78,12 @@ def main() -> None:
     seconds_per_graph = elapsed / count
     graphs_per_second = count / elapsed
     print("DAG generation benchmark")
-    print(f"  implementation:        {args.implementation}")
     print(f"  seed:                 {args.seed}")
     print(f"  roots:                {args.num_root_nodes}")
     print(f"  trunks:               {args.num_trunk_nodes}")
     print(f"  outputs:              {args.num_output_nodes}")
     print(f"  trunk types:          {args.num_trunk_node_types}")
     print(f"  trunk in-degrees:     {trunk_node_in_degrees}")
-    print(f"  mcmc passes/round:    {args.mcmc_passes_per_split_round}")
     print(f"  warmup graphs:        {args.warmup_graphs}")
     print(f"  measured graphs:      {count}")
     print(f"  elapsed seconds:      {elapsed:.6f}")
