@@ -77,6 +77,20 @@ def _mlp_dims(
     return [in_dim] + [hidden_width] * mlp_depth + [out_dim]
 
 
+def _feed_forward_layers(
+    vector_dims: Iterable[int],
+    dropout: float,
+) -> list[nn.Module]:
+    vector_dims = list(vector_dims)
+    layers: list[nn.Module] = []
+    for i in range(len(vector_dims) - 1):
+        layers.append(nn.Linear(vector_dims[i], vector_dims[i + 1]))
+        if i + 1 < len(vector_dims) - 1:
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+    return layers
+
+
 class ResidualFreeTransformerBlock(nn.Module):
     """Self-attention + MLP block with replacement updates, not residual adds."""
 
@@ -84,10 +98,13 @@ class ResidualFreeTransformerBlock(nn.Module):
         self,
         node_embedding_dim: int,
         num_heads: int,
+        mlp_depth: int,
         mlp_expansion_factor: float,
         dropout: float,
     ):
         super().__init__()
+        if mlp_depth < 0:
+            raise ValueError("mlp_depth must be non-negative")
         hidden_dim = max(1, round(node_embedding_dim * mlp_expansion_factor))
         self.attn_norm = nn.LayerNorm(node_embedding_dim)
         self.attn = nn.MultiheadAttention(
@@ -98,10 +115,12 @@ class ResidualFreeTransformerBlock(nn.Module):
         )
         self.post_attn_norm = nn.LayerNorm(node_embedding_dim)
         self.ff = nn.Sequential(
-            nn.Linear(node_embedding_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, node_embedding_dim),
+            *_feed_forward_layers(
+                [node_embedding_dim]
+                + [hidden_dim] * mlp_depth
+                + [node_embedding_dim],
+                dropout,
+            )
         )
         self.ff_norm = nn.LayerNorm(node_embedding_dim)
 
@@ -134,6 +153,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
         num_layers: int,
         num_register_tokens: int,
         num_heads: int,
+        mlp_depth: int,
         mlp_expansion_factor: float,
         dropout: float = 0.0,
     ):
@@ -144,12 +164,15 @@ class TypeConditionedSequenceTransformer(nn.Module):
             raise ValueError("num_layers must be positive")
         if num_register_tokens < 0:
             raise ValueError("num_register_tokens must be non-negative")
+        if mlp_depth < 0:
+            raise ValueError("mlp_depth must be non-negative")
         if node_embedding_dim % num_heads != 0:
             raise ValueError("node_embedding_dim must be divisible by num_heads")
 
         self.node_embedding_dim = node_embedding_dim
         self.max_context_length = max_context_length
         self.num_register_tokens = num_register_tokens
+        self.mlp_depth = mlp_depth
         self.position_embeddings = nn.Parameter(
             torch.empty(max_context_length, node_embedding_dim)
         )
@@ -162,6 +185,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
                 ResidualFreeTransformerBlock(
                     node_embedding_dim=node_embedding_dim,
                     num_heads=num_heads,
+                    mlp_depth=mlp_depth,
                     mlp_expansion_factor=mlp_expansion_factor,
                     dropout=dropout,
                 )
@@ -338,6 +362,7 @@ class DagnabbitAutoEncoder(nn.Module):
         mlp_expansion_factor: float,
         reconstruction_detach_target: bool = True,
         transformer_num_layers: int | None = None,
+        transformer_mlp_depth: int = 1,
         transformer_num_register_tokens: int = 2,
         transformer_num_heads: int = 4,
         transformer_dropout: float = 0.0,
@@ -363,6 +388,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.transformer_num_layers = (
             mlp_depth if transformer_num_layers is None else transformer_num_layers
         )
+        self.transformer_mlp_depth = transformer_mlp_depth
         self.transformer_num_register_tokens = transformer_num_register_tokens
         self.transformer_num_heads = transformer_num_heads
         self.transformer_dropout = transformer_dropout
@@ -379,6 +405,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 num_layers=self.transformer_num_layers,
                 num_register_tokens=transformer_num_register_tokens,
                 num_heads=transformer_num_heads,
+                mlp_depth=transformer_mlp_depth,
                 mlp_expansion_factor=mlp_expansion_factor,
                 dropout=transformer_dropout,
             )
@@ -391,6 +418,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 num_layers=self.transformer_num_layers,
                 num_register_tokens=transformer_num_register_tokens,
                 num_heads=transformer_num_heads,
+                mlp_depth=transformer_mlp_depth,
                 mlp_expansion_factor=mlp_expansion_factor,
                 dropout=transformer_dropout,
             )

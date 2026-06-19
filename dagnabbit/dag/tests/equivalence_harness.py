@@ -66,6 +66,7 @@ def run_and_normalize(seed: int) -> dict:
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,

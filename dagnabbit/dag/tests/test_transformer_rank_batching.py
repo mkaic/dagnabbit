@@ -46,6 +46,7 @@ def _build_model() -> DagnabbitAutoEncoder:
         mlp_depth=1,
         mlp_expansion_factor=2.0,
         transformer_num_layers=2,
+        transformer_mlp_depth=1,
         transformer_num_register_tokens=2,
         transformer_num_heads=4,
     )
@@ -102,3 +103,29 @@ def test_mixed_type_rank_uses_one_shared_transformer_call() -> None:
     # single shared decoder call, producing max_indegree slots and scattering
     # only each node's valid parent slots.
     assert ([0, 1, 0, 1], [1, 2, 1, 2]) in decoder_calls
+
+
+def test_transformer_mlp_depth_controls_expanded_layers() -> None:
+    model = DagnabbitAutoEncoder(
+        node_embedding_dim=16,
+        trunk_node_type_in_degrees=[1, 2],
+        num_trunk_node_types=2,
+        num_root_nodes=2,
+        num_output_nodes=1,
+        mlp_depth=1,
+        mlp_expansion_factor=2.0,
+        transformer_num_layers=1,
+        transformer_mlp_depth=3,
+        transformer_num_register_tokens=2,
+        transformer_num_heads=4,
+    )
+
+    block = model.node_encoder.sequence_transformer.blocks[0]
+    linears = [module for module in block.ff if isinstance(module, torch.nn.Linear)]
+
+    assert [(layer.in_features, layer.out_features) for layer in linears] == [
+        (16, 32),
+        (32, 32),
+        (32, 32),
+        (32, 16),
+    ]

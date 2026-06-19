@@ -13,6 +13,8 @@ MLP_DEPTH = 2
 MLP_EXPANSION_FACTOR = 12.0
 # Shared residual-free transformer settings for the encoder and decoder.
 TRANSFORMER_NUM_LAYERS = 4
+# Number of expanded hidden layers inside each transformer feed-forward MLP.
+TRANSFORMER_MLP_DEPTH = 1
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_DROPOUT = 0.0
