@@ -1,3 +1,10 @@
+"""Render a random fixed-in-degree DAG to ``dag_primary.png`` in the repo root.
+
+Example:
+
+    uv run python -m dagnabbit.scripts.render --seed 7 --roots 4 --trunks 32 --outputs 4
+"""
+
 import argparse
 
 import torch
@@ -7,34 +14,27 @@ from dagnabbit.dag.render import render_dag
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Render a random fixed-in-degree DAG."
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--num-root-nodes", type=int, default=4)
-    parser.add_argument("--num-trunk-nodes", type=int, default=32)
-    parser.add_argument("--num-output-nodes", type=int, default=4)
-    parser.add_argument("--trunk-node-in-degrees", type=int, default=2)
-    parser.add_argument("--num-trunk-node-types", type=int, default=2)
+    parser.add_argument("--roots", type=int, default=4)
+    parser.add_argument("--trunks", type=int, default=32)
+    parser.add_argument("--outputs", type=int, default=4)
+    parser.add_argument("--in-degrees", type=int, default=2)
+    parser.add_argument("--types", type=int, default=2)
     args = parser.parse_args()
-
-    kwargs = dict(
-        num_root_nodes=args.num_root_nodes,
-        num_trunk_nodes=args.num_trunk_nodes,
-        num_output_nodes=args.num_output_nodes,
-        trunk_node_in_degrees=args.trunk_node_in_degrees,
-        num_trunk_node_types=args.num_trunk_node_types,
-    )
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
-    primary = make_random_graph_description(**kwargs)
-
-    primary_path = render_dag(primary, output_path="dag_primary", fmt="png")
-    print(
-        f"Rendered graph to {primary_path} "
-        f"({primary.num_trunk_nodes} trunk nodes)"
+    dag = make_random_graph_description(
+        num_root_nodes=args.roots,
+        num_trunk_nodes=args.trunks,
+        num_output_nodes=args.outputs,
+        trunk_node_in_degrees=args.in_degrees,
+        num_trunk_node_types=args.types,
     )
+
+    path = render_dag(dag, output_path="dag_primary", fmt="png")
+    print(f"Rendered graph to {path} ({dag.num_trunk_nodes} trunk nodes)")
 
 
 if __name__ == "__main__":
