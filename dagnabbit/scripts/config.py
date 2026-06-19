@@ -10,9 +10,9 @@ NUM_OUTPUT_NODES = 8
 MLP_DEPTH = 2
 # Hidden-layer width as a multiplicative expansion factor of each MLP/transformer
 # feed-forward input dim.
-MLP_EXPANSION_FACTOR = 4.0
+MLP_EXPANSION_FACTOR = 12.0
 # Shared residual-free transformer settings for the encoder and decoder.
-TRANSFORMER_NUM_LAYERS = 2
+TRANSFORMER_NUM_LAYERS = 4
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_DROPOUT = 0.0
