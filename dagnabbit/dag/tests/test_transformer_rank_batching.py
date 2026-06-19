@@ -129,3 +129,11 @@ def test_transformer_mlp_depth_controls_expanded_layers() -> None:
         (32, 32),
         (32, 16),
     ]
+
+
+def test_node_type_predictor_is_linear_projection() -> None:
+    model = _build_model()
+
+    assert isinstance(model.node_type_predictor, torch.nn.Linear)
+    assert model.node_type_predictor.in_features == model.node_embedding_dim
+    assert model.node_type_predictor.out_features == model.num_node_types

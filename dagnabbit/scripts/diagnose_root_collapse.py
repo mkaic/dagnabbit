@@ -28,9 +28,7 @@ Run::
 
 from __future__ import annotations
 
-# Keep the math pure-eager so we reproduce the decode exactly and need no
-# compile toolchain. Must precede the torch import (MLP.forward is compiled at
-# class-definition time).
+# Keep the math pure-eager so we reproduce the decode exactly.
 import os
 
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")

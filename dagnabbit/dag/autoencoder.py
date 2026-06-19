@@ -24,59 +24,6 @@ def _class_balance_weights(node_types: list[int]) -> list[float]:
     return [1.0 / counts[t] for t in node_types]
 
 
-class MLP(nn.Module):
-    """Pre-norm MLP: ``LayerNorm -> Linear`` per layer, GELU between layers."""
-
-    def __init__(
-        self,
-        vector_dims: Iterable[int],
-        activation: nn.Module | None = None,
-    ):
-        super().__init__()
-
-        self.layers = nn.ModuleList(
-            [
-                nn.Linear(vector_dims[i], vector_dims[i + 1])
-                for i in range(len(vector_dims) - 1)
-            ]
-        )
-        self.norms = nn.ModuleList(
-            [nn.LayerNorm(vector_dims[i]) for i in range(len(vector_dims) - 1)]
-        )
-        self.activation = activation if activation is not None else nn.GELU()
-
-    # ``dynamic=True``: grouped (rank-batched) evaluation calls every MLP with a
-    # leading batch axis ``G`` that varies per topological rank and per random
-    # graph. Compiling statically would recompile (and blow past dynamo's
-    # cache_size_limit) once per distinct ``G``; marking the batch dim dynamic
-    # compiles a single shape-polymorphic kernel instead. Only the leading dim
-    # varies -- each MLP instance has fixed layer widths -- so this is safe.
-    @torch.compile(dynamic=True)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for i, layer in enumerate(self.layers):
-            x = self.norms[i](x)
-            x = layer(x)
-            if i + 1 < len(self.layers):
-                x = self.activation(x)
-
-        return x
-
-
-def _mlp_dims(
-    in_dim: int,
-    out_dim: int,
-    mlp_depth: int,
-    mlp_expansion_factor: float,
-) -> list[int]:
-    """Build an MLP layer-size list with ``mlp_depth`` hidden layers between
-    ``in_dim`` and ``out_dim``. Each hidden layer's width is
-    ``round(in_dim * mlp_expansion_factor)`` (and at least 1)."""
-    assert mlp_depth >= 0
-    assert mlp_expansion_factor > 0
-    hidden_width = max(1, round(in_dim * mlp_expansion_factor))
-    return [in_dim] + [hidden_width] * mlp_depth + [out_dim]
-
-
 def _feed_forward_layers(
     vector_dims: Iterable[int],
     dropout: float,
@@ -116,9 +63,7 @@ class ResidualFreeTransformerBlock(nn.Module):
         self.post_attn_norm = nn.LayerNorm(node_embedding_dim)
         self.ff = nn.Sequential(
             *_feed_forward_layers(
-                [node_embedding_dim]
-                + [hidden_dim] * mlp_depth
-                + [node_embedding_dim],
+                [node_embedding_dim] + [hidden_dim] * mlp_depth + [node_embedding_dim],
                 dropout,
             )
         )
@@ -430,40 +375,9 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         # ---- Auxiliary node-type prediction head ----
-        self.node_type_predictor = MLP(
-            _mlp_dims(
-                in_dim=self.node_embedding_dim,
-                out_dim=self.num_node_types,
-                mlp_depth=mlp_depth,
-                mlp_expansion_factor=mlp_expansion_factor,
-            )
-        )
-
-        self._raise_dynamo_cache_limit_for_mlp_shapes()
-
-    def _raise_dynamo_cache_limit_for_mlp_shapes(self) -> None:
-        """Size dynamo's compile cache to this model's distinct MLP shapes.
-
-        Grouped (rank-batched) evaluation funnels every MLP through the single
-        decorated ``MLP.forward``; dynamo keys its compile cache on that one
-        shared code object, accumulating one specialization per distinct
-        (layer-shape x grad-mode x size-1-vs-dynamic-batch) combination. The
-        layer-shapes are fixed by this model's config (trunk in-degrees, output
-        in-degrees, embedding dim, type-head width), and ``dynamic=True`` keeps
-        the batch axis from multiplying the count, so the total is bounded. We
-        compute the number of distinct MLP layer-shapes actually instantiated and
-        give the cache room for each one's grad/no-grad and batch-warmup variants
-        (x4) plus headroom -- otherwise this bounded set would thrash against
-        dynamo's default ``cache_size_limit`` of 8.
-        """
-        distinct_mlp_shapes = {
-            tuple((layer.in_features, layer.out_features) for layer in mlp.layers)
-            for mlp in self.modules()
-            if isinstance(mlp, MLP)
-        }
-        needed = len(distinct_mlp_shapes) * 4 + 8
-        torch._dynamo.config.cache_size_limit = max(
-            torch._dynamo.config.cache_size_limit, needed
+        self.node_type_predictor = nn.Linear(
+            self.node_embedding_dim,
+            self.num_node_types,
         )
 
     def evaluate_graph(
@@ -686,7 +600,7 @@ class DagnabbitAutoEncoder(nn.Module):
         order-independent sum). The autoregressive and teacher-forced passes get
         their own fresh buffers, so they never share decode state -- but they are
         decoded in lockstep inside :meth:`_decode_graph`, which concatenates the
-        two passes for each MLP/loss launch.
+        two passes for each classification/loss launch.
 
         Returns ``(autoregressive_result, teacher_forced_result)``.
         """
