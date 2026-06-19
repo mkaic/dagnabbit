@@ -56,6 +56,10 @@ def build_model(device: torch.device) -> DagnabbitAutoEncoder:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
+        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
+        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
     ).to(device)
 
 
@@ -174,9 +178,11 @@ def diagnose(
             if not any(p < R for p in parents):
                 continue
             node_type = graph.node_types[node_idx]
-            ae = model.node_autoencoders[node_type]
             subtypes = torch.tensor([node_type], device=device)
-            preds = ae.decode_batch(combined[node_idx : node_idx + 1], subtypes)
+            preds = model.node_decoder.forward_batch(
+                combined[node_idx : node_idx + 1],
+                subtypes,
+            )
             preds = preds[0]  # [in_degree, D]
             for slot, parent in enumerate(parents):
                 if parent < R:  # parent is a root

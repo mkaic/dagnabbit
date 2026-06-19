@@ -1,12 +1,10 @@
 """Signal-propagation sanity check for the DAG autoencoder.
 
-Because ``evaluate_graph`` recursively composes a ``NodeEncoder`` MLP at every
-non-root node, the effective depth of the computation equals the depth of the
-DAG -- so a freshly-initialized model is really a very deep, weight-shared,
-residual-free network. Each ``NodeEncoder`` applies a ``LayerNorm`` after its
-MLP output, which re-centres and re-scales the embedding before it is passed as
-input to the next rank's encoders, keeping the per-node embedding norm flat
-around ``sqrt(node_embedding_dim)`` as DAG depth increases.
+Because ``evaluate_graph`` recursively composes the shared residual-free
+transformer encoder at every non-root rank, the effective depth of the
+computation equals the depth of the DAG. The encoder and decoder use LayerNorm
+inside every block and on their outputs, keeping the per-node embedding norm
+bounded as DAG depth increases.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
 ``decode`` guided-autoregressive pass that propagates predicted embeddings back
@@ -41,6 +39,10 @@ def build_model() -> DagnabbitAutoEncoder:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
+        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
+        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
     )
 
 
@@ -99,7 +101,7 @@ def measure_signal_propagation(
     """Run several freshly-initialized models on several random graphs and return
     per-DAG-depth statistics (averaged over samples) for both phases:
 
-    - ``"encode"``: the primary forward-pass buffer (``NodeEncoder`` MLPs
+    - ``"encode"``: the primary forward-pass buffer (shared transformer encoder
       composed down the DAG).
     - ``"decode"``: each primary node's ``combined_predicted_embedding`` from the
       guided-autoregressive decode (predictions propagated back up the DAG).
@@ -167,9 +169,9 @@ def test_norms_stay_bounded() -> None:
 
     for phase, stats_by_depth in stats_by_phase.items():
         for depth, s in stats_by_depth.items():
-            assert math.isfinite(s["norm_mean"]), (
-                f"[{phase}] non-finite norm at depth {depth}"
-            )
+            assert math.isfinite(
+                s["norm_mean"]
+            ), f"[{phase}] non-finite norm at depth {depth}"
             # Generous band: the original failure mode was norms exploding by
             # orders of magnitude with depth; this catches that (and collapse).
             assert 0.25 * target <= s["norm_mean"] <= 4.0 * target, (

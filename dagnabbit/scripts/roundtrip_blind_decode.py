@@ -76,7 +76,9 @@ def run_roundtrip(
     equal_size_miss = 0
     failures: Counter[str] = Counter()
     termination_reasons: Counter[str] = Counter()
-    buckets: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "survived": 0})
+    buckets: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "survived": 0}
+    )
 
     for _ in tqdm(range(num_graphs), desc="Round-tripping graphs"):
         graph = make_random_graph_description(
@@ -88,12 +90,7 @@ def run_roundtrip(
         )
 
         try:
-            buffer = DagnabbitAutoEncoder.evaluate_graph(
-                graph=graph,
-                root_node_embeddings=model.root_node_embeddings.weight,
-                node_autoencoders=model.node_autoencoders,
-                node_embedding_dim=model.node_embedding_dim,
-            )
+            buffer = model.evaluate_graph(graph=graph)
             output_embeddings = buffer[-graph.num_output_nodes :]
             recovered, diagnostics = model.blind_autoregressive_decode(
                 output_embeddings,

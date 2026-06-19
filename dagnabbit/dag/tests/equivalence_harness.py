@@ -1,20 +1,17 @@
-"""Cross-commit equivalence harness for the DAG autoencoder.
+"""Deterministic snapshot harness for the DAG autoencoder.
 
-This file lives *outside* the git repo on purpose: it must run unchanged on the
-pre-refactor commit (``aae1991``, per-node loops, list-based return contract)
-*and* on the current batched ``main``. It builds a deterministic model + graph,
-runs ``training_forward`` + a backward pass, and normalizes everything into a
-plain dict of CPU float32 tensors with a fixed schema so the two commits can be
-compared bit-for-bit-ish (within float reduction-order tolerance).
+It builds a deterministic model + graph, runs ``training_forward`` + a backward
+pass, and normalizes everything into a plain dict of CPU float32 tensors with a
+fixed schema. The output is useful as a local regression snapshot when changing
+the autoencoder internals.
 
-Key determinism choices (see also the chat plan):
+Key determinism choices:
   * ``TORCH_COMPILE_DISABLE=1`` (set before importing torch) -> pure eager on
-    both commits, so ``@torch.compile`` / ``@torch.compile(dynamic=True)`` is not
-    a confound and no C toolchain is needed.
+    this harness, so ``@torch.compile`` is not a confound and no C toolchain is
+    needed.
   * CPU, float32, no autocast.
-  * One ``manual_seed`` up front; model init then graph gen consume the global
-    RNG in the same order on both commits (verified: the refactor added no RNG
-    draws to ``__init__`` or to ``FixedInDegreeDAGDescription``).
+  * One ``manual_seed`` up front; model init then graph generation consume the
+    global RNG in a fixed order.
 
 Usage:  python harness.py <output_pickle_path> [seed]
 """
@@ -35,7 +32,7 @@ from dagnabbit.scripts import config as cfg
 
 def _stack_live(x) -> torch.Tensor:
     """Return a *live* (autograd-connected) 1-D tensor from a loss field that is
-    either a list[Tensor] (pre-refactor) or a 1-D Tensor (current)."""
+    either a list[Tensor] or a 1-D Tensor."""
     if isinstance(x, torch.Tensor):
         return x
     return torch.stack(list(x))
@@ -68,6 +65,10 @@ def run_and_normalize(seed: int) -> dict:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
+        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
+        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
     ).to(device)
     model = model.float()
 

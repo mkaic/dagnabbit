@@ -177,6 +177,10 @@ def main() -> None:
         mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
+        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
+        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
+        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
     ).to(device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

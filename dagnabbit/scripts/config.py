@@ -6,10 +6,16 @@ TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
 NUM_OUTPUT_NODES = 8
-# Number of hidden layers in every MLP (encoders, decoders, type predictor).
+# Number of hidden layers in the node-type predictor MLP.
 MLP_DEPTH = 2
-# Hidden-layer width as a multiplicative expansion factor of each MLP's input dim.
+# Hidden-layer width as a multiplicative expansion factor of each MLP/transformer
+# feed-forward input dim.
 MLP_EXPANSION_FACTOR = 4.0
+# Shared residual-free transformer settings for the encoder and decoder.
+TRANSFORMER_NUM_LAYERS = 2
+TRANSFORMER_NUM_REGISTER_TOKENS = 2
+TRANSFORMER_NUM_HEADS = 4
+TRANSFORMER_DROPOUT = 0.0
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 128
