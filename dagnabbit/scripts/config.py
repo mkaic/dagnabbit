@@ -6,8 +6,7 @@ TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
 NUM_OUTPUT_NODES = 8
-# Fallback transformer layer count when TRANSFORMER_NUM_LAYERS is None.
-MLP_DEPTH = 2
+
 # Hidden-layer width as a multiplicative expansion factor of each transformer
 # feed-forward input dim.
 MLP_EXPANSION_FACTOR = 4.0

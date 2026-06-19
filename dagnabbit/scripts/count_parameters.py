@@ -10,7 +10,6 @@ def main() -> None:
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
         num_root_nodes=cfg.NUM_ROOT_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
-        mlp_depth=cfg.MLP_DEPTH,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
