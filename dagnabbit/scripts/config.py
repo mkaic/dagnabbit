@@ -18,6 +18,13 @@ TRANSFORMER_NUM_REGISTER_TOKENS = 2
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_DROPOUT = 0.0
 
+# Compile the repeated encoder/decoder tensor kernels during CUDA training.
+# This intentionally does not compile the whole graph-shaped training step,
+# whose Python DAG traversal changes every iteration.
+TORCH_COMPILE = torch.cuda.is_available()
+TORCH_COMPILE_MODE = "reduce-overhead"
+TORCH_COMPILE_DYNAMIC = True
+
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 128
 

@@ -64,6 +64,32 @@ def combine_losses(
 LOSS_EMA_DECAY = 0.99
 
 
+def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> None:
+    if not cfg.TORCH_COMPILE:
+        return
+
+    if device.type != "cuda":
+        print(f"torch_compile=skipped device={device.type} (CUDA only)")
+        return
+
+    compile_kwargs = {
+        "mode": cfg.TORCH_COMPILE_MODE,
+        "dynamic": cfg.TORCH_COMPILE_DYNAMIC,
+    }
+    model.node_encoder.forward_batch = torch.compile(
+        model.node_encoder.forward_batch,
+        **compile_kwargs,
+    )
+    model.node_decoder.forward_batch = torch.compile(
+        model.node_decoder.forward_batch,
+        **compile_kwargs,
+    )
+    print(
+        "torch_compile=enabled "
+        f"mode={cfg.TORCH_COMPILE_MODE} dynamic={cfg.TORCH_COMPILE_DYNAMIC}"
+    )
+
+
 def save_checkpoint(
     path: Path,
     step: int,
@@ -128,6 +154,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable TensorBoard logging.",
     )
     parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Compile the repeated encoder/decoder forward_batch kernels on CUDA. "
+            "Defaults to TORCH_COMPILE in config.py."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help=(
@@ -151,6 +186,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.compile is not None:
+        cfg.TORCH_COMPILE = args.compile
+
     torch.manual_seed(cfg.SEED)
     torch.set_float32_matmul_precision("high")
 
@@ -182,6 +220,8 @@ def main() -> None:
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
     ).to(device)
+
+    apply_torch_compile(model, device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
