@@ -235,12 +235,11 @@ class TransformerNodeDecoder(nn.Module):
 
 @dataclass
 class TrainingStepLossReturnType:
-    # 1-D tensor over classified nodes in the primary graph (trunks + roots).
+    # 1-D tensor over all nodes in the primary graph.
     primary_node_classification_losses: Tensor
     # Raw per-node logits ``[N, num_types]`` and true type labels (1-D
-    # ``LongTensor``) for downstream diagnostics, restricted to the same
-    # classified nodes. ``primary_node_predicted_type_logits[i]`` corresponds to
-    # ``primary_node_true_types[i]``.
+    # ``LongTensor``) for downstream diagnostics. ``primary_node_predicted_type_logits[i]``
+    # corresponds to ``primary_node_true_types[i]``.
     primary_node_predicted_type_logits: Tensor
     primary_node_true_types: Tensor
     # Teacher-forced counterparts (same node alignment, same true labels). These
@@ -527,9 +526,6 @@ class DagnabbitAutoEncoder(nn.Module):
             dtype=primary_buffer.dtype,
             device=device,
         )
-        classification_node_mask = (
-            primary_labels < primary_graph.output_node_types_start
-        )
 
         # Two decode passes over the *same* (shared) encode pass. The
         # autoregressive pass is the genuine model -- predictions compound down
@@ -542,10 +538,10 @@ class DagnabbitAutoEncoder(nn.Module):
         # The two passes are independent of each other at every rank (each only
         # depends on its own higher-rank predictions), so they are run in
         # lockstep and batched together: at each rank their inputs are
-        # concatenated along the batch axis for shared ``node_type_predictor`` /
-        # ``decode_batch`` launches where applicable, then split back apart.
-        # Every op involved is row-wise, so this is numerically identical to two
-        # separate pipelines but roughly halves the kernel-launch count.
+        # concatenated along the batch axis for a single ``node_type_predictor``
+        # / ``decode_batch`` (and loss) launch, then split back apart. Every op
+        # involved is row-wise, so this is numerically identical to two separate
+        # pipelines but roughly halves the kernel-launch count.
         autoregressive, teacher_forced = self._decode_pipeline(
             primary_graph=primary_graph,
             primary_buffer=primary_buffer,
@@ -555,18 +551,14 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         losses = TrainingStepLossReturnType(
-            primary_node_classification_losses=autoregressive.primary_class_losses[
-                classification_node_mask
-            ],
-            primary_node_predicted_type_logits=autoregressive.primary_logits[
-                classification_node_mask
-            ],
-            primary_node_true_types=primary_labels[classification_node_mask],
+            primary_node_classification_losses=autoregressive.primary_class_losses,
+            primary_node_predicted_type_logits=autoregressive.primary_logits,
+            primary_node_true_types=primary_labels,
             teacher_forced_primary_node_classification_losses=(
-                teacher_forced.primary_class_losses[classification_node_mask]
+                teacher_forced.primary_class_losses
             ),
             teacher_forced_primary_node_predicted_type_logits=(
-                teacher_forced.primary_logits[classification_node_mask]
+                teacher_forced.primary_logits
             ),
             primary_node_parent_reconstruction_losses=autoregressive.primary_recon,
             teacher_forced_primary_node_parent_reconstruction_losses=(
@@ -731,7 +723,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
         1. the variance-preserving combine ``child_sum / sqrt(child_count)``, and
         2. classification (``node_type_predictor``) with class-balanced
-           cross-entropy for supervised node types (trunks + roots);
+           cross-entropy;
 
         then, per supertype group with parents, one ``decode_batch`` whose
         predicted parent embeddings are ``index_add_``-scattered into the
@@ -751,10 +743,9 @@ class DagnabbitAutoEncoder(nn.Module):
         Because the two passes are independent of each other at every rank, their
         inputs are concatenated along the batch axis (autoregressive rows first,
         teacher-forced rows second) for a single ``node_type_predictor`` /
-        ``decode_batch`` (and cross-entropy where applicable) launch, then split
-        back apart. Every op is row-wise, so this is numerically identical to
-        running the two passes separately while roughly halving the kernel-launch
-        count.
+        ``decode_batch`` (and cross-entropy) launch, then split back apart. Every
+        op is row-wise, so this is numerically identical to running the two
+        passes separately while roughly halving the kernel-launch count.
 
         ``process_roots`` controls whether rank-0 (root) nodes are classified:
         roots have no parents so nothing is scattered regardless, but this flag
@@ -798,9 +789,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 continue
             groups = graph.rank_groups[rank]
 
-            # All nodes at this rank, across supertype groups: combine
-            # uniformly. Classification is applied below only to supervised
-            # node types.
+            # All nodes at this rank, across supertype groups: combine and
+            # classify uniformly (these use the shared type head regardless of
+            # supertype).
             rank_node_indices = torch.cat([g.node_buffer_indices for g in groups]).to(
                 device
             )
@@ -853,43 +844,31 @@ class DagnabbitAutoEncoder(nn.Module):
                 tf_counts > 1, tf_var, torch.zeros_like(tf_var)
             )
 
+            # Classify both passes in one launch. Rows ``[:num_rank_nodes]`` are
+            # autoregressive, ``[num_rank_nodes:]`` are teacher-forced; the
+            # type head is row-wise, so this is identical to two separate calls.
+            combined_both = torch.cat([ar_combined_rank, tf_combined_rank], dim=0)
+            logits_both = self.node_type_predictor(combined_both)
+            ar_logits[rank_node_indices] = logits_both[:num_rank_nodes].to(
+                ar_logits.dtype
+            )
+            tf_logits[rank_node_indices] = logits_both[num_rank_nodes:].to(
+                tf_logits.dtype
+            )
+
             rank_labels = labels[rank_node_indices]
-            output_type_start = self.num_trunk_node_types + self.num_root_nodes
-            rank_class_mask = rank_labels < output_type_start
-            if rank_class_mask.any():
-                class_node_indices = rank_node_indices[rank_class_mask]
-                num_class_nodes = class_node_indices.shape[0]
-
-                # Outputs still decode into their parents, but do not
-                # contribute classifier logits or cross-entropy.
-                combined_both = torch.cat(
-                    [
-                        ar_combined_rank[rank_class_mask],
-                        tf_combined_rank[rank_class_mask],
-                    ],
-                    dim=0,
-                )
-                logits_both = self.node_type_predictor(combined_both)
-                ar_logits[class_node_indices] = logits_both[:num_class_nodes].to(
-                    ar_logits.dtype
-                )
-                tf_logits[class_node_indices] = logits_both[num_class_nodes:].to(
-                    tf_logits.dtype
-                )
-
-                class_labels = rank_labels[rank_class_mask]
-                class_weights_for_rank = class_weights[class_node_indices]
-                cross_entropy_both = F.cross_entropy(
-                    logits_both,
-                    torch.cat([class_labels, class_labels]),
-                    reduction="none",
-                ) * torch.cat([class_weights_for_rank, class_weights_for_rank])
-                ar_class[class_node_indices] = cross_entropy_both[:num_class_nodes].to(
-                    ar_class.dtype
-                )
-                tf_class[class_node_indices] = cross_entropy_both[num_class_nodes:].to(
-                    tf_class.dtype
-                )
+            rank_weights = class_weights[rank_node_indices]
+            cross_entropy_both = F.cross_entropy(
+                logits_both,
+                torch.cat([rank_labels, rank_labels]),
+                reduction="none",
+            ) * torch.cat([rank_weights, rank_weights])
+            ar_class[rank_node_indices] = cross_entropy_both[:num_rank_nodes].to(
+                ar_class.dtype
+            )
+            tf_class[rank_node_indices] = cross_entropy_both[num_rank_nodes:].to(
+                tf_class.dtype
+            )
 
             # Decode the whole rank at once. Parentless root rows are harmless:
             # their valid mask is empty, so no predicted slot is scattered.
