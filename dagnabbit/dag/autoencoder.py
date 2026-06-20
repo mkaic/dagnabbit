@@ -1,14 +1,16 @@
-import torch
-from torch import Tensor
-import torch.nn as nn
-from typing import Iterable
 from dataclasses import dataclass
+from typing import Iterable
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     NodeSupertype,
     subtype_to_supertype,
 )
-import torch.nn.functional as F
 
 
 def _class_balance_weights(node_types: list[int]) -> list[float]:
@@ -156,8 +158,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
             raise ValueError("x must have shape [B, K, D]")
         if x.shape[1] != self.max_context_length:
             raise ValueError(
-                f"x context length must be {self.max_context_length}; "
-                f"got {x.shape[1]}"
+                f"x context length must be {self.max_context_length}; got {x.shape[1]}"
             )
         if x.shape[2] != self.node_embedding_dim:
             raise ValueError(
@@ -1052,12 +1053,6 @@ class DagnabbitAutoEncoder(nn.Module):
             }
             return description, diagnostics
         return description
-
-    def inference_decode_blind_autoregressive(
-        self,
-        graph_embedding: Tensor,
-    ) -> FixedInDegreeDAGDescription:
-        return self.blind_autoregressive_decode(graph_embedding)
 
     def _blind_decode_expand(
         self,
