@@ -1,7 +1,7 @@
 import torch
 
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 128
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -35,7 +35,7 @@ NUM_TRUNK_NODES = 128
 # --- training ---
 NUM_STEPS = 1_000_000
 GRADIENT_ACCUMULATION_STEPS = 8
-LEARNING_RATE = 2.5e-4
+LEARNING_RATE = 1e-3
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
