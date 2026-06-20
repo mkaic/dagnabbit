@@ -238,9 +238,8 @@ class TrainingStepLossReturnType:
     # 1-D tensor over all nodes in the primary graph.
     primary_node_classification_losses: Tensor
     # Raw per-node logits ``[N, num_types]`` and true type labels (1-D
-    # ``LongTensor``) for downstream diagnostics (e.g. per-node-type accuracy
-    # per class). ``primary_node_predicted_type_logits[i]`` corresponds to
-    # ``primary_node_true_types[i]``.
+    # ``LongTensor``) for downstream diagnostics. ``primary_node_predicted_type_logits[i]``
+    # corresponds to ``primary_node_true_types[i]``.
     primary_node_predicted_type_logits: Tensor
     primary_node_true_types: Tensor
     # Teacher-forced counterparts (same node alignment, same true labels). These

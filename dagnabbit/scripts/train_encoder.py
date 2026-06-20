@@ -13,10 +13,10 @@ from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossRetu
 from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
+    accuracy_summary,
     format_param_count,
     log_run_config,
     log_step_metrics,
-    per_type_accuracies,
     step_preds_and_truth,
 )
 
@@ -287,12 +287,15 @@ def main() -> None:
             progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
 
             if writer is not None and step % cfg.LOG_EVERY == 0:
-                decoder_accuracies = per_type_accuracies(
+                decoder_accuracy, decoder_supertype_accuracies = accuracy_summary(
                     np.concatenate(window_preds),
                     np.concatenate(window_truth),
                     num_classes=model.num_node_types,
                 )
-                tf_decoder_accuracies = per_type_accuracies(
+                (
+                    tf_decoder_accuracy,
+                    tf_decoder_supertype_accuracies,
+                ) = accuracy_summary(
                     np.concatenate(tf_window_preds),
                     np.concatenate(tf_window_truth),
                     num_classes=model.num_node_types,
@@ -306,8 +309,10 @@ def main() -> None:
                     step,
                     loss_val,
                     {name: value.item() for name, value in components.items()},
-                    decoder_accuracies,
-                    tf_decoder_accuracies,
+                    decoder_accuracy,
+                    decoder_supertype_accuracies,
+                    tf_decoder_accuracy,
+                    tf_decoder_supertype_accuracies,
                     grad_norm=last_grad_norm,
                     grad_was_clipped=last_grad_was_clipped,
                 )

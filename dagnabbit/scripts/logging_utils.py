@@ -29,75 +29,45 @@ def step_preds_and_truth(
     return preds, truth
 
 
-def per_type_accuracies(
+def accuracy_summary(
     preds: np.ndarray,
     truth: np.ndarray,
     num_classes: int,
-) -> dict[int, float]:
-    """Per-class accuracy (recall): argmax==c rate over nodes whose true type is c.
+) -> tuple[float, dict[NodeSupertype, float]]:
+    """Overall and supertype accuracy over an accumulated logging window."""
+    correct = preds == truth
+    overall = float(correct.mean()) if truth.size else float("nan")
 
-    NaN for classes with no nodes of that type in the accumulated window.
-    """
-    accuracies: dict[int, float] = {}
-    for c in range(num_classes):
-        mask = truth == c
-        if not mask.any():
-            accuracies[c] = float("nan")
-        else:
-            accuracies[c] = float((preds[mask] == c).mean())
-    return accuracies
-
-
-def node_type_class_label(cls: int) -> str:
-    """Map a node-type class index to a human-readable metaclass label."""
-    trunk_end = cfg.NUM_TRUNK_NODE_TYPES
-    root_end = trunk_end + cfg.NUM_ROOT_NODES
-
-    supertype = subtype_to_supertype(cls)
-    if supertype is NodeSupertype.TRUNK:
-        return f"trunk_class_{cls}"
-    if supertype is NodeSupertype.ROOT:
-        return f"root_class_{cls - trunk_end}"
-    return f"output_class_{cls - root_end}"
+    class_supertypes = np.array(
+        [subtype_to_supertype(cls) for cls in range(num_classes)],
+        dtype=object,
+    )
+    truth_supertypes = class_supertypes[truth]
+    by_supertype: dict[NodeSupertype, float] = {}
+    for supertype in NodeSupertype:
+        mask = truth_supertypes == supertype
+        if mask.any():
+            by_supertype[supertype] = float(correct[mask].mean())
+    return overall, by_supertype
 
 
 def log_decoder_accuracies(
     writer: SummaryWriter,
     step: int,
-    decoder_accuracies: dict[int, float],
+    overall_accuracy: float,
+    supertype_accuracies: dict[NodeSupertype, float],
     *,
     mean_tag: str,
     tag_prefix: str,
-    per_class_tag_prefix: str,
 ) -> None:
-    valid_dec = [v for v in decoder_accuracies.values() if not np.isnan(v)]
-    if valid_dec:
-        writer.add_scalar(mean_tag, float(np.mean(valid_dec)), step)
+    if not np.isnan(overall_accuracy):
+        writer.add_scalar(mean_tag, overall_accuracy, step)
 
-    supertype_groups: dict[NodeSupertype, list[float]] = {
-        NodeSupertype.TRUNK: [],
-        NodeSupertype.ROOT: [],
-        NodeSupertype.OUTPUT: [],
-    }
-    for cls, acc in decoder_accuracies.items():
-        if np.isnan(acc):
-            continue
-        supertype = subtype_to_supertype(cls)
-        supertype_groups[supertype].append(acc)
-
-    for supertype, group_vals in supertype_groups.items():
-        if group_vals:
+    for supertype, accuracy in supertype_accuracies.items():
+        if not np.isnan(accuracy):
             writer.add_scalar(
                 f"{tag_prefix}/{supertype.value}",
-                float(np.mean(group_vals)),
-                step,
-            )
-
-    for cls, acc in decoder_accuracies.items():
-        if not np.isnan(acc):
-            writer.add_scalar(
-                f"{per_class_tag_prefix}/{node_type_class_label(cls)}",
-                acc,
+                accuracy,
                 step,
             )
 
@@ -107,8 +77,10 @@ def log_step_metrics(
     step: int,
     total: float,
     components: dict[str, float],
-    decoder_accuracies: dict[int, float],
-    tf_decoder_accuracies: dict[int, float] | None = None,
+    decoder_accuracy: float,
+    decoder_supertype_accuracies: dict[NodeSupertype, float],
+    tf_decoder_accuracy: float | None = None,
+    tf_decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
     grad_norm: float | None = None,
     grad_was_clipped: bool | None = None,
 ) -> None:
@@ -130,24 +102,22 @@ def log_step_metrics(
     log_decoder_accuracies(
         writer,
         step,
-        decoder_accuracies,
+        decoder_accuracy,
+        decoder_supertype_accuracies,
         mean_tag="accuracy/decoder_mean",
         tag_prefix="accuracy",
-        per_class_tag_prefix="accuracy_per_class",
     )
 
     # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
-    # so they sit next to the autoregressive curves in TensorBoard). The whole
-    # point of the TF pass is to watch whether root identity is recoverable from
-    # clean inputs, so per-class root accuracy lives here.
-    if tf_decoder_accuracies is not None:
+    # so they sit next to the autoregressive curves in TensorBoard).
+    if tf_decoder_accuracy is not None and tf_decoder_supertype_accuracies is not None:
         log_decoder_accuracies(
             writer,
             step,
-            tf_decoder_accuracies,
+            tf_decoder_accuracy,
+            tf_decoder_supertype_accuracies,
             mean_tag="accuracy/tf/decoder_mean",
             tag_prefix="accuracy/tf",
-            per_class_tag_prefix="accuracy/tf_per_class",
         )
 
 
