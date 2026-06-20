@@ -1,7 +1,7 @@
 import torch
 
 # --- model ---
-NODE_EMBEDDING_DIM = 128
+NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -13,7 +13,7 @@ MLP_EXPANSION_FACTOR = 4.0
 # Shared residual-free transformer settings for the encoder and decoder.
 TRANSFORMER_NUM_LAYERS = 2
 # Number of expanded hidden layers inside each transformer feed-forward MLP.
-TRANSFORMER_MLP_DEPTH = 3
+TRANSFORMER_MLP_DEPTH = 1
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
 TRANSFORMER_NUM_HEADS = 4
 TRANSFORMER_DROPOUT = 0.0
