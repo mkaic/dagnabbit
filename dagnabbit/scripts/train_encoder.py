@@ -334,7 +334,10 @@ def main() -> None:
             progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
 
             if writer is not None and step % cfg.LOG_EVERY == 0:
-                decoder_accuracy, decoder_supertype_accuracies = accuracy_summary(
+                (
+                    decoder_accuracy,
+                    decoder_supertype_accuracies,
+                ) = accuracy_summary(
                     np.concatenate(window_preds),
                     np.concatenate(window_truth),
                     num_classes=model.num_node_types,

@@ -21,7 +21,7 @@ TRANSFORMER_DROPOUT = 0.0
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,
 # whose Python DAG traversal changes every iteration.
-TORCH_COMPILE = torch.cuda.is_available()
+TORCH_COMPILE = False
 TORCH_COMPILE_MODE = "reduce-overhead"
 TORCH_COMPILE_DYNAMIC = True
 # The training step invokes compiled encoder/decoder kernels many times before

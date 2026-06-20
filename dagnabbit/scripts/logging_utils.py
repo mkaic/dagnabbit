@@ -36,34 +36,51 @@ def accuracy_summary(
     truth: np.ndarray,
     num_classes: int,
 ) -> tuple[float, dict[NodeSupertype, float]]:
-    """Overall and supertype accuracy over an accumulated logging window."""
-    correct = preds == truth
-    overall = float(correct.mean()) if truth.size else float("nan")
+    """Per-class recall summary over an accumulated logging window.
 
-    class_supertypes = np.array(
-        [subtype_to_supertype(cls) for cls in range(num_classes)],
-        dtype=object,
+    ``accuracy/decoder_mean`` historically logged the mean of per-class recalls,
+    not node-weighted overall accuracy. Keep that definition so new runs remain
+    comparable with older TensorBoard curves.
+    """
+    per_class: dict[int, float] = {}
+    for cls in range(num_classes):
+        mask = truth == cls
+        if not mask.any():
+            per_class[cls] = float("nan")
+        else:
+            per_class[cls] = float((preds[mask] == cls).mean())
+
+    valid_class_accuracies = [v for v in per_class.values() if not np.isnan(v)]
+    mean = (
+        float(np.mean(valid_class_accuracies))
+        if valid_class_accuracies
+        else float("nan")
     )
-    truth_supertypes = class_supertypes[truth]
+
     by_supertype: dict[NodeSupertype, float] = {}
     for supertype in NodeSupertype:
-        mask = truth_supertypes == supertype
-        if mask.any():
-            by_supertype[supertype] = float(correct[mask].mean())
-    return overall, by_supertype
+        group = [
+            accuracy
+            for cls, accuracy in per_class.items()
+            if subtype_to_supertype(cls) is supertype and not np.isnan(accuracy)
+        ]
+        if group:
+            by_supertype[supertype] = float(np.mean(group))
+
+    return mean, by_supertype
 
 
 def log_decoder_accuracies(
     writer: SummaryWriter,
     step: int,
-    overall_accuracy: float,
+    mean_accuracy: float,
     supertype_accuracies: dict[NodeSupertype, float],
     *,
     mean_tag: str,
     tag_prefix: str,
 ) -> None:
-    if not np.isnan(overall_accuracy):
-        writer.add_scalar(mean_tag, overall_accuracy, step)
+    if not np.isnan(mean_accuracy):
+        writer.add_scalar(mean_tag, mean_accuracy, step)
 
     for supertype, accuracy in supertype_accuracies.items():
         if not np.isnan(accuracy):
@@ -112,7 +129,10 @@ def log_step_metrics(
 
     # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
     # so they sit next to the autoregressive curves in TensorBoard).
-    if tf_decoder_accuracy is not None and tf_decoder_supertype_accuracies is not None:
+    if (
+        tf_decoder_accuracy is not None
+        and tf_decoder_supertype_accuracies is not None
+    ):
         log_decoder_accuracies(
             writer,
             step,
