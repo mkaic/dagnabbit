@@ -24,6 +24,10 @@ TRANSFORMER_DROPOUT = 0.0
 TORCH_COMPILE = torch.cuda.is_available()
 TORCH_COMPILE_MODE = "reduce-overhead"
 TORCH_COMPILE_DYNAMIC = True
+# The training step invokes compiled encoder/decoder kernels many times before
+# one backward pass. CUDA graph replay is fragile for that pattern, so keep
+# Inductor's CUDA graph fast path disabled unless explicitly testing it.
+TORCH_COMPILE_CUDAGRAPHS = False
 
 # --- DAG sampling ---
 NUM_TRUNK_NODES = 128

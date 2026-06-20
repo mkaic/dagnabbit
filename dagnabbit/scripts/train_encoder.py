@@ -72,10 +72,14 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
         print(f"torch_compile=skipped device={device.type} (CUDA only)")
         return
 
-    compile_kwargs = {
-        "mode": cfg.TORCH_COMPILE_MODE,
-        "dynamic": cfg.TORCH_COMPILE_DYNAMIC,
-    }
+    compile_kwargs = {"dynamic": cfg.TORCH_COMPILE_DYNAMIC}
+    if cfg.TORCH_COMPILE_CUDAGRAPHS:
+        compile_kwargs["mode"] = cfg.TORCH_COMPILE_MODE
+    else:
+        compile_kwargs["options"] = {
+            "triton.cudagraphs": False,
+            "triton.cudagraph_trees": False,
+        }
     model.node_encoder.forward_batch = torch.compile(
         model.node_encoder.forward_batch,
         **compile_kwargs,
@@ -84,9 +88,12 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
         model.node_decoder.forward_batch,
         **compile_kwargs,
     )
+    compile_mode = cfg.TORCH_COMPILE_MODE if cfg.TORCH_COMPILE_CUDAGRAPHS else "default"
     print(
         "torch_compile=enabled "
-        f"mode={cfg.TORCH_COMPILE_MODE} dynamic={cfg.TORCH_COMPILE_DYNAMIC}"
+        f"mode={compile_mode} "
+        f"dynamic={cfg.TORCH_COMPILE_DYNAMIC} "
+        f"cudagraphs={cfg.TORCH_COMPILE_CUDAGRAPHS}"
     )
 
 
