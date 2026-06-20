@@ -102,10 +102,14 @@ def log_step_metrics(
     tf_decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
     grad_norm: float | None = None,
     grad_was_clipped: bool | None = None,
+    learning_rate: float | None = None,
 ) -> None:
     writer.add_scalar("loss/total", total, step)
     for name, value in components.items():
         writer.add_scalar(f"loss/{name}", value, step)
+
+    if learning_rate is not None:
+        writer.add_scalar("optimizer/learning_rate", learning_rate, step)
 
     if grad_norm is not None:
         writer.add_scalar("gradients/norm", grad_norm, step)

@@ -102,17 +102,31 @@ def save_checkpoint(
     step: int,
     model: DagnabbitAutoEncoder,
     optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     loss: float,
 ) -> None:
-    torch.save(
-        {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": loss,
-        },
-        path,
-    )
+    checkpoint = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "loss": loss,
+    }
+    if lr_scheduler is not None:
+        checkpoint["lr_scheduler_state_dict"] = lr_scheduler.state_dict()
+    torch.save(checkpoint, path)
+
+
+def make_lr_warmup_scheduler(
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.LambdaLR | None:
+    warmup_steps = cfg.LR_WARMUP_OPTIMIZER_STEPS
+    if warmup_steps <= 0:
+        return None
+
+    def lr_lambda(optimizer_step_index: int) -> float:
+        return min((optimizer_step_index + 1) / warmup_steps, 1.0)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def dump_profile(
@@ -238,6 +252,15 @@ def main() -> None:
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
+    lr_scheduler = make_lr_warmup_scheduler(optimizer)
+    if lr_scheduler is None:
+        print("lr_warmup_optimizer_steps=0")
+    else:
+        print(
+            f"lr_warmup_optimizer_steps={cfg.LR_WARMUP_OPTIMIZER_STEPS} "
+            f"initial_lr={optimizer.param_groups[0]['lr']:.4g} "
+            f"target_lr={cfg.LEARNING_RATE:.4g}"
+        )
 
     prof: profile | None = None
     total_profile_steps = 0
@@ -276,6 +299,7 @@ def main() -> None:
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
         last_grad_norm: float | None = None
         last_grad_was_clipped: bool | None = None
+        last_optimizer_lr = optimizer.param_groups[0]["lr"]
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
             graph = make_random_graph_description(
@@ -306,7 +330,10 @@ def main() -> None:
                     )
                     last_grad_norm = grad_norm.item()
                     last_grad_was_clipped = None
+                last_optimizer_lr = optimizer.param_groups[0]["lr"]
                 optimizer.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
                 optimizer.zero_grad()
 
             if writer is not None:
@@ -365,6 +392,7 @@ def main() -> None:
                     tf_decoder_supertype_accuracies,
                     grad_norm=last_grad_norm,
                     grad_was_clipped=last_grad_was_clipped,
+                    learning_rate=last_optimizer_lr,
                 )
 
             if (step + 1) % cfg.CHECK_BEST_EVERY == 0:
@@ -377,6 +405,7 @@ def main() -> None:
                         step,
                         model,
                         optimizer,
+                        lr_scheduler,
                         avg_loss,
                     )
                     progress.write(
