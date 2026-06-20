@@ -1,10 +1,9 @@
 """Signal-propagation sanity check for the DAG autoencoder.
 
-Because ``evaluate_graph`` recursively composes the shared residual-free
-transformer encoder at every non-root rank, the effective depth of the
-computation equals the depth of the DAG. The encoder and decoder use LayerNorm
-inside every block and on their outputs, keeping the per-node embedding norm
-bounded as DAG depth increases.
+Because ``evaluate_graph`` recursively composes the shared residual transformer
+encoder at every non-root rank, the effective depth of the computation equals
+the depth of the DAG. The encoder and decoder use final LayerNorms on their
+outputs, keeping the per-node embedding norm bounded as DAG depth increases.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
 ``decode`` guided-autoregressive pass that propagates predicted embeddings back

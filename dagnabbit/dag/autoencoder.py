@@ -40,8 +40,8 @@ def _feed_forward_layers(
     return layers
 
 
-class ResidualFreeTransformerBlock(nn.Module):
-    """Self-attention + MLP block with replacement updates, not residual adds."""
+class TransformerBlock(nn.Module):
+    """Pre-norm self-attention + MLP block with a standard residual stream."""
 
     def __init__(
         self,
@@ -62,7 +62,7 @@ class ResidualFreeTransformerBlock(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.post_attn_norm = nn.LayerNorm(node_embedding_dim)
+        self.attn_dropout = nn.Dropout(dropout)
         self.ff = nn.Sequential(
             *_feed_forward_layers(
                 [node_embedding_dim]
@@ -72,6 +72,7 @@ class ResidualFreeTransformerBlock(nn.Module):
             )
         )
         self.ff_norm = nn.LayerNorm(node_embedding_dim)
+        self.ff_dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, key_padding_mask: Tensor | None) -> Tensor:
         y = self.attn_norm(x)
@@ -82,8 +83,8 @@ class ResidualFreeTransformerBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        x = self.post_attn_norm(y)
-        return self.ff_norm(self.ff(x))
+        x = x + self.attn_dropout(y)
+        return x + self.ff_dropout(self.ff(self.ff_norm(x)))
 
 
 class TypeConditionedSequenceTransformer(nn.Module):
@@ -131,7 +132,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
         self.node_type_embeddings = nn.Embedding(num_node_types, node_embedding_dim)
         self.blocks = nn.ModuleList(
             [
-                ResidualFreeTransformerBlock(
+                TransformerBlock(
                     node_embedding_dim=node_embedding_dim,
                     num_heads=num_heads,
                     transformer_mlp_depth=transformer_mlp_depth,
