@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -134,14 +136,52 @@ def cfg_hparams() -> dict[str, bool | int | float | str]:
     return hparams
 
 
+def git_metadata() -> dict[str, str]:
+    """Return Git metadata for TensorBoard run provenance."""
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    try:
+        commit = _git("rev-parse", "HEAD")
+        short_commit = _git("rev-parse", "--short", "HEAD")
+        branch = _git("branch", "--show-current") or "DETACHED"
+        dirty = bool(_git("status", "--porcelain"))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {
+            "git_commit": "unknown",
+            "git_commit_short": "unknown",
+            "git_branch": "unknown",
+            "git_dirty": "unknown",
+        }
+
+    return {
+        "git_commit": commit,
+        "git_commit_short": short_commit,
+        "git_branch": branch,
+        "git_dirty": str(dirty),
+    }
+
+
 def log_run_config(writer: SummaryWriter) -> None:
+    metadata = git_metadata()
+    hparams = cfg_hparams()
+    hparams.update(metadata)
+
     # Log hparams on this writer (add_hparams opens a nested SummaryWriter subdir).
-    exp, ssi, sei = hparams_summary(cfg_hparams(), {"hparam/started": 0.0})
+    exp, ssi, sei = hparams_summary(hparams, {"hparam/started": 0.0})
     writer.file_writer.add_summary(exp, 0)
     writer.file_writer.add_summary(ssi, 0)
     writer.file_writer.add_summary(sei, 0)
 
-    config_text = "\n".join(
-        f"{key}={value}" for key, value in vars(cfg).items() if not key.startswith("_")
-    )
+    config_items = [
+        (key, value) for key, value in vars(cfg).items() if not key.startswith("_")
+    ]
+    config_items.extend(metadata.items())
+    config_text = "\n".join(f"{key}={value}" for key, value in config_items)
     writer.add_text("config", config_text, global_step=0)
