@@ -29,7 +29,12 @@ from dagnabbit.dag.description import (
 from dagnabbit.scripts import config as cfg
 
 
-def build_model() -> DagnabbitAutoEncoder:
+def build_model(
+    *,
+    compute_reconstruction_loss: bool | None = None,
+) -> DagnabbitAutoEncoder:
+    if compute_reconstruction_loss is None:
+        compute_reconstruction_loss = cfg.COMPUTE_RECONSTRUCTION_LOSS
     return DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
@@ -37,6 +42,8 @@ def build_model() -> DagnabbitAutoEncoder:
         num_root_nodes=cfg.NUM_ROOT_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
+        compute_reconstruction_loss=compute_reconstruction_loss,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
@@ -160,6 +167,29 @@ def format_table(phase: str, stats_by_depth: dict[int, dict[str, float]]) -> str
     return "\n".join([header, *rows])
 
 
+def test_reconstruction_loss_can_be_disabled_and_enabled() -> None:
+    graph = sample_graph()
+
+    with torch.no_grad():
+        disabled_losses = build_model(
+            compute_reconstruction_loss=False,
+        ).training_forward(graph)
+        assert disabled_losses.primary_node_parent_reconstruction_losses.numel() == 0
+        assert (
+            disabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
+            == 0
+        )
+
+        enabled_losses = build_model(
+            compute_reconstruction_loss=True,
+        ).training_forward(graph)
+        assert enabled_losses.primary_node_parent_reconstruction_losses.numel() > 0
+        assert (
+            enabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
+            > 0
+        )
+
+
 def test_norms_stay_bounded() -> None:
     """Norms should neither explode nor collapse as DAG depth grows, on both the
     encode and decode passes."""
@@ -204,6 +234,7 @@ def main() -> None:
 
     test_norms_stay_bounded()
     test_no_mean_shift()
+    test_reconstruction_loss_can_be_disabled_and_enabled()
     print("\nALL SIGNAL-PROPAGATION CHECKS PASSED")
 
 

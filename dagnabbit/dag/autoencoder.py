@@ -308,6 +308,7 @@ class DagnabbitAutoEncoder(nn.Module):
         num_output_nodes: int,
         mlp_expansion_factor: float,
         reconstruction_detach_target: bool = True,
+        compute_reconstruction_loss: bool = False,
         transformer_num_layers: int = 1,
         transformer_mlp_depth: int = 1,
         transformer_num_register_tokens: int = 2,
@@ -330,6 +331,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
         self.mlp_expansion_factor = mlp_expansion_factor
         self.reconstruction_detach_target = reconstruction_detach_target
+        self.compute_reconstruction_loss = compute_reconstruction_loss
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.transformer_num_layers = transformer_num_layers
         self.transformer_mlp_depth = transformer_mlp_depth
@@ -902,22 +904,23 @@ class DagnabbitAutoEncoder(nn.Module):
             ar_flat = ar_predicted[rank_batch.valid_parent_mask]
             tf_flat = tf_predicted[rank_batch.valid_parent_mask]
 
-            # Per-edge reconstruction: 1 - cos(predicted, true_parent_embed).
-            recon_target = encoder_buffer[flat_parent_indices]
-            if self.reconstruction_detach_target:
-                recon_target = recon_target.detach()
-            ar_recon_edge_list.append(
-                1.0
-                - F.cosine_similarity(
-                    ar_flat.to(recon_target.dtype), recon_target, dim=-1
+            if self.compute_reconstruction_loss:
+                # Per-edge reconstruction: 1 - cos(predicted, true_parent_embed).
+                recon_target = encoder_buffer[flat_parent_indices]
+                if self.reconstruction_detach_target:
+                    recon_target = recon_target.detach()
+                ar_recon_edge_list.append(
+                    1.0
+                    - F.cosine_similarity(
+                        ar_flat.to(recon_target.dtype), recon_target, dim=-1
+                    )
                 )
-            )
-            tf_recon_edge_list.append(
-                1.0
-                - F.cosine_similarity(
-                    tf_flat.to(recon_target.dtype), recon_target, dim=-1
+                tf_recon_edge_list.append(
+                    1.0
+                    - F.cosine_similarity(
+                        tf_flat.to(recon_target.dtype), recon_target, dim=-1
+                    )
                 )
-            )
 
             autoregressive_child_sum.index_add_(
                 0,

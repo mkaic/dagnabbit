@@ -235,6 +235,7 @@ def main() -> None:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
+        compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,

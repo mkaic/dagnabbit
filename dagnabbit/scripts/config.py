@@ -67,7 +67,10 @@ W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 # --- teacher-forced decode pass loss weights ---
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
 
-# parent-reconstruction (per-edge: predicted parent vs true encode embedding)
+# parent-reconstruction (per-edge: predicted parent vs true encode embedding).
+# Keep this disabled while both reconstruction weights are zero to avoid spending
+# each training step on a loss that cannot affect gradients.
+COMPUTE_RECONSTRUCTION_LOSS = False
 W_PRIMARY_PARENT_RECONSTRUCTION = 0.0
 W_TF_PRIMARY_PARENT_RECONSTRUCTION = 0.0
 # parent-consistency (per-parent agreement among child predictions); opt-in
