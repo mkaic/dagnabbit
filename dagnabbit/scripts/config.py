@@ -15,7 +15,7 @@ TRANSFORMER_NUM_LAYERS = 2
 # Number of expanded hidden layers inside each transformer feed-forward MLP.
 TRANSFORMER_MLP_DEPTH = 1
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
-TRANSFORMER_NUM_HEADS = 4
+TRANSFORMER_NUM_HEADS = 8
 TRANSFORMER_DROPOUT = 0.0
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
