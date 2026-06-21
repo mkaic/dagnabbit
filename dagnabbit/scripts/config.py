@@ -39,6 +39,7 @@ LEARNING_RATE = 1e-4
 OPTIMIZER_CLASS = torch.optim.Muon
 OPTIMIZER_KWARGS = {
     "lr": LEARNING_RATE,
+    "adjust_lr_fn": "match_rms_adamw",
     # "betas": (0.9, 0.999),
 }
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
