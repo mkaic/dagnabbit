@@ -39,8 +39,7 @@ LEARNING_RATE = 1e-4
 OPTIMIZER_CLASS = torch.optim.AdamW
 OPTIMIZER_KWARGS = {
     "lr": LEARNING_RATE,
-    "betas": (0.99, 0.999),
-    "amsgrad": True,
+    "betas": (0.9, 0.999),
 }
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
 LR_WARMUP_OPTIMIZER_STEPS = 100
