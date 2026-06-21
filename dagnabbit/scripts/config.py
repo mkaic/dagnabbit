@@ -1,7 +1,7 @@
 import torch
 
 # --- model ---
-NODE_EMBEDDING_DIM = 128
+NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -35,13 +35,13 @@ NUM_TRUNK_NODES = 128
 # --- training ---
 NUM_STEPS = 1_000_000
 GRADIENT_ACCUMULATION_STEPS = 8
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
 LR_WARMUP_OPTIMIZER_STEPS = 100
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 1.0
+GRADIENT_CLIP_MAX_NORM = 2.0
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
