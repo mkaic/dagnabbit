@@ -13,19 +13,6 @@ from dagnabbit.dag.description import (
 )
 
 
-def _class_balance_weights(node_types: list[int]) -> list[float]:
-    """Return per-node weights of ``1 / count_of_that_type``.
-
-    Scaling each node's classification loss by this weight makes every type
-    present in ``node_types`` contribute equally to the summed loss, regardless
-    of how many nodes of that type appear in the graph.
-    """
-    counts: dict[int, int] = {}
-    for t in node_types:
-        counts[t] = counts.get(t, 0) + 1
-    return [1.0 / counts[t] for t in node_types]
-
-
 def _feed_forward_layers(
     vector_dims: Iterable[int],
     dropout: float,
@@ -519,15 +506,10 @@ class DagnabbitAutoEncoder(nn.Module):
 
         device = primary_buffer.device
 
-        # ---- Per-graph labels and class-balance weights ----
+        # ---- Per-graph labels ----
         # Shared by both decode passes (same graph, same node types).
         primary_labels = torch.as_tensor(
             list(primary_graph.node_types), dtype=torch.long, device=device
-        )
-        primary_weights = torch.as_tensor(
-            _class_balance_weights(list(primary_graph.node_types)),
-            dtype=primary_buffer.dtype,
-            device=device,
         )
 
         # Two decode passes over the *same* (shared) encode pass. The
@@ -549,7 +531,6 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_graph=primary_graph,
             primary_buffer=primary_buffer,
             primary_labels=primary_labels,
-            primary_weights=primary_weights,
             device=device,
         )
 
@@ -585,7 +566,6 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_graph: FixedInDegreeDAGDescription,
         primary_buffer: Tensor,
         primary_labels: Tensor,
-        primary_weights: Tensor,
         device: torch.device,
     ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult"]:
         """Run the full decode over the primary graph for both the autoregressive
@@ -676,7 +656,6 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_child_count=tf_primary_count,
             teacher_forced_child_sumsq=tf_primary_sumsq,
             labels=primary_labels,
-            class_weights=primary_weights,
             process_roots=True,
             device=device,
         )
@@ -708,7 +687,6 @@ class DagnabbitAutoEncoder(nn.Module):
         teacher_forced_child_count: Tensor,
         teacher_forced_child_sumsq: Tensor,
         labels: Tensor,
-        class_weights: Tensor,
         process_roots: bool,
         device: torch.device,
     ) -> tuple[
@@ -725,7 +703,7 @@ class DagnabbitAutoEncoder(nn.Module):
         parent/child). At each rank it batches:
 
         1. the variance-preserving combine ``child_sum / sqrt(child_count)``, and
-        2. classification (``node_type_predictor``) with class-balanced
+        2. classification (``node_type_predictor``) with per-node
            cross-entropy;
 
         then, per supertype group with parents, one ``decode_batch`` whose
@@ -860,12 +838,11 @@ class DagnabbitAutoEncoder(nn.Module):
             )
 
             rank_labels = labels[rank_node_indices]
-            rank_weights = class_weights[rank_node_indices]
             cross_entropy_both = F.cross_entropy(
                 logits_both,
                 torch.cat([rank_labels, rank_labels]),
                 reduction="none",
-            ) * torch.cat([rank_weights, rank_weights])
+            )
             ar_class[rank_node_indices] = cross_entropy_both[:num_rank_nodes].to(
                 ar_class.dtype
             )
