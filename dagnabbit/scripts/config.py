@@ -34,8 +34,8 @@ NUM_TRUNK_NODES = 128
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRADIENT_ACCUMULATION_STEPS = 16
-LEARNING_RATE = 5e-4
+GRADIENT_ACCUMULATION_STEPS = 4
+LEARNING_RATE = 1e-4
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
 LR_WARMUP_OPTIMIZER_STEPS = 100
 
