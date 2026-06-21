@@ -37,7 +37,7 @@ NUM_STEPS = 1_000_000
 GRADIENT_ACCUMULATION_STEPS = 8
 LEARNING_RATE = 2.5e-4
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
-LR_WARMUP_OPTIMIZER_STEPS = 100
+LR_WARMUP_OPTIMIZER_STEPS = 500
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
