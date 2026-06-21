@@ -36,6 +36,11 @@ NUM_TRUNK_NODES = 128
 NUM_STEPS = 1_000_000
 GRADIENT_ACCUMULATION_STEPS = 4
 LEARNING_RATE = 1e-4
+OPTIMIZER_CLASS = torch.optim.Muon
+OPTIMIZER_KWARGS = {
+    "lr": LEARNING_RATE,
+    # "betas": (0.9, 0.999),
+}
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
 LR_WARMUP_OPTIMIZER_STEPS = 100
 

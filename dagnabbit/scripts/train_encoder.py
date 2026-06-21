@@ -252,15 +252,16 @@ def main() -> None:
         f"({num_trainable_params})"
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
+    optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
     lr_scheduler = make_lr_warmup_scheduler(optimizer)
     if lr_scheduler is None:
         print("lr_warmup_optimizer_steps=0")
     else:
+        target_lrs = ", ".join(f"{lr:.4g}" for lr in lr_scheduler.base_lrs)
         print(
             f"lr_warmup_optimizer_steps={cfg.LR_WARMUP_OPTIMIZER_STEPS} "
             f"initial_lr={optimizer.param_groups[0]['lr']:.4g} "
-            f"target_lr={cfg.LEARNING_RATE:.4g}"
+            f"target_lr={target_lrs}"
         )
 
     prof: profile | None = None
