@@ -4,8 +4,9 @@ import torch
 NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
-NUM_ROOT_NODES = 16
-NUM_OUTPUT_NODES = 8
+NUM_ROOT_NODES = 4
+NUM_OUTPUT_NODES = 4
+NUM_TRUNK_NODES = 32
 
 # Hidden-layer width as a multiplicative expansion factor of each transformer
 # feed-forward input dim.
@@ -29,8 +30,6 @@ TORCH_COMPILE_DYNAMIC = True
 # Inductor's CUDA graph fast path disabled unless explicitly testing it.
 TORCH_COMPILE_CUDAGRAPHS = False
 
-# --- DAG sampling ---
-NUM_TRUNK_NODES = 128
 
 # --- training ---
 NUM_STEPS = 1_000_000
