@@ -208,17 +208,73 @@ class TransformerNodeEncoder(nn.Module):
 
 
 class TransformerNodeDecoder(nn.Module):
-    def __init__(self, sequence_transformer: TypeConditionedSequenceTransformer):
+    def __init__(
+        self,
+        sequence_transformer: TypeConditionedSequenceTransformer,
+        num_parent_slots: int,
+        num_leaf_context_slots: int,
+    ):
         super().__init__()
         self.sequence_transformer = sequence_transformer
+        self.num_parent_slots = num_parent_slots
+        self.num_leaf_context_slots = num_leaf_context_slots
 
-    def forward_batch(self, node_embeddings: Tensor, subtypes: Tensor) -> Tensor:
-        context = node_embeddings.unsqueeze(1).expand(
+        if num_parent_slots <= 0:
+            raise ValueError("num_parent_slots must be positive")
+        if num_leaf_context_slots < 0:
+            raise ValueError("num_leaf_context_slots must be non-negative")
+
+        expected_context_length = num_parent_slots + num_leaf_context_slots
+        if sequence_transformer.max_context_length != expected_context_length:
+            raise ValueError(
+                "decoder transformer context length must equal parent slots plus "
+                "leaf context slots; got "
+                f"{sequence_transformer.max_context_length} vs "
+                f"{expected_context_length}"
+            )
+
+    def forward_batch(
+        self,
+        node_embeddings: Tensor,
+        subtypes: Tensor,
+        leaf_embeddings: Tensor,
+    ) -> Tensor:
+        if node_embeddings.ndim != 2:
+            raise ValueError("node_embeddings must have shape [B, D]")
+        batch_size, embedding_dim = node_embeddings.shape
+        if embedding_dim != self.sequence_transformer.node_embedding_dim:
+            raise ValueError(
+                "node_embeddings embedding dim must be "
+                f"{self.sequence_transformer.node_embedding_dim}; got {embedding_dim}"
+            )
+
+        local_context = node_embeddings.unsqueeze(1).expand(
             -1,
-            self.sequence_transformer.max_context_length,
+            self.num_parent_slots,
             -1,
         )
-        return self.sequence_transformer(context, subtypes)
+        leaf_context = self._prepare_leaf_context(leaf_embeddings, node_embeddings)
+        context = torch.cat([local_context, leaf_context], dim=1)
+        transformed = self.sequence_transformer(context, subtypes)
+        return transformed[:, : self.num_parent_slots]
+
+    def _prepare_leaf_context(
+        self,
+        leaf_embeddings: Tensor,
+        node_embeddings: Tensor,
+    ) -> Tensor:
+        batch_size, embedding_dim = node_embeddings.shape
+        expected_shape = (self.num_leaf_context_slots, embedding_dim)
+        if leaf_embeddings.shape != expected_shape:
+            raise ValueError(
+                f"leaf_embeddings must have shape {expected_shape}; got "
+                f"{tuple(leaf_embeddings.shape)}"
+            )
+        leaf_embeddings = leaf_embeddings.to(
+            device=node_embeddings.device,
+            dtype=node_embeddings.dtype,
+        )
+        return leaf_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 @dataclass
@@ -327,9 +383,12 @@ class DagnabbitAutoEncoder(nn.Module):
         self.transformer_dropout = transformer_dropout
 
         # ---- Shared, type-conditioned node transformers ----
-        # The public context is the ordered parent-slot sequence padded to
-        # maximum_indegree. Each transformer appends its own registers and one
-        # node-type token internally, so all trunk and output types share weights.
+        # The encoder public context is the ordered parent-slot sequence padded
+        # to maximum_indegree. The decoder public context starts with those same
+        # parent-output slots, then appends one auxiliary slot per graph leaf
+        # (the fixed output nodes in generated graphs). Each transformer appends
+        # its own registers and one node-type token internally, so all trunk and
+        # output types share weights.
         self.node_encoder = TransformerNodeEncoder(
             TypeConditionedSequenceTransformer(
                 node_embedding_dim=node_embedding_dim,
@@ -347,14 +406,16 @@ class DagnabbitAutoEncoder(nn.Module):
             TypeConditionedSequenceTransformer(
                 node_embedding_dim=node_embedding_dim,
                 num_node_types=self.num_node_types,
-                max_context_length=self.maximum_indegree,
+                max_context_length=self.maximum_indegree + self.num_output_nodes,
                 num_layers=self.transformer_num_layers,
                 num_register_tokens=transformer_num_register_tokens,
                 num_heads=transformer_num_heads,
                 transformer_mlp_depth=transformer_mlp_depth,
                 mlp_expansion_factor=mlp_expansion_factor,
                 dropout=transformer_dropout,
-            )
+            ),
+            num_parent_slots=self.maximum_indegree,
+            num_leaf_context_slots=self.num_output_nodes,
         )
 
         # ---- Root node embeddings ----
@@ -467,6 +528,24 @@ class DagnabbitAutoEncoder(nn.Module):
             valid_parent_mask=valid_parent_mask[order],
             subtypes=subtypes[order],
         )
+
+    def _make_leaf_context(
+        self,
+        graph: FixedInDegreeDAGDescription,
+        encoder_buffer: Tensor,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor]:
+        leaf_indices = torch.as_tensor(
+            graph.leaf_node_indices, dtype=torch.long, device=device
+        )
+        expected_leaf_slots = self.node_decoder.num_leaf_context_slots
+        if leaf_indices.shape[0] != expected_leaf_slots:
+            raise ValueError(
+                "decoder is configured for "
+                f"{expected_leaf_slots} leaf context slots, but graph has "
+                f"{leaf_indices.shape[0]} leaf nodes"
+            )
+        return leaf_indices, encoder_buffer[leaf_indices]
 
     def _in_degree_for_type(self, node_type: int) -> int:
         if node_type < self.num_trunk_node_types:
@@ -618,8 +697,8 @@ class DagnabbitAutoEncoder(nn.Module):
         # each leaf simply starts the autoregressive chain from its true encode
         # embedding (one prediction, so its combine is that embedding itself).
         # Both passes seed identically from the shared encode buffer.
-        leaf_indices = torch.as_tensor(
-            primary_graph.leaf_node_indices, dtype=torch.long, device=device
+        leaf_indices, leaf_embeddings = self._make_leaf_context(
+            primary_graph, primary_buffer, device
         )
         for child_sum, child_count, child_sumsq in (
             (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
@@ -656,6 +735,7 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_child_count=tf_primary_count,
             teacher_forced_child_sumsq=tf_primary_sumsq,
             labels=primary_labels,
+            leaf_embeddings=leaf_embeddings,
             process_roots=True,
             device=device,
         )
@@ -687,6 +767,7 @@ class DagnabbitAutoEncoder(nn.Module):
         teacher_forced_child_count: Tensor,
         teacher_forced_child_sumsq: Tensor,
         labels: Tensor,
+        leaf_embeddings: Tensor,
         process_roots: bool,
         device: torch.device,
     ) -> tuple[
@@ -867,6 +948,7 @@ class DagnabbitAutoEncoder(nn.Module):
             predicted_both = self.node_decoder.forward_batch(
                 decode_input_both,
                 subtypes_both,
+                leaf_embeddings,
             )
             ar_predicted = predicted_both[:num_rank_nodes]
             tf_predicted = predicted_both[num_rank_nodes:]
@@ -1006,7 +1088,11 @@ class DagnabbitAutoEncoder(nn.Module):
                 termination_reason = "max_nodes"
                 break
 
-            predictions = self._blind_decode_expand(pool, frontier)
+            predictions = self._blind_decode_expand(
+                pool,
+                frontier,
+                output_embeddings,
+            )
             frontier = self._blind_decode_integrate(
                 pool,
                 predictions,
@@ -1038,6 +1124,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self,
         pool: list[_DecodeNode],
         frontier: list[int],
+        leaf_embeddings: Tensor,
     ) -> list[_ParentPrediction]:
         node_ids: list[int] = []
         subtypes: list[int] = []
@@ -1063,7 +1150,9 @@ class DagnabbitAutoEncoder(nn.Module):
             device=node_embeddings.device,
         )
         parent_embeddings = self.node_decoder.forward_batch(
-            node_embeddings, subtype_tensor
+            node_embeddings,
+            subtype_tensor,
+            leaf_embeddings,
         )
 
         for row_idx, child_id in enumerate(node_ids):
