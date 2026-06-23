@@ -100,13 +100,18 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
 def save_checkpoint(
     path: Path,
     step: int,
+    graphs_seen: int,
     model: DagnabbitAutoEncoder,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     loss: float,
 ) -> None:
     checkpoint = {
+        # ``step`` is retained as the zero-based loop index for compatibility
+        # with existing checkpoints. The other counters are unambiguous.
         "step": step,
+        "completed_steps": step + 1,
+        "graphs_seen": graphs_seen,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss": loss,
@@ -216,6 +221,23 @@ def main() -> None:
     device = torch.device(cfg.DEVICE)
     if cfg.GRAPH_BATCH_SIZE <= 0:
         raise ValueError("GRAPH_BATCH_SIZE must be positive")
+    if cfg.GRADIENT_ACCUMULATION_STEPS <= 0:
+        raise ValueError("GRADIENT_ACCUMULATION_STEPS must be positive")
+
+    checkpoint_every_graphs = cfg.CHECKPOINT_EVERY_GRAPHS
+    checkpoint_every_steps: int | None = None
+    if checkpoint_every_graphs is not None:
+        if checkpoint_every_graphs <= 0:
+            raise ValueError("CHECKPOINT_EVERY_GRAPHS must be positive or None")
+        if checkpoint_every_graphs % cfg.GRAPH_BATCH_SIZE != 0:
+            raise ValueError(
+                "CHECKPOINT_EVERY_GRAPHS must be divisible by GRAPH_BATCH_SIZE"
+            )
+        checkpoint_every_steps = checkpoint_every_graphs // cfg.GRAPH_BATCH_SIZE
+        if checkpoint_every_steps % cfg.GRADIENT_ACCUMULATION_STEPS != 0:
+            raise ValueError(
+                "CHECKPOINT_EVERY_GRAPHS must land on an optimizer-update boundary"
+            )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
@@ -363,6 +385,7 @@ def main() -> None:
                 tf_window_truth.append(tf_step_truth)
 
             loss_val = total.item()
+            graphs_seen = (step + 1) * cfg.GRAPH_BATCH_SIZE
             loss_window.append(loss_val)
             if loss_ema is None:
                 loss_ema = loss_val
@@ -413,6 +436,7 @@ def main() -> None:
                     save_checkpoint(
                         checkpoint_path,
                         step,
+                        graphs_seen,
                         model,
                         optimizer,
                         lr_scheduler,
@@ -422,6 +446,26 @@ def main() -> None:
                         f"step {step + 1}: new best avg loss {avg_loss:.4g} "
                         f"-> {checkpoint_path}"
                     )
+
+            if (
+                checkpoint_every_steps is not None
+                and (step + 1) % checkpoint_every_steps == 0
+            ):
+                checkpoint_dir = run_dir / "checkpoints"
+                checkpoint_dir.mkdir(exist_ok=True)
+                checkpoint_path = checkpoint_dir / f"graphs-{graphs_seen:09d}.ckpt"
+                save_checkpoint(
+                    checkpoint_path,
+                    step,
+                    graphs_seen,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    loss_val,
+                )
+                progress.write(
+                    f"graphs {graphs_seen}: saved checkpoint -> {checkpoint_path}"
+                )
 
             if prof is not None:
                 prof.step()

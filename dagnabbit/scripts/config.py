@@ -50,6 +50,10 @@ GRADIENT_CLIP_MAX_NORM = 4.0
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
+# Save an immutable training snapshot after this many completed graphs. The
+# interval must land on both a graph-batch and optimizer-update boundary so a
+# checkpoint represents a complete training state. Set to None to disable.
+CHECKPOINT_EVERY_GRAPHS = 20_000
 # DEVICE="cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
