@@ -40,8 +40,8 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
+from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
-from dagnabbit.scripts.graph_batches import GraphBatchSource, GraphGenerationConfig
 from dagnabbit.scripts.train_encoder import combine_losses
 
 
@@ -83,24 +83,6 @@ def parse_args() -> argparse.Namespace:
         "--no-trace",
         action="store_true",
         help="Skip the chrome trace export (smaller output).",
-    )
-    p.add_argument(
-        "--prefetch-graphs",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Generate future graph batches in a background process.",
-    )
-    p.add_argument(
-        "--prefetch-workers",
-        type=int,
-        default=None,
-        help="Number of graph-generation worker processes.",
-    )
-    p.add_argument(
-        "--prefetch-batches",
-        type=int,
-        default=None,
-        help="Number of future graph batches to keep queued.",
     )
     return p.parse_args()
 
@@ -151,12 +133,6 @@ def main() -> None:
         cfg.GRAPH_BATCH_SIZE = args.batch_size
     if args.compile is not None:
         cfg.TORCH_COMPILE = args.compile
-    if args.prefetch_graphs is not None:
-        cfg.GRAPH_PREFETCH_ENABLED = args.prefetch_graphs
-    if args.prefetch_workers is not None:
-        cfg.GRAPH_PREFETCH_WORKERS = args.prefetch_workers
-    if args.prefetch_batches is not None:
-        cfg.GRAPH_PREFETCH_BATCHES = args.prefetch_batches
 
     torch.manual_seed(cfg.SEED)
     torch.set_float32_matmul_precision("high")
@@ -210,23 +186,21 @@ def main() -> None:
     model.evaluate_graph_batch = timed_encode
     model._decode_pipeline = timed_decode
 
-    graph_source = GraphBatchSource(
-        batch_size=cfg.GRAPH_BATCH_SIZE,
-        graph_config=GraphGenerationConfig(
-            num_root_nodes=cfg.NUM_ROOT_NODES,
-            num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-            num_output_nodes=cfg.NUM_OUTPUT_NODES,
-            trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-            num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-        ),
-        prefetch=cfg.GRAPH_PREFETCH_ENABLED,
-        num_workers=cfg.GRAPH_PREFETCH_WORKERS,
-        prefetch_batches=cfg.GRAPH_PREFETCH_BATCHES,
-    )
+    def make_graphs():
+        return [
+            make_random_graph_description(
+                num_root_nodes=cfg.NUM_ROOT_NODES,
+                num_trunk_nodes=cfg.NUM_TRUNK_NODES,
+                num_output_nodes=cfg.NUM_OUTPUT_NODES,
+                trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+                num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+            )
+            for _ in range(cfg.GRAPH_BATCH_SIZE)
+        ]
 
     def run_step():
         with timer.phase("gen"):
-            graphs = graph_source.next()
+            graphs = make_graphs()
         with timer.phase("forward"):
             losses = model.training_forward_batch(graphs)
             total, _ = combine_losses(losses)
@@ -302,11 +276,6 @@ def main() -> None:
     )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")
-    w(
-        "graph_prefetch   "
-        f"{cfg.GRAPH_PREFETCH_ENABLED}  workers {cfg.GRAPH_PREFETCH_WORKERS}  "
-        f"batches {cfg.GRAPH_PREFETCH_BATCHES}"
-    )
     w(f"measured_steps   {args.steps} (after {args.warmup} warmup)")
     w("")
 
@@ -399,7 +368,6 @@ def main() -> None:
         prof.export_chrome_trace(str(trace_path))
         print(f"chrome_trace={trace_path}  (open at https://ui.perfetto.dev)")
 
-    graph_source.close()
     print(f"\nwrote {out_dir}/SUMMARY.txt  <- paste this back for analysis")
 
 

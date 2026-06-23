@@ -55,12 +55,6 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
-# Generate future graph batches in a background process so Python graph
-# construction overlaps the current step's GPU work.
-GRAPH_PREFETCH_ENABLED = DEVICE == "cuda"
-GRAPH_PREFETCH_WORKERS = 1
-GRAPH_PREFETCH_BATCHES = 2
-
 # --- loss weights ---
 # Uniform scale applied to the weighted sum of all loss terms before backward.
 GLOBAL_LOSS_MULTIPLIER = 1.0
