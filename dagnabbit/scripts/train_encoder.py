@@ -306,6 +306,9 @@ def main() -> None:
         last_optimizer_lr = optimizer.param_groups[0]["lr"]
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
+            # TensorBoard's Step axis is the historical per-graph training
+            # coordinate, not the optimizer/update index.
+            tensorboard_step = step * cfg.GRAPH_BATCH_SIZE
             graphs = [
                 make_random_graph_description(
                     num_root_nodes=cfg.NUM_ROOT_NODES,
@@ -390,7 +393,7 @@ def main() -> None:
                 tf_window_truth.clear()
                 log_step_metrics(
                     writer,
-                    step,
+                    tensorboard_step,
                     loss_val,
                     {name: value.item() for name, value in components.items()},
                     decoder_accuracy,
