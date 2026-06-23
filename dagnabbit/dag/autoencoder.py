@@ -9,6 +9,7 @@ from torch import Tensor
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     NodeSupertype,
+    PreparedRankBatch,
     subtype_to_supertype,
 )
 
@@ -308,18 +309,6 @@ class _DecodePipelineResult:
 
 
 @dataclass
-class _RankBatch:
-    node_indices: Tensor
-    parent_indices: Tensor
-    valid_parent_mask: Tensor
-    subtypes: Tensor
-    # CPU-side: does any node in this rank have at least one parent? Derived from
-    # graph structure (in-degrees) so the decode loop can skip parent-less ranks
-    # without a device read of ``valid_parent_mask``.
-    has_valid_parents: bool = False
-
-
-@dataclass
 class _BatchedRank:
     batch_indices: Tensor
     node_indices: Tensor
@@ -439,6 +428,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self,
         graphs: Sequence[FixedInDegreeDAGDescription],
         root_node_embeddings: Tensor | None = None,
+        rank_batches: Sequence[_BatchedRank] | None = None,
     ) -> Tensor:
         graphs = list(graphs)
         if root_node_embeddings is None:
@@ -459,9 +449,11 @@ class DagnabbitAutoEncoder(nn.Module):
         # Walk topological ranks ascending. Rank 0 roots are seeded above. Every
         # non-root node in a rank can be encoded together because node type is an
         # input token to the shared transformer rather than a module selector.
-        max_ranks = max(len(graph.rank_groups) for graph in graphs)
+        if rank_batches is None:
+            rank_batches = self._make_batched_rank_cache(graphs, device)
+        max_ranks = len(rank_batches)
         for rank in range(1, max_ranks):
-            rank_batch = self._make_batched_rank(graphs, rank, device)
+            rank_batch = rank_batches[rank]
             if rank_batch.node_indices.numel() == 0:
                 continue
             parent_embeddings = embeddings_buffer[
@@ -483,75 +475,96 @@ class DagnabbitAutoEncoder(nn.Module):
 
         return embeddings_buffer
 
-    def _make_rank_batch(
-        self,
-        groups: list,
-        device: torch.device,
-    ) -> _RankBatch:
-        if not groups:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return _RankBatch(
-                node_indices=empty,
-                parent_indices=torch.empty(
-                    0,
-                    self.maximum_indegree,
-                    dtype=torch.long,
-                    device=device,
-                ),
-                valid_parent_mask=torch.empty(
-                    0,
-                    self.maximum_indegree,
-                    dtype=torch.bool,
-                    device=device,
-                ),
-                subtypes=empty,
+    def _empty_batched_rank(self, device: torch.device) -> _BatchedRank:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return _BatchedRank(
+            batch_indices=empty,
+            node_indices=empty,
+            parent_indices=torch.empty(
+                0,
+                self.maximum_indegree,
+                dtype=torch.long,
+                device=device,
+            ),
+            valid_parent_mask=torch.empty(
+                0,
+                self.maximum_indegree,
+                dtype=torch.bool,
+                device=device,
+            ),
+            subtypes=empty,
+        )
+
+    def _validate_prepared_rank(self, rank_batch: PreparedRankBatch) -> None:
+        parent_width = rank_batch.parent_indices.shape[1]
+        if parent_width != self.maximum_indegree:
+            raise ValueError(
+                "graph rank metadata has maximum in-degree "
+                f"{parent_width}, but model expects {self.maximum_indegree}"
             )
 
-        node_indices = torch.cat([g.node_buffer_indices for g in groups]).to(device)
-        subtypes = torch.cat([g.subtypes for g in groups]).to(device)
-        parent_indices = torch.zeros(
-            node_indices.shape[0],
-            self.maximum_indegree,
-            dtype=torch.long,
+    def _make_batched_rank_cache(
+        self,
+        graphs: Sequence[FixedInDegreeDAGDescription],
+        device: torch.device,
+    ) -> list[_BatchedRank]:
+        max_ranks = max(len(graph.rank_batches) for graph in graphs)
+        cpu_ranks = [
+            self._make_batched_rank_cpu(graphs, rank) for rank in range(max_ranks)
+        ]
+        row_counts = [rank.node_indices.shape[0] for rank in cpu_ranks]
+        total_rows = sum(row_counts)
+        if total_rows == 0:
+            return [self._empty_batched_rank(device) for _ in cpu_ranks]
+
+        nonempty_ranks = [
+            rank for rank, row_count in zip(cpu_ranks, row_counts) if row_count
+        ]
+        batch_indices = torch.cat([rank.batch_indices for rank in nonempty_ranks]).to(
             device=device,
+            non_blocking=True,
         )
-        valid_parent_mask = torch.zeros(
-            node_indices.shape[0],
-            self.maximum_indegree,
-            dtype=torch.bool,
+        node_indices = torch.cat([rank.node_indices for rank in nonempty_ranks]).to(
             device=device,
+            non_blocking=True,
+        )
+        parent_indices = torch.cat([rank.parent_indices for rank in nonempty_ranks]).to(
+            device=device,
+            non_blocking=True,
+        )
+        valid_parent_mask = torch.cat(
+            [rank.valid_parent_mask for rank in nonempty_ranks]
+        ).to(
+            device=device,
+            non_blocking=True,
+        )
+        subtypes = torch.cat([rank.subtypes for rank in nonempty_ranks]).to(
+            device=device,
+            non_blocking=True,
         )
 
+        device_ranks: list[_BatchedRank] = []
         offset = 0
-        has_valid_parents = False
-        for group in groups:
-            group_parents = group.parent_buffer_gather_indices.to(device)
-            group_size, in_degree = group_parents.shape
-            if in_degree > self.maximum_indegree:
-                raise ValueError(
-                    f"rank contains in-degree {in_degree}, above maximum "
-                    f"{self.maximum_indegree}"
+        for cpu_rank, row_count in zip(cpu_ranks, row_counts):
+            start = offset
+            offset += row_count
+            end = offset
+            device_ranks.append(
+                _BatchedRank(
+                    batch_indices=batch_indices[start:end],
+                    node_indices=node_indices[start:end],
+                    parent_indices=parent_indices[start:end],
+                    valid_parent_mask=valid_parent_mask[start:end],
+                    subtypes=subtypes[start:end],
+                    has_valid_parents=cpu_rank.has_valid_parents,
                 )
-            if in_degree and group_size:
-                parent_indices[offset : offset + group_size, :in_degree] = group_parents
-                valid_parent_mask[offset : offset + group_size, :in_degree] = True
-                has_valid_parents = True
-            offset += group_size
+            )
+        return device_ranks
 
-        order = node_indices.argsort()
-        return _RankBatch(
-            node_indices=node_indices[order],
-            parent_indices=parent_indices[order],
-            valid_parent_mask=valid_parent_mask[order],
-            subtypes=subtypes[order],
-            has_valid_parents=has_valid_parents,
-        )
-
-    def _make_batched_rank(
+    def _make_batched_rank_cpu(
         self,
         graphs: Sequence[FixedInDegreeDAGDescription],
         rank: int,
-        device: torch.device,
     ) -> _BatchedRank:
         batch_indices: list[Tensor] = []
         node_indices: list[Tensor] = []
@@ -561,9 +574,10 @@ class DagnabbitAutoEncoder(nn.Module):
         has_valid_parents = False
 
         for batch_idx, graph in enumerate(graphs):
-            if rank >= len(graph.rank_groups):
+            if rank >= len(graph.rank_batches):
                 continue
-            rank_batch = self._make_rank_batch(graph.rank_groups[rank], device)
+            rank_batch = graph.rank_batches[rank]
+            self._validate_prepared_rank(rank_batch)
             num_rows = rank_batch.node_indices.shape[0]
             if num_rows == 0:
                 continue
@@ -573,7 +587,6 @@ class DagnabbitAutoEncoder(nn.Module):
                     (num_rows,),
                     batch_idx,
                     dtype=torch.long,
-                    device=device,
                 )
             )
             node_indices.append(rank_batch.node_indices)
@@ -582,24 +595,7 @@ class DagnabbitAutoEncoder(nn.Module):
             subtypes.append(rank_batch.subtypes)
 
         if not node_indices:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return _BatchedRank(
-                batch_indices=empty,
-                node_indices=empty,
-                parent_indices=torch.empty(
-                    0,
-                    self.maximum_indegree,
-                    dtype=torch.long,
-                    device=device,
-                ),
-                valid_parent_mask=torch.empty(
-                    0,
-                    self.maximum_indegree,
-                    dtype=torch.bool,
-                    device=device,
-                ),
-                subtypes=empty,
-            )
+            return self._empty_batched_rank(torch.device("cpu"))
 
         return _BatchedRank(
             batch_indices=torch.cat(batch_indices),
@@ -639,22 +635,18 @@ class DagnabbitAutoEncoder(nn.Module):
         """
 
         primary_graphs = list(primary_graphs)
+        device = self.root_node_embeddings.weight.device
+        rank_batches = self._make_batched_rank_cache(primary_graphs, device)
         primary_buffer = self.evaluate_graph_batch(
             graphs=primary_graphs,
+            rank_batches=rank_batches,
         )
 
         device = primary_buffer.device
         primary_labels = torch.stack(
-            [
-                torch.as_tensor(
-                    list(graph.node_types),
-                    dtype=torch.long,
-                    device=device,
-                )
-                for graph in primary_graphs
-            ],
+            [graph.node_types_tensor for graph in primary_graphs],
             dim=0,
-        )
+        ).to(device=device, non_blocking=True)
 
         # Two decode passes over the same shared encode pass. The
         # autoregressive pass compounds predictions down each DAG; the
@@ -664,6 +656,7 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_graphs=primary_graphs,
             primary_buffer=primary_buffer,
             primary_labels=primary_labels,
+            rank_batches=rank_batches,
             device=device,
         )
 
@@ -696,6 +689,7 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_graphs: Sequence[FixedInDegreeDAGDescription],
         primary_buffer: Tensor,
         primary_labels: Tensor,
+        rank_batches: Sequence[_BatchedRank],
         device: torch.device,
     ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult"]:
         batch_size, num_nodes, _ = primary_buffer.shape
@@ -730,30 +724,20 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_buffer.dtype
         )
 
-        leaf_embeddings_by_graph = torch.empty(
-            batch_size,
-            self.num_output_nodes,
-            self.node_embedding_dim,
-            dtype=primary_buffer.dtype,
-            device=device,
-        )
-        for batch_idx, graph in enumerate(primary_graphs):
-            leaf_indices = torch.as_tensor(
-                graph.leaf_node_indices,
-                dtype=torch.long,
-                device=device,
-            )
-            leaf_embeddings = primary_buffer[batch_idx, leaf_indices]
-            leaf_embeddings_by_graph[batch_idx] = leaf_embeddings
-            for child_sum, child_count, child_sumsq in (
-                (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
-                (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
-            ):
-                child_sum[batch_idx, leaf_indices] = leaf_embeddings.to(child_sum.dtype)
-                child_count[batch_idx, leaf_indices] = 1.0
-                child_sumsq[batch_idx, leaf_indices] = (
-                    leaf_embeddings.to(child_sumsq.dtype) ** 2
-                )
+        leaf_indices = torch.stack(
+            [graph.leaf_node_indices_tensor for graph in primary_graphs],
+            dim=0,
+        ).to(device=device, non_blocking=True)
+        batch_rows = torch.arange(batch_size, dtype=torch.long, device=device)[:, None]
+        leaf_embeddings_by_graph = primary_buffer[batch_rows, leaf_indices]
+        for child_sum, child_count, child_sumsq in (
+            (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
+            (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
+        ):
+            leaf_embeddings = leaf_embeddings_by_graph.to(child_sum.dtype)
+            child_sum[batch_rows, leaf_indices] = leaf_embeddings
+            child_count[batch_rows, leaf_indices] = 1.0
+            child_sumsq[batch_rows, leaf_indices] = leaf_embeddings**2
 
         (
             (
@@ -782,6 +766,7 @@ class DagnabbitAutoEncoder(nn.Module):
             labels=primary_labels,
             leaf_embeddings_by_graph=leaf_embeddings_by_graph,
             process_roots=True,
+            rank_batches=rank_batches,
             device=device,
         )
 
@@ -814,6 +799,7 @@ class DagnabbitAutoEncoder(nn.Module):
         labels: Tensor,
         leaf_embeddings_by_graph: Tensor,
         process_roots: bool,
+        rank_batches: Sequence[_BatchedRank],
         device: torch.device,
     ) -> tuple[
         tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
@@ -856,12 +842,12 @@ class DagnabbitAutoEncoder(nn.Module):
         ar_recon_edge_list: list[Tensor] = []
         tf_recon_edge_list: list[Tensor] = []
 
-        max_ranks = max(len(graph.rank_groups) for graph in graphs)
+        max_ranks = len(rank_batches)
         for rank in reversed(range(max_ranks)):
             if rank == 0 and not process_roots:
                 continue
 
-            rank_batch = self._make_batched_rank(graphs, rank, device)
+            rank_batch = rank_batches[rank]
             if rank_batch.node_indices.numel() == 0:
                 continue
 
@@ -977,9 +963,9 @@ class DagnabbitAutoEncoder(nn.Module):
             if self.compute_reconstruction_loss:
                 valid_parent_mask = mask
                 flat_parent_indices = rank_batch.parent_indices[valid_parent_mask]
-                flat_batch_indices = rows[:, None].expand_as(
-                    rank_batch.parent_indices
-                )[valid_parent_mask]
+                flat_batch_indices = rows[:, None].expand_as(rank_batch.parent_indices)[
+                    valid_parent_mask
+                ]
                 ar_flat = ar_predicted[valid_parent_mask]
                 tf_flat = tf_predicted[valid_parent_mask]
                 recon_target = encoder_buffer[flat_batch_indices, flat_parent_indices]
@@ -1005,7 +991,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 0, global_parent_indices, edge_weight
             )
             autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, (ar_contrib**2).to(autoregressive_child_sumsq.dtype)
+                0,
+                global_parent_indices,
+                (ar_contrib**2).to(autoregressive_child_sumsq.dtype),
             )
             teacher_forced_child_sum.view(batch_size * num_nodes, -1).index_add_(
                 0, global_parent_indices, tf_contrib.to(teacher_forced_child_sum.dtype)
@@ -1014,7 +1002,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 0, global_parent_indices, edge_weight
             )
             teacher_forced_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, (tf_contrib**2).to(teacher_forced_child_sumsq.dtype)
+                0,
+                global_parent_indices,
+                (tf_contrib**2).to(teacher_forced_child_sumsq.dtype),
             )
 
         _empty = encoder_buffer.new_zeros(0)

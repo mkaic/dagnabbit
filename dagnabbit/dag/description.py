@@ -82,6 +82,17 @@ class RankGroup:
     subtypes: torch.Tensor
 
 
+@dataclass
+class PreparedRankBatch:
+    """CPU-side padded tensors for one topological rank of one graph."""
+
+    node_indices: torch.Tensor
+    parent_indices: torch.Tensor
+    valid_parent_mask: torch.Tensor
+    subtypes: torch.Tensor
+    has_valid_parents: bool = False
+
+
 class FixedInDegreeDAGDescription:
     def __init__(
         self,
@@ -100,11 +111,13 @@ class FixedInDegreeDAGDescription:
 
         self.node_inputs_indices = node_inputs_indices
         self.node_types = node_types
+        self.node_types_tensor = torch.tensor(self.node_types, dtype=torch.long)
         self.num_trunk_nodes = num_trunk_nodes
         self.num_root_nodes = num_root_nodes
         self.num_output_nodes = num_output_nodes
         self.num_trunk_node_types = num_trunk_node_types
         self.trunk_node_in_degrees = trunk_node_in_degrees
+        self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
 
         # Each root and output gets its own unique type index, laid out in a
@@ -135,11 +148,16 @@ class FixedInDegreeDAGDescription:
             assert self.node_types[node_idx] == self.output_node_types_start + i
 
         self.leaf_node_indices = self.identify_leaf_nodes()
+        self.leaf_node_indices_tensor = torch.tensor(
+            self.leaf_node_indices,
+            dtype=torch.long,
+        )
 
         # Batch overlay over the (unchanged) flat arrays: longest-path rank per
         # node, and the per-rank groups iterated over during grouped evaluation.
         self.node_ranks = self.compute_node_ranks()
         self.rank_groups = self.build_rank_groups()
+        self.rank_batches = self.build_rank_batches()
 
     def identify_leaf_nodes(self) -> list[int]:
         """
@@ -239,6 +257,80 @@ class FixedInDegreeDAGDescription:
             rank_groups.append(groups)
 
         return rank_groups
+
+    def build_rank_batches(self) -> list[PreparedRankBatch]:
+        """Precompute padded CPU rank tensors used by the model hot path.
+
+        ``rank_groups`` keeps the semantic grouping for diagnostics and future
+        batching strategies. The training loop needs a node-sorted padded view
+        of each rank every encode/decode pass, so build that once when the graph
+        is created instead of rebuilding it on the compute device.
+        """
+        rank_batches: list[PreparedRankBatch] = []
+        for groups in self.rank_groups:
+            if not groups:
+                empty = torch.empty(0, dtype=torch.long)
+                rank_batches.append(
+                    PreparedRankBatch(
+                        node_indices=empty,
+                        parent_indices=torch.empty(
+                            0,
+                            self.maximum_indegree,
+                            dtype=torch.long,
+                        ),
+                        valid_parent_mask=torch.empty(
+                            0,
+                            self.maximum_indegree,
+                            dtype=torch.bool,
+                        ),
+                        subtypes=empty,
+                    )
+                )
+                continue
+
+            node_indices = torch.cat([g.node_buffer_indices for g in groups])
+            subtypes = torch.cat([g.subtypes for g in groups])
+            parent_indices = torch.zeros(
+                node_indices.shape[0],
+                self.maximum_indegree,
+                dtype=torch.long,
+            )
+            valid_parent_mask = torch.zeros(
+                node_indices.shape[0],
+                self.maximum_indegree,
+                dtype=torch.bool,
+            )
+
+            offset = 0
+            has_valid_parents = False
+            for group in groups:
+                group_parents = group.parent_buffer_gather_indices
+                group_size, in_degree = group_parents.shape
+                if in_degree > self.maximum_indegree:
+                    raise ValueError(
+                        f"rank contains in-degree {in_degree}, above maximum "
+                        f"{self.maximum_indegree}"
+                    )
+                if in_degree and group_size:
+                    parent_indices[offset : offset + group_size, :in_degree] = (
+                        group_parents
+                    )
+                    valid_parent_mask[offset : offset + group_size, :in_degree] = True
+                    has_valid_parents = True
+                offset += group_size
+
+            order = node_indices.argsort()
+            rank_batches.append(
+                PreparedRankBatch(
+                    node_indices=node_indices[order],
+                    parent_indices=parent_indices[order],
+                    valid_parent_mask=valid_parent_mask[order],
+                    subtypes=subtypes[order],
+                    has_valid_parents=has_valid_parents,
+                )
+            )
+
+        return rank_batches
 
 
 def make_random_graph_description(
@@ -390,7 +482,9 @@ def make_random_graph_description(
     for node_idx in range(num_nodes):
         slot_values = parents[node_idx]
         assert all(value is not None for value in slot_values)
-        ordered_parents: list[int] = [value for value in slot_values if value is not None]
+        ordered_parents: list[int] = [
+            value for value in slot_values if value is not None
+        ]
         if node_idx >= num_root_nodes:
             rng.shuffle(ordered_parents)
         node_inputs_indices.append(ordered_parents)
