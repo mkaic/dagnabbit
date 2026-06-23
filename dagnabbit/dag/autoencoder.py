@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -28,8 +29,18 @@ def _feed_forward_layers(
     return layers
 
 
+def _normalize_to_unit_sphere(x: Tensor) -> Tensor:
+    """Project each embedding vector onto the unit L2 hypersphere."""
+    return F.normalize(x, dim=-1)
+
+
+def _normalize_to_model_sphere(x: Tensor) -> Tensor:
+    """Project embeddings to the fixed radius used at recursive boundaries."""
+    return _normalize_to_unit_sphere(x) * math.sqrt(x.shape[-1])
+
+
 class TransformerBlock(nn.Module):
-    """Pre-norm self-attention + MLP block with a standard residual stream."""
+    """nGPT-style attention and MLP updates on the unit hypersphere."""
 
     def __init__(
         self,
@@ -38,12 +49,14 @@ class TransformerBlock(nn.Module):
         transformer_mlp_depth: int,
         mlp_expansion_factor: float,
         dropout: float,
+        residual_step_init: float,
     ):
         super().__init__()
         if transformer_mlp_depth < 0:
             raise ValueError("transformer_mlp_depth must be non-negative")
+        if not 0.0 < residual_step_init < 1.0:
+            raise ValueError("residual_step_init must be strictly between 0 and 1")
         hidden_dim = max(1, round(node_embedding_dim * mlp_expansion_factor))
-        self.attn_norm = nn.LayerNorm(node_embedding_dim)
         self.attn = nn.MultiheadAttention(
             node_embedding_dim,
             num_heads,
@@ -59,11 +72,33 @@ class TransformerBlock(nn.Module):
                 dropout,
             )
         )
-        self.ff_norm = nn.LayerNorm(node_embedding_dim)
         self.ff_dropout = nn.Dropout(dropout)
 
+        # Sigmoid-parameterized, per-channel interpolation steps. Initializing
+        # them near zero makes each block begin as a small directional update
+        # instead of an unrestricted residual addition.
+        step_logit = math.log(residual_step_init) - math.log1p(-residual_step_init)
+        self.attn_step_logits = nn.Parameter(
+            torch.full((node_embedding_dim,), step_logit)
+        )
+        self.ff_step_logits = nn.Parameter(
+            torch.full((node_embedding_dim,), step_logit)
+        )
+
+    @staticmethod
+    def _interpolate_on_sphere(
+        current: Tensor,
+        proposal: Tensor,
+        step_logits: Tensor,
+    ) -> Tensor:
+        step = step_logits.sigmoid().to(dtype=current.dtype)
+        return _normalize_to_unit_sphere(
+            current + step * (proposal - current)
+        )
+
     def forward(self, x: Tensor, key_padding_mask: Tensor | None) -> Tensor:
-        y = self.attn_norm(x)
+        x = _normalize_to_unit_sphere(x)
+        y = x
         y, _ = self.attn(
             y,
             y,
@@ -71,8 +106,11 @@ class TransformerBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False,
         )
-        x = x + self.attn_dropout(y)
-        return x + self.ff_dropout(self.ff(self.ff_norm(x)))
+        y = _normalize_to_unit_sphere(self.attn_dropout(y))
+        x = self._interpolate_on_sphere(x, y, self.attn_step_logits)
+
+        y = _normalize_to_unit_sphere(self.ff_dropout(self.ff(x)))
+        return self._interpolate_on_sphere(x, y, self.ff_step_logits)
 
 
 class TypeConditionedSequenceTransformer(nn.Module):
@@ -94,6 +132,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
         transformer_mlp_depth: int,
         mlp_expansion_factor: float,
         dropout: float = 0.0,
+        residual_step_init: float = 0.05,
     ):
         super().__init__()
         if max_context_length <= 0:
@@ -126,11 +165,11 @@ class TypeConditionedSequenceTransformer(nn.Module):
                     transformer_mlp_depth=transformer_mlp_depth,
                     mlp_expansion_factor=mlp_expansion_factor,
                     dropout=dropout,
+                    residual_step_init=residual_step_init,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.output_norm = nn.LayerNorm(node_embedding_dim)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -182,14 +221,15 @@ class TypeConditionedSequenceTransformer(nn.Module):
         for block in self.blocks:
             x = block(x, key_padding_mask)
 
-        return self.output_norm(x[:, : self.max_context_length])
+        # Recursive encoder/decoder calls exchange vectors at the conventional
+        # Transformer radius sqrt(D), but without learned affine norm terms.
+        return _normalize_to_model_sphere(x[:, : self.max_context_length])
 
 
 class TransformerNodeEncoder(nn.Module):
     def __init__(self, sequence_transformer: TypeConditionedSequenceTransformer):
         super().__init__()
         self.sequence_transformer = sequence_transformer
-        self.output_norm = nn.LayerNorm(sequence_transformer.node_embedding_dim)
 
     def forward_batch(
         self,
@@ -205,7 +245,7 @@ class TransformerNodeEncoder(nn.Module):
         weights = valid_parent_mask.to(dtype=transformed.dtype).unsqueeze(-1)
         counts = weights.sum(dim=1).clamp(min=1.0)
         pooled = (transformed * weights).sum(dim=1) / counts.sqrt()
-        return self.output_norm(pooled)
+        return _normalize_to_model_sphere(pooled)
 
 
 class TransformerNodeDecoder(nn.Module):
@@ -352,6 +392,7 @@ class DagnabbitAutoEncoder(nn.Module):
         transformer_num_register_tokens: int = 2,
         transformer_num_heads: int = 4,
         transformer_dropout: float = 0.0,
+        transformer_residual_step_init: float = 0.05,
     ):
         super().__init__()
 
@@ -376,6 +417,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.transformer_num_register_tokens = transformer_num_register_tokens
         self.transformer_num_heads = transformer_num_heads
         self.transformer_dropout = transformer_dropout
+        self.transformer_residual_step_init = transformer_residual_step_init
 
         # ---- Shared, type-conditioned node transformers ----
         # The encoder public context is the ordered parent-slot sequence padded
@@ -395,6 +437,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 transformer_mlp_depth=transformer_mlp_depth,
                 mlp_expansion_factor=mlp_expansion_factor,
                 dropout=transformer_dropout,
+                residual_step_init=transformer_residual_step_init,
             )
         )
         self.node_decoder = TransformerNodeDecoder(
@@ -408,6 +451,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 transformer_mlp_depth=transformer_mlp_depth,
                 mlp_expansion_factor=mlp_expansion_factor,
                 dropout=transformer_dropout,
+                residual_step_init=transformer_residual_step_init,
             ),
             num_parent_slots=self.maximum_indegree,
             num_leaf_context_slots=self.num_output_nodes,
@@ -857,12 +901,14 @@ class DagnabbitAutoEncoder(nn.Module):
 
             ar_counts = autoregressive_child_count[rows, nodes]
             tf_counts = teacher_forced_child_count[rows, nodes]
-            ar_combined_rank = autoregressive_child_sum[
-                rows, nodes
-            ] / ar_counts.sqrt().unsqueeze(-1)
-            tf_combined_rank = teacher_forced_child_sum[
-                rows, nodes
-            ] / tf_counts.sqrt().unsqueeze(-1)
+            ar_combined_rank = _normalize_to_model_sphere(
+                autoregressive_child_sum[rows, nodes]
+                / ar_counts.sqrt().unsqueeze(-1)
+            )
+            tf_combined_rank = _normalize_to_model_sphere(
+                teacher_forced_child_sum[rows, nodes]
+                / tf_counts.sqrt().unsqueeze(-1)
+            )
             ar_combined[rows, nodes] = ar_combined_rank
             tf_combined[rows, nodes] = tf_combined_rank
 

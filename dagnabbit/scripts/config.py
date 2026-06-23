@@ -18,6 +18,9 @@ TRANSFORMER_MLP_DEPTH = 1
 TRANSFORMER_NUM_REGISTER_TOKENS = 2
 TRANSFORMER_NUM_HEADS = 16
 TRANSFORMER_DROPOUT = 0.0
+# Initial per-channel interpolation step for the nGPT-style attention and MLP
+# updates. Must be strictly between 0 and 1.
+TRANSFORMER_RESIDUAL_STEP_INIT = 0.05
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,

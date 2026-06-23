@@ -1,9 +1,9 @@
 """Signal-propagation sanity check for the DAG autoencoder.
 
-Because ``evaluate_graph`` recursively composes the shared residual transformer
+Because ``evaluate_graph`` recursively composes the shared spherical transformer
 encoder at every non-root rank, the effective depth of the computation equals
-the depth of the DAG. The encoder and decoder use final LayerNorms on their
-outputs, keeping the per-node embedding norm bounded as DAG depth increases.
+the depth of the DAG. The encoder and decoder hard-normalize their outputs to a
+fixed L2 radius, keeping per-node embedding norms bounded as DAG depth increases.
 
 This covers both passes: the ``encode`` forward pass down the DAG, and the
 ``decode`` guided-autoregressive pass that propagates predicted embeddings back
@@ -21,7 +21,7 @@ import math
 
 import torch
 
-from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
+from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TransformerBlock
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_random_graph_description,
@@ -49,6 +49,7 @@ def build_model(
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        transformer_residual_step_init=cfg.TRANSFORMER_RESIDUAL_STEP_INIT,
     )
 
 
@@ -213,8 +214,12 @@ def test_norms_stay_bounded() -> None:
 
 
 def test_no_mean_shift() -> None:
-    """Per-element mean should stay near zero on both passes (LayerNorm
-    re-centering removes mean-shift)."""
+    """Fresh random representations should not acquire a large mean with depth.
+
+    Unlike the previous LayerNorm boundary, L2 normalization does not enforce a
+    zero mean, so this is a signal-propagation diagnostic rather than an exact
+    architectural invariant.
+    """
     stats_by_phase = measure_signal_propagation()
     for phase, stats_by_depth in stats_by_phase.items():
         for depth, s in stats_by_depth.items():
@@ -222,6 +227,44 @@ def test_no_mean_shift() -> None:
                 f"[{phase}] depth {depth}: element mean {s['elem_mean']:.4f} "
                 f"drifted from 0"
             )
+
+
+def test_spherical_block_norms_and_gate_initialization() -> None:
+    """Blocks stay on the unit sphere and start with small trainable steps."""
+    dim = 8
+    initial_step = 0.05
+    block = TransformerBlock(
+        node_embedding_dim=dim,
+        num_heads=2,
+        transformer_mlp_depth=1,
+        mlp_expansion_factor=2.0,
+        dropout=0.0,
+        residual_step_init=initial_step,
+    )
+    inputs = torch.randn(2, 3, dim, requires_grad=True)
+    outputs = block(inputs, key_padding_mask=None)
+
+    torch.testing.assert_close(
+        outputs.norm(dim=-1),
+        torch.ones(2, 3),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        block.attn_step_logits.sigmoid(),
+        torch.full((dim,), initial_step),
+    )
+    torch.testing.assert_close(
+        block.ff_step_logits.sigmoid(),
+        torch.full((dim,), initial_step),
+    )
+
+    outputs[..., 0].sum().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert block.attn_step_logits.grad is not None
+    assert torch.isfinite(block.attn_step_logits.grad).all()
+    assert block.ff_step_logits.grad is not None
+    assert torch.isfinite(block.ff_step_logits.grad).all()
 
 
 def main() -> None:
@@ -237,6 +280,7 @@ def main() -> None:
 
     test_norms_stay_bounded()
     test_no_mean_shift()
+    test_spherical_block_norms_and_gate_initialization()
     test_reconstruction_loss_can_be_disabled_and_enabled()
     print("\nALL SIGNAL-PROPAGATION CHECKS PASSED")
 

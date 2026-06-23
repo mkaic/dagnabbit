@@ -159,6 +159,7 @@ def main() -> None:
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        transformer_residual_step_init=cfg.TRANSFORMER_RESIDUAL_STEP_INIT,
     ).to(device)
 
     if cfg.TORCH_COMPILE and device.type == "cuda":

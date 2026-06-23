@@ -56,6 +56,7 @@ def _build() -> tuple[DagnabbitAutoEncoder, list]:
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=0.0,
+        transformer_residual_step_init=cfg.TRANSFORMER_RESIDUAL_STEP_INIT,
     )
     model.eval()
     graphs = [
