@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -263,27 +263,19 @@ class TransformerNodeDecoder(nn.Module):
         leaf_embeddings: Tensor,
         node_embeddings: Tensor,
     ) -> Tensor:
-        batch_size, embedding_dim = node_embeddings.shape
-        expected_shape = (self.num_leaf_context_slots, embedding_dim)
-        if leaf_embeddings.shape != expected_shape:
-            raise ValueError(
-                f"leaf_embeddings must have shape {expected_shape}; got "
-                f"{tuple(leaf_embeddings.shape)}"
-            )
-        leaf_embeddings = leaf_embeddings.to(
+        return leaf_embeddings.to(
             device=node_embeddings.device,
             dtype=node_embeddings.dtype,
         )
-        return leaf_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 @dataclass
 class TrainingStepLossReturnType:
-    # 1-D tensor over all nodes in the primary graph.
+    # Node-aligned tensor over the primary graph batch: [B, N].
     primary_node_classification_losses: Tensor
-    # Raw per-node logits ``[N, num_types]`` and true type labels (1-D
-    # ``LongTensor``) for downstream diagnostics. ``primary_node_predicted_type_logits[i]``
-    # corresponds to ``primary_node_true_types[i]``.
+    # Raw per-node logits and true type labels for downstream diagnostics.
+    # ``primary_node_predicted_type_logits[b, i]`` corresponds to
+    # ``primary_node_true_types[b, i]``.
     primary_node_predicted_type_logits: Tensor
     primary_node_true_types: Tensor
     # Teacher-forced counterparts (same node alignment, same true labels). These
@@ -297,7 +289,7 @@ class TrainingStepLossReturnType:
     primary_node_parent_reconstruction_losses: Tensor
     teacher_forced_primary_node_parent_reconstruction_losses: Tensor
     # Per-node consistency: variance of predictions landing on the same parent,
-    # averaged over D. Node-indexed 1-D tensor; zero for count <= 1 nodes.
+    # averaged over D. Node-indexed [B, N] tensor; zero for count <= 1 nodes.
     primary_node_parent_consistency_losses: Tensor
     teacher_forced_primary_node_parent_consistency_losses: Tensor
 
@@ -317,6 +309,15 @@ class _DecodePipelineResult:
 
 @dataclass
 class _RankBatch:
+    node_indices: Tensor
+    parent_indices: Tensor
+    valid_parent_mask: Tensor
+    subtypes: Tensor
+
+
+@dataclass
+class _BatchedRank:
+    batch_indices: Tensor
     node_indices: Tensor
     parent_indices: Tensor
     valid_parent_mask: Tensor
@@ -429,42 +430,51 @@ class DagnabbitAutoEncoder(nn.Module):
             self.num_node_types,
         )
 
-    def evaluate_graph(
+    def evaluate_graph_batch(
         self,
-        graph: FixedInDegreeDAGDescription,
+        graphs: Sequence[FixedInDegreeDAGDescription],
         root_node_embeddings: Tensor | None = None,
     ) -> Tensor:
+        graphs = list(graphs)
         if root_node_embeddings is None:
-            root_node_embeddings = self.root_node_embeddings.weight
-        assert root_node_embeddings.shape[0] == graph.num_root_nodes
+            root_node_embeddings = self.root_node_embeddings.weight.unsqueeze(0).expand(
+                len(graphs), -1, -1
+            )
 
+        batch_size = len(graphs)
+        num_nodes = graphs[0].num_nodes
         device = root_node_embeddings.device
         embeddings_buffer = torch.empty(
-            (graph.num_nodes, self.node_embedding_dim),
+            (batch_size, num_nodes, self.node_embedding_dim),
             dtype=root_node_embeddings.dtype,
             device=device,
         )
-        embeddings_buffer[: graph.num_root_nodes] = root_node_embeddings
+        embeddings_buffer[:, : self.num_root_nodes] = root_node_embeddings
 
         # Walk topological ranks ascending. Rank 0 roots are seeded above. Every
         # non-root node in a rank can be encoded together because node type is an
         # input token to the shared transformer rather than a module selector.
-        for rank, groups in enumerate(graph.rank_groups):
-            if rank == 0:
+        max_ranks = max(len(graph.rank_groups) for graph in graphs)
+        for rank in range(1, max_ranks):
+            rank_batch = self._make_batched_rank(graphs, rank, device)
+            if rank_batch.node_indices.numel() == 0:
                 continue
-            rank_batch = self._make_rank_batch(groups, device)
-            parent_embeddings = embeddings_buffer[rank_batch.parent_indices]
+            parent_embeddings = embeddings_buffer[
+                rank_batch.batch_indices[:, None],
+                rank_batch.parent_indices,
+            ]
             parent_embeddings = parent_embeddings.masked_fill(
                 ~rank_batch.valid_parent_mask.unsqueeze(-1),
                 0.0,
             )
-            embeddings_buffer[rank_batch.node_indices] = (
-                self.node_encoder.forward_batch(
-                    parent_embeddings,
-                    rank_batch.subtypes,
-                    rank_batch.valid_parent_mask,
-                ).to(embeddings_buffer.dtype)
-            )
+            embeddings_buffer[
+                rank_batch.batch_indices,
+                rank_batch.node_indices,
+            ] = self.node_encoder.forward_batch(
+                parent_embeddings,
+                rank_batch.subtypes,
+                rank_batch.valid_parent_mask,
+            ).to(embeddings_buffer.dtype)
 
         return embeddings_buffer
 
@@ -529,23 +539,65 @@ class DagnabbitAutoEncoder(nn.Module):
             subtypes=subtypes[order],
         )
 
-    def _make_leaf_context(
+    def _make_batched_rank(
         self,
-        graph: FixedInDegreeDAGDescription,
-        encoder_buffer: Tensor,
+        graphs: Sequence[FixedInDegreeDAGDescription],
+        rank: int,
         device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        leaf_indices = torch.as_tensor(
-            graph.leaf_node_indices, dtype=torch.long, device=device
-        )
-        expected_leaf_slots = self.node_decoder.num_leaf_context_slots
-        if leaf_indices.shape[0] != expected_leaf_slots:
-            raise ValueError(
-                "decoder is configured for "
-                f"{expected_leaf_slots} leaf context slots, but graph has "
-                f"{leaf_indices.shape[0]} leaf nodes"
+    ) -> _BatchedRank:
+        batch_indices: list[Tensor] = []
+        node_indices: list[Tensor] = []
+        parent_indices: list[Tensor] = []
+        valid_parent_masks: list[Tensor] = []
+        subtypes: list[Tensor] = []
+
+        for batch_idx, graph in enumerate(graphs):
+            if rank >= len(graph.rank_groups):
+                continue
+            rank_batch = self._make_rank_batch(graph.rank_groups[rank], device)
+            num_rows = rank_batch.node_indices.shape[0]
+            if num_rows == 0:
+                continue
+            batch_indices.append(
+                torch.full(
+                    (num_rows,),
+                    batch_idx,
+                    dtype=torch.long,
+                    device=device,
+                )
             )
-        return leaf_indices, encoder_buffer[leaf_indices]
+            node_indices.append(rank_batch.node_indices)
+            parent_indices.append(rank_batch.parent_indices)
+            valid_parent_masks.append(rank_batch.valid_parent_mask)
+            subtypes.append(rank_batch.subtypes)
+
+        if not node_indices:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return _BatchedRank(
+                batch_indices=empty,
+                node_indices=empty,
+                parent_indices=torch.empty(
+                    0,
+                    self.maximum_indegree,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                valid_parent_mask=torch.empty(
+                    0,
+                    self.maximum_indegree,
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                subtypes=empty,
+            )
+
+        return _BatchedRank(
+            batch_indices=torch.cat(batch_indices),
+            node_indices=torch.cat(node_indices),
+            parent_indices=torch.cat(parent_indices),
+            valid_parent_mask=torch.cat(valid_parent_masks),
+            subtypes=torch.cat(subtypes),
+        )
 
     def _in_degree_for_type(self, node_type: int) -> int:
         if node_type < self.num_trunk_node_types:
@@ -557,9 +609,9 @@ class DagnabbitAutoEncoder(nn.Module):
             return 1
         raise ValueError(f"unknown node type {node_type}")
 
-    def training_forward(
+    def training_forward_batch(
         self,
-        primary_graph: FixedInDegreeDAGDescription,
+        primary_graphs: Sequence[FixedInDegreeDAGDescription],
         return_buffers: bool = False,
     ) -> (
         TrainingStepLossReturnType
@@ -569,45 +621,36 @@ class DagnabbitAutoEncoder(nn.Module):
             Tensor,
         ]
     ):
-        """Returns losses for the training step.
+        """Batched training forward over multiple structurally compatible DAGs.
 
-        When ``return_buffers`` is True, additionally returns the primary-graph
-        encode buffer (per-node embeddings from the forward pass) and the primary
-        decode buffer: a node-indexed ``[num_nodes, D]`` tensor of each node's
-        decode-side combined prediction, for diagnostics such as signal
-        propagation analysis.
+        Per-node outputs keep an explicit ``[B, N, ...]`` graph-batch dimension.
+        Reconstruction losses remain edge-flat across the whole graph batch.
         """
 
-        primary_buffer = self.evaluate_graph(
-            graph=primary_graph,
-            root_node_embeddings=self.root_node_embeddings.weight,
+        primary_graphs = list(primary_graphs)
+        primary_buffer = self.evaluate_graph_batch(
+            graphs=primary_graphs,
         )
 
         device = primary_buffer.device
-
-        # ---- Per-graph labels ----
-        # Shared by both decode passes (same graph, same node types).
-        primary_labels = torch.as_tensor(
-            list(primary_graph.node_types), dtype=torch.long, device=device
+        primary_labels = torch.stack(
+            [
+                torch.as_tensor(
+                    list(graph.node_types),
+                    dtype=torch.long,
+                    device=device,
+                )
+                for graph in primary_graphs
+            ],
+            dim=0,
         )
 
-        # Two decode passes over the *same* (shared) encode pass. The
-        # autoregressive pass is the genuine model -- predictions compound down
-        # each DAG. The teacher-forced pass instead feeds every node its true
-        # encode embedding, severing the autoregressive chain so the decoders are
-        # asked to recover each parent's identity from a clean input. The combine
-        # / classify targets are identical between the two; only what the
-        # decoders are fed differs (see ``_decode_graph``).
-        #
-        # The two passes are independent of each other at every rank (each only
-        # depends on its own higher-rank predictions), so they are run in
-        # lockstep and batched together: at each rank their inputs are
-        # concatenated along the batch axis for a single ``node_type_predictor``
-        # / ``decode_batch`` (and loss) launch, then split back apart. Every op
-        # involved is row-wise, so this is numerically identical to two separate
-        # pipelines but roughly halves the kernel-launch count.
+        # Two decode passes over the same shared encode pass. The
+        # autoregressive pass compounds predictions down each DAG; the
+        # teacher-forced pass decodes each node from its true encode-side
+        # embedding. Both passes are processed together rank-by-rank.
         autoregressive, teacher_forced = self._decode_pipeline(
-            primary_graph=primary_graph,
+            primary_graphs=primary_graphs,
             primary_buffer=primary_buffer,
             primary_labels=primary_labels,
             device=device,
@@ -634,47 +677,35 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         if return_buffers:
-            # `autoregressive.primary_combined` is the node-indexed [num_nodes, D]
-            # decode-side combined-prediction buffer from the genuine
-            # (autoregressive) pass, consumed directly by diagnostics.
             return losses, primary_buffer, autoregressive.primary_combined
         return losses
 
     def _decode_pipeline(
         self,
-        primary_graph: FixedInDegreeDAGDescription,
+        primary_graphs: Sequence[FixedInDegreeDAGDescription],
         primary_buffer: Tensor,
         primary_labels: Tensor,
         device: torch.device,
     ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult"]:
-        """Run the full decode over the primary graph for both the autoregressive
-        and teacher-forced passes at once.
+        batch_size, num_nodes, _ = primary_buffer.shape
 
-        The decode propagates predicted parent embeddings up the DAG. We hold
-        two dense buffers per pass instead of per-node prediction lists:
-          child_sum[n]   = running sum of embeddings predicted for node n by its
-                           (already-decoded) children, and
-          child_count[n] = how many such predictions have landed on n.
-        A node's combined prediction is then ``child_sum / sqrt(child_count)``,
-        and a child pushes into its parents with ``index_add_`` (an
-        order-independent sum). The autoregressive and teacher-forced passes get
-        their own fresh buffers, so they never share decode state -- but they are
-        decoded in lockstep inside :meth:`_decode_graph`, which concatenates the
-        two passes for each classification/loss launch.
-
-        Returns ``(autoregressive_result, teacher_forced_result)``.
-        """
-
-        def _zeros(graph: FixedInDegreeDAGDescription, dtype: torch.dtype):
+        def _zeros(dtype: torch.dtype):
             child_sum = torch.zeros(
-                graph.num_nodes,
+                batch_size,
+                num_nodes,
                 self.node_embedding_dim,
                 dtype=dtype,
                 device=device,
             )
-            child_count = torch.zeros(graph.num_nodes, dtype=dtype, device=device)
+            child_count = torch.zeros(
+                batch_size,
+                num_nodes,
+                dtype=dtype,
+                device=device,
+            )
             child_sumsq = torch.zeros(
-                graph.num_nodes,
+                batch_size,
+                num_nodes,
                 self.node_embedding_dim,
                 dtype=dtype,
                 device=device,
@@ -682,33 +713,36 @@ class DagnabbitAutoEncoder(nn.Module):
             return child_sum, child_count, child_sumsq
 
         ar_primary_sum, ar_primary_count, ar_primary_sumsq = _zeros(
-            primary_graph, primary_buffer.dtype
+            primary_buffer.dtype
         )
         tf_primary_sum, tf_primary_count, tf_primary_sumsq = _zeros(
-            primary_graph, primary_buffer.dtype
+            primary_buffer.dtype
         )
 
-        # Seed the leaf nodes' child buffers with their own encode-side
-        # embeddings. Leaves are (by definition) referenced by no other node, so
-        # nothing scatters predictions onto them during the descending decode --
-        # without a seed their ``child_count`` stays 0 and the combine
-        # ``child_sum / sqrt(child_count)`` divides by zero. Previously the
-        # condenser graph decoded the graph embedding down into these leaves; now
-        # each leaf simply starts the autoregressive chain from its true encode
-        # embedding (one prediction, so its combine is that embedding itself).
-        # Both passes seed identically from the shared encode buffer.
-        leaf_indices, leaf_embeddings = self._make_leaf_context(
-            primary_graph, primary_buffer, device
+        leaf_embeddings_by_graph = torch.empty(
+            batch_size,
+            self.num_output_nodes,
+            self.node_embedding_dim,
+            dtype=primary_buffer.dtype,
+            device=device,
         )
-        for child_sum, child_count, child_sumsq in (
-            (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
-            (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
-        ):
-            child_sum[leaf_indices] = primary_buffer[leaf_indices].to(child_sum.dtype)
-            child_count[leaf_indices] = 1.0
-            child_sumsq[leaf_indices] = (
-                primary_buffer[leaf_indices].to(child_sumsq.dtype) ** 2
+        for batch_idx, graph in enumerate(primary_graphs):
+            leaf_indices = torch.as_tensor(
+                graph.leaf_node_indices,
+                dtype=torch.long,
+                device=device,
             )
+            leaf_embeddings = primary_buffer[batch_idx, leaf_indices]
+            leaf_embeddings_by_graph[batch_idx] = leaf_embeddings
+            for child_sum, child_count, child_sumsq in (
+                (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
+                (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
+            ):
+                child_sum[batch_idx, leaf_indices] = leaf_embeddings.to(child_sum.dtype)
+                child_count[batch_idx, leaf_indices] = 1.0
+                child_sumsq[batch_idx, leaf_indices] = (
+                    leaf_embeddings.to(child_sumsq.dtype) ** 2
+                )
 
         (
             (
@@ -726,7 +760,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 tf_primary_consistency,
             ),
         ) = self._decode_graph(
-            graph=primary_graph,
+            graphs=primary_graphs,
             encoder_buffer=primary_buffer,
             autoregressive_child_sum=ar_primary_sum,
             autoregressive_child_count=ar_primary_count,
@@ -735,7 +769,7 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_child_count=tf_primary_count,
             teacher_forced_child_sumsq=tf_primary_sumsq,
             labels=primary_labels,
-            leaf_embeddings=leaf_embeddings,
+            leaf_embeddings_by_graph=leaf_embeddings_by_graph,
             process_roots=True,
             device=device,
         )
@@ -758,7 +792,7 @@ class DagnabbitAutoEncoder(nn.Module):
 
     def _decode_graph(
         self,
-        graph: FixedInDegreeDAGDescription,
+        graphs: Sequence[FixedInDegreeDAGDescription],
         encoder_buffer: Tensor,
         autoregressive_child_sum: Tensor,
         autoregressive_child_count: Tensor,
@@ -767,76 +801,41 @@ class DagnabbitAutoEncoder(nn.Module):
         teacher_forced_child_count: Tensor,
         teacher_forced_child_sumsq: Tensor,
         labels: Tensor,
-        leaf_embeddings: Tensor,
+        leaf_embeddings_by_graph: Tensor,
         process_roots: bool,
         device: torch.device,
     ) -> tuple[
         tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
         tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
     ]:
-        """Run the batched guided-autoregressive decode over one graph for the
-        autoregressive and teacher-forced passes **simultaneously**.
-
-        Walks topological ranks **descending** (every edge strictly increases
-        rank, so all of a node's children -- which live at higher ranks -- have
-        already pushed their predictions into the ``child_sum`` / ``child_count``
-        buffers by the time the node is processed, and no two same-rank nodes are
-        parent/child). At each rank it batches:
-
-        1. the variance-preserving combine ``child_sum / sqrt(child_count)``, and
-        2. classification (``node_type_predictor``) with per-node
-           cross-entropy;
-
-        then, per supertype group with parents, one ``decode_batch`` whose
-        predicted parent embeddings are ``index_add_``-scattered into the
-        parents' ``child_sum`` (and ``child_count`` incremented).
-
-        The two passes differ only in *what each node's decoder is fed*. The
-        autoregressive pass decodes each node's own predicted ``combined``
-        embedding, so prediction error compounds down the DAG. The teacher-forced
-        pass instead decodes each node's *true* encode-side embedding
-        (``encoder_buffer``), so each parent prediction is produced from ground
-        truth -- this severs the autoregressive chain and tests whether the
-        decoders can recover a parent's identity (e.g. which root) from a clean
-        input. Both passes' combine / classify still use their own *accumulated*
-        predictions, so loss targets match between the two; only the decoder
-        inputs differ.
-
-        Because the two passes are independent of each other at every rank, their
-        inputs are concatenated along the batch axis (autoregressive rows first,
-        teacher-forced rows second) for a single ``node_type_predictor`` /
-        ``decode_batch`` (and cross-entropy) launch, then split back apart. Every
-        op is row-wise, so this is numerically identical to running the two
-        passes separately while roughly halving the kernel-launch count.
-
-        ``process_roots`` controls whether rank-0 (root) nodes are classified:
-        roots have no parents so nothing is scattered regardless, but this flag
-        gates whether they get a classification loss.
-
-        Returns ``(autoregressive_tensors, teacher_forced_tensors)`` where each
-        is a dense per-node tuple ``(combined, logits, classification_loss)``;
-        entries for nodes that were not processed stay zero.
-        """
-        num_nodes = graph.num_nodes
+        batch_size, num_nodes, _ = encoder_buffer.shape
 
         def _alloc_pass_buffers():
             combined = torch.zeros(
+                batch_size,
                 num_nodes,
                 self.node_embedding_dim,
                 dtype=autoregressive_child_sum.dtype,
                 device=device,
             )
             logits = torch.zeros(
+                batch_size,
                 num_nodes,
                 self.num_node_types,
                 dtype=encoder_buffer.dtype,
                 device=device,
             )
             class_losses = torch.zeros(
-                num_nodes, dtype=encoder_buffer.dtype, device=device
+                batch_size,
+                num_nodes,
+                dtype=encoder_buffer.dtype,
+                device=device,
             )
             consistency = torch.zeros(
-                num_nodes, dtype=encoder_buffer.dtype, device=device
+                batch_size,
+                num_nodes,
+                dtype=encoder_buffer.dtype,
+                device=device,
             )
             return combined, logits, class_losses, consistency
 
@@ -846,126 +845,112 @@ class DagnabbitAutoEncoder(nn.Module):
         ar_recon_edge_list: list[Tensor] = []
         tf_recon_edge_list: list[Tensor] = []
 
-        for rank in reversed(range(len(graph.rank_groups))):
+        max_ranks = max(len(graph.rank_groups) for graph in graphs)
+        for rank in reversed(range(max_ranks)):
             if rank == 0 and not process_roots:
                 continue
-            groups = graph.rank_groups[rank]
 
-            # All nodes at this rank, across supertype groups: combine and
-            # classify uniformly (these use the shared type head regardless of
-            # supertype).
-            rank_node_indices = torch.cat([g.node_buffer_indices for g in groups]).to(
-                device
-            )
-            num_rank_nodes = rank_node_indices.shape[0]
+            rank_batch = self._make_batched_rank(graphs, rank, device)
+            if rank_batch.node_indices.numel() == 0:
+                continue
 
-            # Per-pass combine (each pass accumulates into its own buffers).
-            ar_counts = autoregressive_child_count[rank_node_indices]
-            tf_counts = teacher_forced_child_count[rank_node_indices]
+            rows = rank_batch.batch_indices
+            nodes = rank_batch.node_indices
+            num_rank_rows = nodes.shape[0]
+
+            ar_counts = autoregressive_child_count[rows, nodes]
+            tf_counts = teacher_forced_child_count[rows, nodes]
             ar_combined_rank = autoregressive_child_sum[
-                rank_node_indices
+                rows, nodes
             ] / ar_counts.sqrt().unsqueeze(-1)
             tf_combined_rank = teacher_forced_child_sum[
-                rank_node_indices
+                rows, nodes
             ] / tf_counts.sqrt().unsqueeze(-1)
-            ar_combined[rank_node_indices] = ar_combined_rank
-            tf_combined[rank_node_indices] = tf_combined_rank
+            ar_combined[rows, nodes] = ar_combined_rank
+            tf_combined[rows, nodes] = tf_combined_rank
 
-            # Per-node consistency: variance of child predictions averaged over D
-            # (mean, not sum, so the magnitude is invariant to embedding dim),
-            # masked to nodes that received > 1 prediction.
-            ar_mean = autoregressive_child_sum[rank_node_indices] / ar_counts.unsqueeze(
-                -1
-            )
+            ar_mean = autoregressive_child_sum[rows, nodes] / ar_counts.unsqueeze(-1)
             ar_var = (
                 (
-                    autoregressive_child_sumsq[rank_node_indices]
-                    / ar_counts.unsqueeze(-1)
+                    autoregressive_child_sumsq[rows, nodes] / ar_counts.unsqueeze(-1)
                     - ar_mean**2
                 )
                 .mean(dim=-1)
                 .clamp(min=0)
             )
-            ar_consistency[rank_node_indices] = torch.where(
+            ar_consistency[rows, nodes] = torch.where(
                 ar_counts > 1, ar_var, torch.zeros_like(ar_var)
             )
 
-            tf_mean = teacher_forced_child_sum[rank_node_indices] / tf_counts.unsqueeze(
-                -1
-            )
+            tf_mean = teacher_forced_child_sum[rows, nodes] / tf_counts.unsqueeze(-1)
             tf_var = (
                 (
-                    teacher_forced_child_sumsq[rank_node_indices]
-                    / tf_counts.unsqueeze(-1)
+                    teacher_forced_child_sumsq[rows, nodes] / tf_counts.unsqueeze(-1)
                     - tf_mean**2
                 )
                 .mean(dim=-1)
                 .clamp(min=0)
             )
-            tf_consistency[rank_node_indices] = torch.where(
+            tf_consistency[rows, nodes] = torch.where(
                 tf_counts > 1, tf_var, torch.zeros_like(tf_var)
             )
 
-            # Classify both passes in one launch. Rows ``[:num_rank_nodes]`` are
-            # autoregressive, ``[num_rank_nodes:]`` are teacher-forced; the
-            # type head is row-wise, so this is identical to two separate calls.
             combined_both = torch.cat([ar_combined_rank, tf_combined_rank], dim=0)
             logits_both = self.node_type_predictor(combined_both)
-            ar_logits[rank_node_indices] = logits_both[:num_rank_nodes].to(
-                ar_logits.dtype
-            )
-            tf_logits[rank_node_indices] = logits_both[num_rank_nodes:].to(
-                tf_logits.dtype
-            )
+            ar_logits[rows, nodes] = logits_both[:num_rank_rows].to(ar_logits.dtype)
+            tf_logits[rows, nodes] = logits_both[num_rank_rows:].to(tf_logits.dtype)
 
-            rank_labels = labels[rank_node_indices]
+            rank_labels = labels[rows, nodes]
             cross_entropy_both = F.cross_entropy(
                 logits_both,
                 torch.cat([rank_labels, rank_labels]),
                 reduction="none",
             )
-            ar_class[rank_node_indices] = cross_entropy_both[:num_rank_nodes].to(
+            ar_class[rows, nodes] = cross_entropy_both[:num_rank_rows].to(
                 ar_class.dtype
             )
-            tf_class[rank_node_indices] = cross_entropy_both[num_rank_nodes:].to(
+            tf_class[rows, nodes] = cross_entropy_both[num_rank_rows:].to(
                 tf_class.dtype
             )
 
-            # Decode the whole rank at once. Parentless root rows are harmless:
-            # their valid mask is empty, so no predicted slot is scattered.
-            rank_batch = self._make_rank_batch(groups, device)
             if not rank_batch.valid_parent_mask.any():
                 continue
 
             decode_input_both = torch.cat(
                 [
-                    ar_combined[rank_batch.node_indices],
-                    encoder_buffer[rank_batch.node_indices],
+                    ar_combined[rows, nodes],
+                    encoder_buffer[rows, nodes],
                 ],
                 dim=0,
             )
             subtypes_both = torch.cat([rank_batch.subtypes, rank_batch.subtypes])
+            leaf_embeddings_for_rank = leaf_embeddings_by_graph[rows]
+            leaf_embeddings_both = torch.cat(
+                [leaf_embeddings_for_rank, leaf_embeddings_for_rank],
+                dim=0,
+            )
             predicted_both = self.node_decoder.forward_batch(
                 decode_input_both,
                 subtypes_both,
-                leaf_embeddings,
+                leaf_embeddings_both,
             )
-            ar_predicted = predicted_both[:num_rank_nodes]
-            tf_predicted = predicted_both[num_rank_nodes:]
+            ar_predicted = predicted_both[:num_rank_rows]
+            tf_predicted = predicted_both[num_rank_rows:]
 
-            flat_parent_indices = rank_batch.parent_indices[
-                rank_batch.valid_parent_mask
+            valid_parent_mask = rank_batch.valid_parent_mask
+            flat_parent_indices = rank_batch.parent_indices[valid_parent_mask]
+            flat_batch_indices = rows[:, None].expand_as(rank_batch.parent_indices)[
+                valid_parent_mask
             ]
             ones = torch.ones_like(
                 flat_parent_indices, dtype=autoregressive_child_count.dtype
             )
 
-            ar_flat = ar_predicted[rank_batch.valid_parent_mask]
-            tf_flat = tf_predicted[rank_batch.valid_parent_mask]
+            ar_flat = ar_predicted[valid_parent_mask]
+            tf_flat = tf_predicted[valid_parent_mask]
 
             if self.compute_reconstruction_loss:
-                # Per-edge reconstruction: 1 - cos(predicted, true_parent_embed).
-                recon_target = encoder_buffer[flat_parent_indices]
+                recon_target = encoder_buffer[flat_batch_indices, flat_parent_indices]
                 if self.reconstruction_detach_target:
                     recon_target = recon_target.detach()
                 ar_recon_edge_list.append(
@@ -981,28 +966,44 @@ class DagnabbitAutoEncoder(nn.Module):
                     )
                 )
 
-            autoregressive_child_sum.index_add_(
-                0,
-                flat_parent_indices,
-                ar_flat.to(autoregressive_child_sum.dtype),
-            )
-            autoregressive_child_count.index_add_(0, flat_parent_indices, ones)
-            autoregressive_child_sumsq.index_add_(
-                0,
-                flat_parent_indices,
-                (ar_flat**2).to(autoregressive_child_sumsq.dtype),
-            )
-            teacher_forced_child_sum.index_add_(
-                0,
-                flat_parent_indices,
-                tf_flat.to(teacher_forced_child_sum.dtype),
-            )
-            teacher_forced_child_count.index_add_(0, flat_parent_indices, ones)
-            teacher_forced_child_sumsq.index_add_(
-                0,
-                flat_parent_indices,
-                (tf_flat**2).to(teacher_forced_child_sumsq.dtype),
-            )
+            for batch_idx_tensor in flat_batch_indices.unique(sorted=True):
+                batch_idx = int(batch_idx_tensor.item())
+                batch_mask = flat_batch_indices == batch_idx
+                parents_b = flat_parent_indices[batch_mask]
+                ones_b = ones[batch_mask]
+                ar_flat_b = ar_flat[batch_mask]
+                tf_flat_b = tf_flat[batch_mask]
+
+                autoregressive_child_sum[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    ar_flat_b.to(autoregressive_child_sum.dtype),
+                )
+                autoregressive_child_count[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    ones_b,
+                )
+                autoregressive_child_sumsq[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    (ar_flat_b**2).to(autoregressive_child_sumsq.dtype),
+                )
+                teacher_forced_child_sum[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    tf_flat_b.to(teacher_forced_child_sum.dtype),
+                )
+                teacher_forced_child_count[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    ones_b,
+                )
+                teacher_forced_child_sumsq[batch_idx].index_add_(
+                    0,
+                    parents_b,
+                    (tf_flat_b**2).to(teacher_forced_child_sumsq.dtype),
+                )
 
         _empty = encoder_buffer.new_zeros(0)
         ar_recon = torch.cat(ar_recon_edge_list) if ar_recon_edge_list else _empty
@@ -1148,6 +1149,11 @@ class DagnabbitAutoEncoder(nn.Module):
             subtypes,
             dtype=torch.long,
             device=node_embeddings.device,
+        )
+        leaf_embeddings = leaf_embeddings.unsqueeze(0).expand(
+            node_embeddings.shape[0],
+            -1,
+            -1,
         )
         parent_embeddings = self.node_decoder.forward_batch(
             node_embeddings,

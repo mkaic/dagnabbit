@@ -90,7 +90,7 @@ def run_roundtrip(
         )
 
         try:
-            buffer = model.evaluate_graph(graph=graph)
+            buffer = model.evaluate_graph_batch([graph])[0]
             output_embeddings = buffer[-graph.num_output_nodes :]
             recovered, diagnostics = model.blind_autoregressive_decode(
                 output_embeddings,

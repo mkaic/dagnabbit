@@ -21,13 +21,13 @@ def step_preds_and_truth(
     logits_per_node: torch.Tensor,
     true_types: torch.Tensor,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract argmax predictions and true class ids for one step.
+    """Extract flattened argmax predictions and true class ids for one step.
 
-    ``logits_per_node`` is ``[N, num_types]`` and ``true_types`` is a 1-D label
-    tensor aligned with it.
+    ``logits_per_node`` may be ``[N, num_types]`` or ``[B, N, num_types]``;
+    ``true_types`` is aligned with the leading node dimensions.
     """
-    preds = logits_per_node.detach().argmax(dim=-1).cpu().numpy()
-    truth = true_types.detach().cpu().numpy().astype(np.int64)
+    preds = logits_per_node.detach().argmax(dim=-1).reshape(-1).cpu().numpy()
+    truth = true_types.detach().reshape(-1).cpu().numpy().astype(np.int64)
     return preds, truth
 
 
@@ -133,10 +133,7 @@ def log_step_metrics(
 
     # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
     # so they sit next to the autoregressive curves in TensorBoard).
-    if (
-        tf_decoder_accuracy is not None
-        and tf_decoder_supertype_accuracies is not None
-    ):
+    if tf_decoder_accuracy is not None and tf_decoder_supertype_accuracies is not None:
         log_decoder_accuracies(
             writer,
             step,

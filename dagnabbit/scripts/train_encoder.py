@@ -214,6 +214,8 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
 
     device = torch.device(cfg.DEVICE)
+    if cfg.GRAPH_BATCH_SIZE <= 0:
+        raise ValueError("GRAPH_BATCH_SIZE must be positive")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
@@ -304,15 +306,18 @@ def main() -> None:
         last_optimizer_lr = optimizer.param_groups[0]["lr"]
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
-            graph = make_random_graph_description(
-                num_root_nodes=cfg.NUM_ROOT_NODES,
-                num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-                num_output_nodes=cfg.NUM_OUTPUT_NODES,
-                trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-                num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-            )
+            graphs = [
+                make_random_graph_description(
+                    num_root_nodes=cfg.NUM_ROOT_NODES,
+                    num_trunk_nodes=cfg.NUM_TRUNK_NODES,
+                    num_output_nodes=cfg.NUM_OUTPUT_NODES,
+                    trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+                    num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+                )
+                for _ in range(cfg.GRAPH_BATCH_SIZE)
+            ]
 
-            losses = model.training_forward(graph)
+            losses = model.training_forward_batch(graphs)
             total, components = combine_losses(losses)
 
             scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS

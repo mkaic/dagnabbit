@@ -126,12 +126,15 @@ def measure_signal_propagation(
             model = build_model()
             for _ in range(graphs_per_model):
                 graph = sample_graph()
-                _, primary_buffer, decode_buffer = model.training_forward(
-                    graph, return_buffers=True
+                _, primary_buffer, decode_buffer = model.training_forward_batch(
+                    [graph], return_buffers=True
                 )
                 depths = node_depths(graph)
 
-                phase_buffers = {"encode": primary_buffer, "decode": decode_buffer}
+                phase_buffers = {
+                    "encode": primary_buffer[0],
+                    "decode": decode_buffer[0],
+                }
                 for phase, buffer in phase_buffers.items():
                     for depth, stats in _bucket_stats_by_depth(buffer, depths).items():
                         bucket = accum[phase].setdefault(
@@ -173,7 +176,7 @@ def test_reconstruction_loss_can_be_disabled_and_enabled() -> None:
     with torch.no_grad():
         disabled_losses = build_model(
             compute_reconstruction_loss=False,
-        ).training_forward(graph)
+        ).training_forward_batch([graph])
         assert disabled_losses.primary_node_parent_reconstruction_losses.numel() == 0
         assert (
             disabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
@@ -182,7 +185,7 @@ def test_reconstruction_loss_can_be_disabled_and_enabled() -> None:
 
         enabled_losses = build_model(
             compute_reconstruction_loss=True,
-        ).training_forward(graph)
+        ).training_forward_batch([graph])
         assert enabled_losses.primary_node_parent_reconstruction_losses.numel() > 0
         assert (
             enabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
@@ -198,9 +201,9 @@ def test_norms_stay_bounded() -> None:
 
     for phase, stats_by_depth in stats_by_phase.items():
         for depth, s in stats_by_depth.items():
-            assert math.isfinite(
-                s["norm_mean"]
-            ), f"[{phase}] non-finite norm at depth {depth}"
+            assert math.isfinite(s["norm_mean"]), (
+                f"[{phase}] non-finite norm at depth {depth}"
+            )
             # Generous band: the original failure mode was norms exploding by
             # orders of magnitude with depth; this catches that (and collapse).
             assert 0.25 * target <= s["norm_mean"] <= 4.0 * target, (
