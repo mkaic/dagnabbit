@@ -4,9 +4,9 @@ import torch
 NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
-NUM_ROOT_NODES = 4
-NUM_OUTPUT_NODES = 4
-NUM_TRUNK_NODES = 32
+NUM_ROOT_NODES = 16
+NUM_OUTPUT_NODES = 8
+NUM_TRUNK_NODES = 128
 
 # Hidden-layer width as a multiplicative expansion factor of each transformer
 # feed-forward input dim.
@@ -33,7 +33,7 @@ TORCH_COMPILE_CUDAGRAPHS = False
 
 # --- training ---
 NUM_STEPS = 10_000_000
-GRAPH_BATCH_SIZE = 64
+GRAPH_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-4
 OPTIMIZER_CLASS = torch.optim.Adam
