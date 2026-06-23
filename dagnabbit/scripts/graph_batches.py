@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import pickle
 from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
@@ -46,6 +47,14 @@ def _make_graph_batch_from_seeds(
     ]
 
 
+def _make_pickled_graph_batch_from_seeds(
+    seeds: list[int],
+    graph_config: GraphGenerationConfig,
+) -> bytes:
+    batch = _make_graph_batch_from_seeds(seeds, graph_config)
+    return pickle.dumps(batch, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 class GraphBatchSource:
     """Ordered graph-batch producer with optional process prefetching."""
 
@@ -71,7 +80,7 @@ class GraphBatchSource:
         self.num_workers = num_workers
         self.prefetch_batches = prefetch_batches
         self._executor: ProcessPoolExecutor | None = None
-        self._futures: deque[Future[list[FixedInDegreeDAGDescription]]] = deque()
+        self._futures: deque[Future[bytes]] = deque()
         self._closed = False
 
         if self.prefetch:
@@ -92,7 +101,7 @@ class GraphBatchSource:
         seeds = _draw_graph_seeds(self.batch_size)
         self._futures.append(
             self._executor.submit(
-                _make_graph_batch_from_seeds,
+                _make_pickled_graph_batch_from_seeds,
                 seeds,
                 self.graph_config,
             )
@@ -107,7 +116,7 @@ class GraphBatchSource:
         if not self._futures:
             self._submit_next()
         future = self._futures.popleft()
-        batch = future.result()
+        batch = pickle.loads(future.result())
         if not self._closed:
             self._submit_next()
         return batch
