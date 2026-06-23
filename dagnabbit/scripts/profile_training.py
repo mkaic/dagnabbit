@@ -40,27 +40,68 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
+from dagnabbit.scripts.graph_batches import GraphBatchSource, GraphGenerationConfig
 from dagnabbit.scripts.train_encoder import combine_losses
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--steps", type=int, default=20,
-                   help="Measured steps for the manual phase timing.")
-    p.add_argument("--warmup", type=int, default=8,
-                   help="Unmeasured warmup steps (allocator/cudnn autotune settle).")
-    p.add_argument("--profiler-steps", type=int, default=6,
-                   help="Active steps recorded by torch.profiler.")
-    p.add_argument("--batch-size", type=int, default=None,
-                   help="Override cfg.GRAPH_BATCH_SIZE.")
-    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=None,
-                   help="Override cfg.TORCH_COMPILE.")
-    p.add_argument("--output-dir", default=None,
-                   help="Output dir (default: profile_out/<timestamp>).")
-    p.add_argument("--no-trace", action="store_true",
-                   help="Skip the chrome trace export (smaller output).")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=20,
+        help="Measured steps for the manual phase timing.",
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=8,
+        help="Unmeasured warmup steps (allocator/cudnn autotune settle).",
+    )
+    p.add_argument(
+        "--profiler-steps",
+        type=int,
+        default=6,
+        help="Active steps recorded by torch.profiler.",
+    )
+    p.add_argument(
+        "--batch-size", type=int, default=None, help="Override cfg.GRAPH_BATCH_SIZE."
+    )
+    p.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override cfg.TORCH_COMPILE.",
+    )
+    p.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output dir (default: profile_out/<timestamp>).",
+    )
+    p.add_argument(
+        "--no-trace",
+        action="store_true",
+        help="Skip the chrome trace export (smaller output).",
+    )
+    p.add_argument(
+        "--prefetch-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Generate future graph batches in a background process.",
+    )
+    p.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=None,
+        help="Number of graph-generation worker processes.",
+    )
+    p.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=None,
+        help="Number of future graph batches to keep queued.",
+    )
     return p.parse_args()
 
 
@@ -110,13 +151,21 @@ def main() -> None:
         cfg.GRAPH_BATCH_SIZE = args.batch_size
     if args.compile is not None:
         cfg.TORCH_COMPILE = args.compile
+    if args.prefetch_graphs is not None:
+        cfg.GRAPH_PREFETCH_ENABLED = args.prefetch_graphs
+    if args.prefetch_workers is not None:
+        cfg.GRAPH_PREFETCH_WORKERS = args.prefetch_workers
+    if args.prefetch_batches is not None:
+        cfg.GRAPH_PREFETCH_BATCHES = args.prefetch_batches
 
     torch.manual_seed(cfg.SEED)
     torch.set_float32_matmul_precision("high")
     device = torch.device(cfg.DEVICE)
 
-    out_dir = Path(args.output_dir) if args.output_dir else (
-        Path("profile_out") / datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else (Path("profile_out") / datetime.now().strftime("%Y%m%d-%H%M%S"))
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -138,6 +187,7 @@ def main() -> None:
 
     if cfg.TORCH_COMPILE and device.type == "cuda":
         from dagnabbit.scripts.train_encoder import apply_torch_compile
+
         apply_torch_compile(model, device)
 
     optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
@@ -160,21 +210,23 @@ def main() -> None:
     model.evaluate_graph_batch = timed_encode
     model._decode_pipeline = timed_decode
 
-    def make_graphs():
-        return [
-            make_random_graph_description(
-                num_root_nodes=cfg.NUM_ROOT_NODES,
-                num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-                num_output_nodes=cfg.NUM_OUTPUT_NODES,
-                trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-                num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-            )
-            for _ in range(cfg.GRAPH_BATCH_SIZE)
-        ]
+    graph_source = GraphBatchSource(
+        batch_size=cfg.GRAPH_BATCH_SIZE,
+        graph_config=GraphGenerationConfig(
+            num_root_nodes=cfg.NUM_ROOT_NODES,
+            num_trunk_nodes=cfg.NUM_TRUNK_NODES,
+            num_output_nodes=cfg.NUM_OUTPUT_NODES,
+            trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+            num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+        ),
+        prefetch=cfg.GRAPH_PREFETCH_ENABLED,
+        num_workers=cfg.GRAPH_PREFETCH_WORKERS,
+        prefetch_batches=cfg.GRAPH_PREFETCH_BATCHES,
+    )
 
     def run_step():
         with timer.phase("gen"):
-            graphs = make_graphs()
+            graphs = graph_source.next()
         with timer.phase("forward"):
             losses = model.training_forward_batch(graphs)
             total, _ = combine_losses(losses)
@@ -188,10 +240,14 @@ def main() -> None:
             optimizer.step()
             optimizer.zero_grad()
 
-    print(f"device={device} batch_size={cfg.GRAPH_BATCH_SIZE} "
-          f"params={num_params / 1e6:.2f}M compile={cfg.TORCH_COMPILE}")
-    print(f"warmup={args.warmup} measured={args.steps} "
-          f"profiler_steps={args.profiler_steps}")
+    print(
+        f"device={device} batch_size={cfg.GRAPH_BATCH_SIZE} "
+        f"params={num_params / 1e6:.2f}M compile={cfg.TORCH_COMPILE}"
+    )
+    print(
+        f"warmup={args.warmup} measured={args.steps} "
+        f"profiler_steps={args.profiler_steps}"
+    )
 
     # --- warmup (not timed) ---
     for _ in range(args.warmup):
@@ -236,17 +292,26 @@ def main() -> None:
         w(f"compute_cap      {cap[0]}.{cap[1]}")
     w(f"device           {device}")
     w(f"batch_size       {cfg.GRAPH_BATCH_SIZE}")
-    w(f"trunk_nodes      {cfg.NUM_TRUNK_NODES}  roots {cfg.NUM_ROOT_NODES}  "
-      f"outputs {cfg.NUM_OUTPUT_NODES}")
-    w(f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  layers "
-      f"{cfg.TRANSFORMER_NUM_LAYERS}  heads {cfg.TRANSFORMER_NUM_HEADS}")
+    w(
+        f"trunk_nodes      {cfg.NUM_TRUNK_NODES}  roots {cfg.NUM_ROOT_NODES}  "
+        f"outputs {cfg.NUM_OUTPUT_NODES}"
+    )
+    w(
+        f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  layers "
+        f"{cfg.TRANSFORMER_NUM_LAYERS}  heads {cfg.TRANSFORMER_NUM_HEADS}"
+    )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")
+    w(
+        "graph_prefetch   "
+        f"{cfg.GRAPH_PREFETCH_ENABLED}  workers {cfg.GRAPH_PREFETCH_WORKERS}  "
+        f"batches {cfg.GRAPH_PREFETCH_BATCHES}"
+    )
     w(f"measured_steps   {args.steps} (after {args.warmup} warmup)")
     w("")
 
     mean_wall = statistics.mean(wall)
-    w(f"STEP THROUGHPUT")
+    w("STEP THROUGHPUT")
     w(f"  wall/step      {fmt_ms(wall)} ms")
     w(f"  steps/sec      {1000.0 / mean_wall:8.2f}")
     w(f"  graphs/sec     {1000.0 * cfg.GRAPH_BATCH_SIZE / mean_wall:8.2f}")
@@ -279,8 +344,10 @@ def main() -> None:
         w(f"  {'(sum top-level)':14s} {gpu_total:8.2f}")
         busy = 100.0 * gpu_total / mean_wall
         w("")
-        w(f"  GPU BUSY FRACTION  {busy:5.1f}%  "
-          f"(gpu_total {gpu_total:.2f} ms / wall {mean_wall:.2f} ms)")
+        w(
+            f"  GPU BUSY FRACTION  {busy:5.1f}%  "
+            f"(gpu_total {gpu_total:.2f} ms / wall {mean_wall:.2f} ms)"
+        )
         if busy < 50:
             w("  => LAUNCH-BOUND: GPU mostly idle. The win is fewer/larger kernel")
             w("     launches (batch the per-rank / per-graph Python loops), not a")
@@ -303,8 +370,11 @@ def main() -> None:
 
     # kernel-launch signal
     if device.type == "cuda":
-        kernel_events = [e for e in ka if e.device_type.name == "CUDA"
-                         and e.self_device_time_total > 0]
+        kernel_events = [
+            e
+            for e in ka
+            if e.device_type.name == "CUDA" and e.self_device_time_total > 0
+        ]
         total_kernel_calls = sum(e.count for e in kernel_events)
         total_kernel_us = sum(e.self_device_time_total for e in kernel_events)
         per_step_calls = total_kernel_calls / max(1, args.profiler_steps)
@@ -329,6 +399,7 @@ def main() -> None:
         prof.export_chrome_trace(str(trace_path))
         print(f"chrome_trace={trace_path}  (open at https://ui.perfetto.dev)")
 
+    graph_source.close()
     print(f"\nwrote {out_dir}/SUMMARY.txt  <- paste this back for analysis")
 
 

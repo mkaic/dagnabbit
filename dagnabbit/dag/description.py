@@ -339,6 +339,7 @@ def make_random_graph_description(
     num_output_nodes: int,
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
+    seed: int | None = None,
 ) -> FixedInDegreeDAGDescription:
     """Generate a random fixed-in-degree DAG via two-pass construction (Algorithm A).
 
@@ -403,7 +404,8 @@ def make_random_graph_description(
         "(ideally with in-degree > 1) or output nodes"
     )
 
-    seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+    if seed is None:
+        seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
     rng = random.Random(seed)
 
     num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes

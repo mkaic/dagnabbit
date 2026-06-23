@@ -10,8 +10,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
-from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.scripts import config as cfg
+from dagnabbit.scripts.graph_batches import GraphBatchSource, GraphGenerationConfig
 from dagnabbit.scripts.logging_utils import (
     accuracy_summary,
     format_param_count,
@@ -202,6 +202,24 @@ def parse_args() -> argparse.Namespace:
         default="profile_out",
         help="Directory for profiler artifacts (trace.json, mem_snapshot.pickle).",
     )
+    parser.add_argument(
+        "--prefetch-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Generate future graph batches in a background process.",
+    )
+    parser.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=None,
+        help="Number of graph-generation worker processes.",
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=None,
+        help="Number of future graph batches to keep queued.",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +227,12 @@ def main() -> None:
     args = parse_args()
     if args.compile is not None:
         cfg.TORCH_COMPILE = args.compile
+    if args.prefetch_graphs is not None:
+        cfg.GRAPH_PREFETCH_ENABLED = args.prefetch_graphs
+    if args.prefetch_workers is not None:
+        cfg.GRAPH_PREFETCH_WORKERS = args.prefetch_workers
+    if args.prefetch_batches is not None:
+        cfg.GRAPH_PREFETCH_BATCHES = args.prefetch_batches
 
     torch.manual_seed(cfg.SEED)
     torch.set_float32_matmul_precision("high")
@@ -253,6 +277,12 @@ def main() -> None:
         f"trainable_parameters={format_param_count(num_trainable_params)} "
         f"({num_trainable_params})"
     )
+    print(
+        "graph_prefetch="
+        f"{cfg.GRAPH_PREFETCH_ENABLED} "
+        f"workers={cfg.GRAPH_PREFETCH_WORKERS} "
+        f"batches={cfg.GRAPH_PREFETCH_BATCHES}"
+    )
 
     optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
     lr_scheduler = make_lr_warmup_scheduler(optimizer)
@@ -292,6 +322,20 @@ def main() -> None:
             f"(wait={wait}, warmup={warmup}, active={args.profile_steps})"
         )
 
+    graph_source = GraphBatchSource(
+        batch_size=cfg.GRAPH_BATCH_SIZE,
+        graph_config=GraphGenerationConfig(
+            num_root_nodes=cfg.NUM_ROOT_NODES,
+            num_trunk_nodes=cfg.NUM_TRUNK_NODES,
+            num_output_nodes=cfg.NUM_OUTPUT_NODES,
+            trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+            num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+        ),
+        prefetch=cfg.GRAPH_PREFETCH_ENABLED,
+        num_workers=cfg.GRAPH_PREFETCH_WORKERS,
+        prefetch_batches=cfg.GRAPH_PREFETCH_BATCHES,
+    )
+
     try:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
@@ -306,16 +350,7 @@ def main() -> None:
         last_optimizer_lr = optimizer.param_groups[0]["lr"]
         progress = tqdm(range(cfg.NUM_STEPS), unit="step")
         for step in progress:
-            graphs = [
-                make_random_graph_description(
-                    num_root_nodes=cfg.NUM_ROOT_NODES,
-                    num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-                    num_output_nodes=cfg.NUM_OUTPUT_NODES,
-                    trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-                    num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-                )
-                for _ in range(cfg.GRAPH_BATCH_SIZE)
-            ]
+            graphs = graph_source.next()
 
             losses = model.training_forward_batch(graphs)
             total, components = combine_losses(losses)
@@ -428,6 +463,7 @@ def main() -> None:
         if prof is not None:
             prof.stop()
             dump_profile(prof, Path(args.profile_output_dir), device)
+        graph_source.close()
         if writer is not None:
             writer.close()
 
