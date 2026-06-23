@@ -15,6 +15,9 @@ from dagnabbit.dag.description import (
 )
 
 
+_SPHERE_NORM_EPS = 1e-6
+
+
 def _feed_forward_layers(
     vector_dims: Iterable[int],
     dropout: float,
@@ -31,7 +34,7 @@ def _feed_forward_layers(
 
 def _normalize_to_unit_sphere(x: Tensor) -> Tensor:
     """Project each embedding vector onto the unit L2 hypersphere."""
-    return F.normalize(x, dim=-1)
+    return F.normalize(x, dim=-1, eps=_SPHERE_NORM_EPS)
 
 
 def _normalize_to_model_sphere(x: Tensor) -> Tensor:

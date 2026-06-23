@@ -49,7 +49,7 @@ LR_WARMUP_OPTIMIZER_STEPS = 100
 
 # Max L2 norm of gradients across all parameters before each optimizer step.
 # Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 4.0
+GRADIENT_CLIP_MAX_NORM = 12.0
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
