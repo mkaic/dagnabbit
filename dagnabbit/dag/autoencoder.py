@@ -313,6 +313,10 @@ class _RankBatch:
     parent_indices: Tensor
     valid_parent_mask: Tensor
     subtypes: Tensor
+    # CPU-side: does any node in this rank have at least one parent? Derived from
+    # graph structure (in-degrees) so the decode loop can skip parent-less ranks
+    # without a device read of ``valid_parent_mask``.
+    has_valid_parents: bool = False
 
 
 @dataclass
@@ -322,6 +326,7 @@ class _BatchedRank:
     parent_indices: Tensor
     valid_parent_mask: Tensor
     subtypes: Tensor
+    has_valid_parents: bool = False
 
 
 @dataclass
@@ -518,6 +523,7 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         offset = 0
+        has_valid_parents = False
         for group in groups:
             group_parents = group.parent_buffer_gather_indices.to(device)
             group_size, in_degree = group_parents.shape
@@ -526,9 +532,10 @@ class DagnabbitAutoEncoder(nn.Module):
                     f"rank contains in-degree {in_degree}, above maximum "
                     f"{self.maximum_indegree}"
                 )
-            if in_degree:
+            if in_degree and group_size:
                 parent_indices[offset : offset + group_size, :in_degree] = group_parents
                 valid_parent_mask[offset : offset + group_size, :in_degree] = True
+                has_valid_parents = True
             offset += group_size
 
         order = node_indices.argsort()
@@ -537,6 +544,7 @@ class DagnabbitAutoEncoder(nn.Module):
             parent_indices=parent_indices[order],
             valid_parent_mask=valid_parent_mask[order],
             subtypes=subtypes[order],
+            has_valid_parents=has_valid_parents,
         )
 
     def _make_batched_rank(
@@ -550,6 +558,7 @@ class DagnabbitAutoEncoder(nn.Module):
         parent_indices: list[Tensor] = []
         valid_parent_masks: list[Tensor] = []
         subtypes: list[Tensor] = []
+        has_valid_parents = False
 
         for batch_idx, graph in enumerate(graphs):
             if rank >= len(graph.rank_groups):
@@ -558,6 +567,7 @@ class DagnabbitAutoEncoder(nn.Module):
             num_rows = rank_batch.node_indices.shape[0]
             if num_rows == 0:
                 continue
+            has_valid_parents = has_valid_parents or rank_batch.has_valid_parents
             batch_indices.append(
                 torch.full(
                     (num_rows,),
@@ -597,6 +607,7 @@ class DagnabbitAutoEncoder(nn.Module):
             parent_indices=torch.cat(parent_indices),
             valid_parent_mask=torch.cat(valid_parent_masks),
             subtypes=torch.cat(subtypes),
+            has_valid_parents=has_valid_parents,
         )
 
     def _in_degree_for_type(self, node_type: int) -> int:
@@ -913,7 +924,7 @@ class DagnabbitAutoEncoder(nn.Module):
                 tf_class.dtype
             )
 
-            if not rank_batch.valid_parent_mask.any():
+            if not rank_batch.has_valid_parents:
                 continue
 
             decode_input_both = torch.cat(
@@ -937,19 +948,40 @@ class DagnabbitAutoEncoder(nn.Module):
             ar_predicted = predicted_both[:num_rank_rows]
             tf_predicted = predicted_both[num_rank_rows:]
 
-            valid_parent_mask = rank_batch.valid_parent_mask
-            flat_parent_indices = rank_batch.parent_indices[valid_parent_mask]
-            flat_batch_indices = rows[:, None].expand_as(rank_batch.parent_indices)[
-                valid_parent_mask
-            ]
-            ones = torch.ones_like(
-                flat_parent_indices, dtype=autoregressive_child_count.dtype
+            # Scatter every graph's predicted parents into the child buffers
+            # without ever reading mask contents back to the host. We keep the
+            # full padded [R, K] edge grid and zero out the invalid slots via the
+            # mask instead of boolean-compacting it (which would trigger a
+            # nonzero() + D2H sync). Invalid slots already carry parent index 0
+            # and now contribute a zero vector, so adding them is a true no-op;
+            # multiplying valid slots by 1.0 is exact, so the accumulated values
+            # are bitwise identical to the compacted version.
+            #
+            # As in the per-rank batched scatter, flattening the [B, N, ...]
+            # buffers to [B*N, ...] and offsetting each edge's parent by its
+            # graph row (batch * num_nodes + parent) gives every graph a disjoint
+            # index range, so one index_add_ per buffer accumulates the batch.
+            mask = rank_batch.valid_parent_mask
+            edge_weight = mask.reshape(-1).to(autoregressive_child_count.dtype)
+            global_parent_indices = (
+                rows[:, None] * num_nodes + rank_batch.parent_indices
+            ).reshape(-1)
+
+            ar_contrib = ar_predicted.reshape(-1, self.node_embedding_dim) * (
+                edge_weight.unsqueeze(-1)
+            )
+            tf_contrib = tf_predicted.reshape(-1, self.node_embedding_dim) * (
+                edge_weight.unsqueeze(-1)
             )
 
-            ar_flat = ar_predicted[valid_parent_mask]
-            tf_flat = tf_predicted[valid_parent_mask]
-
             if self.compute_reconstruction_loss:
+                valid_parent_mask = mask
+                flat_parent_indices = rank_batch.parent_indices[valid_parent_mask]
+                flat_batch_indices = rows[:, None].expand_as(
+                    rank_batch.parent_indices
+                )[valid_parent_mask]
+                ar_flat = ar_predicted[valid_parent_mask]
+                tf_flat = tf_predicted[valid_parent_mask]
                 recon_target = encoder_buffer[flat_batch_indices, flat_parent_indices]
                 if self.reconstruction_detach_target:
                     recon_target = recon_target.detach()
@@ -966,36 +998,23 @@ class DagnabbitAutoEncoder(nn.Module):
                     )
                 )
 
-            # Scatter every graph's predicted parents into the child buffers in
-            # one shot. Flattening the [B, N, ...] buffers to [B*N, ...] and
-            # offsetting each edge's parent index by its graph row
-            # (batch * num_nodes + parent) gives every graph a disjoint index
-            # range, so a single index_add_ accumulates the whole batch. The
-            # per-slot accumulation order is identical to the old per-graph loop
-            # (edges are already ordered by ascending batch), making this
-            # numerically equivalent while collapsing 6*B kernel launches per
-            # rank into 6 and removing the per-graph .item() device sync.
-            global_parent_indices = flat_batch_indices * num_nodes + flat_parent_indices
-            ar_sumsq_flat = (ar_flat**2).to(autoregressive_child_sumsq.dtype)
-            tf_sumsq_flat = (tf_flat**2).to(teacher_forced_child_sumsq.dtype)
-
             autoregressive_child_sum.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, ar_flat.to(autoregressive_child_sum.dtype)
+                0, global_parent_indices, ar_contrib.to(autoregressive_child_sum.dtype)
             )
             autoregressive_child_count.view(-1).index_add_(
-                0, global_parent_indices, ones
+                0, global_parent_indices, edge_weight
             )
             autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, ar_sumsq_flat
+                0, global_parent_indices, (ar_contrib**2).to(autoregressive_child_sumsq.dtype)
             )
             teacher_forced_child_sum.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, tf_flat.to(teacher_forced_child_sum.dtype)
+                0, global_parent_indices, tf_contrib.to(teacher_forced_child_sum.dtype)
             )
             teacher_forced_child_count.view(-1).index_add_(
-                0, global_parent_indices, ones
+                0, global_parent_indices, edge_weight
             )
             teacher_forced_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, tf_sumsq_flat
+                0, global_parent_indices, (tf_contrib**2).to(teacher_forced_child_sumsq.dtype)
             )
 
         _empty = encoder_buffer.new_zeros(0)
