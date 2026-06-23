@@ -966,44 +966,37 @@ class DagnabbitAutoEncoder(nn.Module):
                     )
                 )
 
-            for batch_idx_tensor in flat_batch_indices.unique(sorted=True):
-                batch_idx = int(batch_idx_tensor.item())
-                batch_mask = flat_batch_indices == batch_idx
-                parents_b = flat_parent_indices[batch_mask]
-                ones_b = ones[batch_mask]
-                ar_flat_b = ar_flat[batch_mask]
-                tf_flat_b = tf_flat[batch_mask]
+            # Scatter every graph's predicted parents into the child buffers in
+            # one shot. Flattening the [B, N, ...] buffers to [B*N, ...] and
+            # offsetting each edge's parent index by its graph row
+            # (batch * num_nodes + parent) gives every graph a disjoint index
+            # range, so a single index_add_ accumulates the whole batch. The
+            # per-slot accumulation order is identical to the old per-graph loop
+            # (edges are already ordered by ascending batch), making this
+            # numerically equivalent while collapsing 6*B kernel launches per
+            # rank into 6 and removing the per-graph .item() device sync.
+            global_parent_indices = flat_batch_indices * num_nodes + flat_parent_indices
+            ar_sumsq_flat = (ar_flat**2).to(autoregressive_child_sumsq.dtype)
+            tf_sumsq_flat = (tf_flat**2).to(teacher_forced_child_sumsq.dtype)
 
-                autoregressive_child_sum[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    ar_flat_b.to(autoregressive_child_sum.dtype),
-                )
-                autoregressive_child_count[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    ones_b,
-                )
-                autoregressive_child_sumsq[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    (ar_flat_b**2).to(autoregressive_child_sumsq.dtype),
-                )
-                teacher_forced_child_sum[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    tf_flat_b.to(teacher_forced_child_sum.dtype),
-                )
-                teacher_forced_child_count[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    ones_b,
-                )
-                teacher_forced_child_sumsq[batch_idx].index_add_(
-                    0,
-                    parents_b,
-                    (tf_flat_b**2).to(teacher_forced_child_sumsq.dtype),
-                )
+            autoregressive_child_sum.view(batch_size * num_nodes, -1).index_add_(
+                0, global_parent_indices, ar_flat.to(autoregressive_child_sum.dtype)
+            )
+            autoregressive_child_count.view(-1).index_add_(
+                0, global_parent_indices, ones
+            )
+            autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
+                0, global_parent_indices, ar_sumsq_flat
+            )
+            teacher_forced_child_sum.view(batch_size * num_nodes, -1).index_add_(
+                0, global_parent_indices, tf_flat.to(teacher_forced_child_sum.dtype)
+            )
+            teacher_forced_child_count.view(-1).index_add_(
+                0, global_parent_indices, ones
+            )
+            teacher_forced_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
+                0, global_parent_indices, tf_sumsq_flat
+            )
 
         _empty = encoder_buffer.new_zeros(0)
         ar_recon = torch.cat(ar_recon_edge_list) if ar_recon_edge_list else _empty
