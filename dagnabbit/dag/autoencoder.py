@@ -134,7 +134,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        nn.init.normal_(self.position_embeddings, std=0.02)
+        nn.init.normal_(self.position_embeddings, std=0.08)
         nn.init.normal_(self.register_tokens, std=0.02)
 
     def forward(
