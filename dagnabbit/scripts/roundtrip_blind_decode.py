@@ -3,7 +3,9 @@
 Run:
 
     uv run python -m dagnabbit.scripts.roundtrip_blind_decode \
-        --ckpt runs/<run>/best.ckpt --num-graphs 128 --similarity-threshold 0.99
+        --ckpt "runs/20260623-190239-posenc-spread-0.08->0.02_0.1tfreconloss/checkpoints/graphs-003840000.ckpt" \
+        --num-graphs 10 \
+        --similarity-threshold 0.8
 """
 
 from __future__ import annotations
@@ -28,7 +30,52 @@ from dagnabbit.dag.description import (
     make_random_graph_description,
 )
 from dagnabbit.scripts import config as cfg
-from dagnabbit.scripts.diagnose_root_collapse import build_model, load_checkpoint
+
+
+def build_model(device: torch.device) -> DagnabbitAutoEncoder:
+    return DagnabbitAutoEncoder(
+        node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
+        trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
+        num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
+        num_root_nodes=cfg.NUM_ROOT_NODES,
+        num_output_nodes=cfg.NUM_OUTPUT_NODES,
+        mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
+        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
+        compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
+        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
+        transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
+        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
+        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
+        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+    ).to(device)
+
+
+def load_checkpoint(
+    model: DagnabbitAutoEncoder,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> int:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        completed_steps = checkpoint.get("completed_steps")
+        step = checkpoint.get("step")
+    else:
+        state_dict = checkpoint
+        completed_steps = None
+        step = None
+
+    if not isinstance(state_dict, dict):
+        raise TypeError(
+            f"checkpoint {checkpoint_path} does not contain a model state dict"
+        )
+
+    model.load_state_dict(state_dict)
+    if completed_steps is not None:
+        return int(completed_steps)
+    if step is not None:
+        return int(step) + 1
+    return -1
 
 
 def _output_cone_indices(graph: FixedInDegreeDAGDescription) -> set[int]:
