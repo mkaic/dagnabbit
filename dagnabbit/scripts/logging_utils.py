@@ -79,14 +79,26 @@ def log_decoder_accuracies(
     mean_tag: str,
     tag_prefix: str,
 ) -> None:
+    # Mirror every accuracy under an ``error/`` tag (1 - accuracy) so progress is
+    # legible on a log axis as it approaches zero. The accuracy tags all start
+    # with ``accuracy``; swap that leading segment for ``error``.
+    mean_error_tag = mean_tag.replace("accuracy", "error", 1)
+    error_prefix = tag_prefix.replace("accuracy", "error", 1)
+
     if not np.isnan(mean_accuracy):
         writer.add_scalar(mean_tag, mean_accuracy, step)
+        writer.add_scalar(mean_error_tag, 1.0 - mean_accuracy, step)
 
     for supertype, accuracy in supertype_accuracies.items():
         if not np.isnan(accuracy):
             writer.add_scalar(
                 f"{tag_prefix}/{supertype.value}",
                 accuracy,
+                step,
+            )
+            writer.add_scalar(
+                f"{error_prefix}/{supertype.value}",
+                1.0 - accuracy,
                 step,
             )
 
