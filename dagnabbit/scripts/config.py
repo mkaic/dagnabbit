@@ -31,6 +31,17 @@ TORCH_COMPILE_DYNAMIC = True
 TORCH_COMPILE_CUDAGRAPHS = False
 
 
+# --- decode passes ---
+# The training step runs up to three decode streams over one shared encode pass
+# (autoregressive-with-aggregation, teacher-forced, single-sample). Set this to
+# False to skip the autoregressive-with-aggregation stream entirely -- it is then
+# neither computed, scored, nor logged, so no compute is spent on it. Use this to
+# run with only the single-sample ("random child") and teacher-forced streams.
+# When False, W_PRIMARY_DECODED_CLASSIFICATION / W_PRIMARY_PARENT_RECONSTRUCTION /
+# W_PRIMARY_PARENT_CONSISTENCY are ignored.
+COMPUTE_AGGREGATE_DECODE_PASS = False
+
+
 # --- training ---
 NUM_STEPS = 10_000_000
 GRAPH_BATCH_SIZE = 16

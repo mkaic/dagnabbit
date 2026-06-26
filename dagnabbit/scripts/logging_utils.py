@@ -108,8 +108,8 @@ def log_step_metrics(
     step: int,
     total: float,
     components: dict[str, float],
-    decoder_accuracy: float,
-    decoder_supertype_accuracies: dict[NodeSupertype, float],
+    decoder_accuracy: float | None = None,
+    decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
     tf_decoder_accuracy: float | None = None,
     tf_decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
     grad_norm: float | None = None,
@@ -134,14 +134,17 @@ def log_step_metrics(
                     step,
                 )
 
-    log_decoder_accuracies(
-        writer,
-        step,
-        decoder_accuracy,
-        decoder_supertype_accuracies,
-        mean_tag="accuracy/decoder_mean",
-        tag_prefix="accuracy",
-    )
+    # Aggregate (autoregressive-with-aggregation) decode accuracies; absent when
+    # that stream is disabled.
+    if decoder_accuracy is not None and decoder_supertype_accuracies is not None:
+        log_decoder_accuracies(
+            writer,
+            step,
+            decoder_accuracy,
+            decoder_supertype_accuracies,
+            mean_tag="accuracy/decoder_mean",
+            tag_prefix="accuracy",
+        )
 
     # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
     # so they sit next to the autoregressive curves in TensorBoard).

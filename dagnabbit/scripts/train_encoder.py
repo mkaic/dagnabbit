@@ -29,39 +29,47 @@ def _safe_mean(t: torch.Tensor) -> torch.Tensor:
 def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    pc_mean = losses.primary_node_classification_losses.mean()
     tf_pc_mean = losses.teacher_forced_primary_node_classification_losses.mean()
-    pr_mean = _safe_mean(losses.primary_node_parent_reconstruction_losses)
     tf_pr_mean = _safe_mean(
         losses.teacher_forced_primary_node_parent_reconstruction_losses
     )
-    pc_cons_mean = _safe_mean(losses.primary_node_parent_consistency_losses)
     tf_pc_cons_mean = _safe_mean(
         losses.teacher_forced_primary_node_parent_consistency_losses
     )
     single_pc_mean = losses.single_sample_primary_node_classification_losses.mean()
 
     total = cfg.GLOBAL_LOSS_MULTIPLIER * (
-        cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
-        + cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
+        cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
         + cfg.W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION * single_pc_mean
-        + cfg.W_PRIMARY_PARENT_RECONSTRUCTION * pr_mean
         + cfg.W_TF_PRIMARY_PARENT_RECONSTRUCTION * tf_pr_mean
-        + cfg.W_PRIMARY_PARENT_CONSISTENCY * pc_cons_mean
         + cfg.W_TF_PRIMARY_PARENT_CONSISTENCY * tf_pc_cons_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
     # steps that actually log them, rather than every step.
     components = {
-        "primary_decoded_classification": pc_mean,
         "tf_primary_decoded_classification": tf_pc_mean,
         "single_sample_classification": single_pc_mean,
-        "primary_parent_reconstruction": pr_mean,
         "tf_primary_parent_reconstruction": tf_pr_mean,
-        "primary_parent_consistency": pc_cons_mean,
         "tf_primary_parent_consistency": tf_pc_cons_mean,
     }
+
+    # The aggregate (autoregressive-with-aggregation) stream is only computed when
+    # enabled; its loss tensors are otherwise zeros and must not be scored or
+    # logged. Fold it in only when the model actually ran it.
+    if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
+        pc_mean = losses.primary_node_classification_losses.mean()
+        pr_mean = _safe_mean(losses.primary_node_parent_reconstruction_losses)
+        pc_cons_mean = _safe_mean(losses.primary_node_parent_consistency_losses)
+        total = total + cfg.GLOBAL_LOSS_MULTIPLIER * (
+            cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
+            + cfg.W_PRIMARY_PARENT_RECONSTRUCTION * pr_mean
+            + cfg.W_PRIMARY_PARENT_CONSISTENCY * pc_cons_mean
+        )
+        components["primary_decoded_classification"] = pc_mean
+        components["primary_parent_reconstruction"] = pr_mean
+        components["primary_parent_consistency"] = pc_cons_mean
+
     return total, components
 
 
@@ -264,6 +272,7 @@ def main() -> None:
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
         compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
+        compute_aggregate_decode_pass=cfg.COMPUTE_AGGREGATE_DECODE_PASS,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
@@ -375,12 +384,15 @@ def main() -> None:
                 optimizer.zero_grad()
 
             if writer is not None:
-                step_preds, step_truth = step_preds_and_truth(
-                    losses.primary_node_predicted_type_logits,
-                    losses.primary_node_true_types,
-                )
-                window_preds.append(step_preds)
-                window_truth.append(step_truth)
+                # Aggregate stream is only populated when enabled; skip its
+                # accuracy bookkeeping otherwise (its logits are all zeros).
+                if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
+                    step_preds, step_truth = step_preds_and_truth(
+                        losses.primary_node_predicted_type_logits,
+                        losses.primary_node_true_types,
+                    )
+                    window_preds.append(step_preds)
+                    window_truth.append(step_truth)
 
                 # Teacher-forced predictions share the autoregressive true labels.
                 tf_step_preds, tf_step_truth = step_preds_and_truth(
@@ -408,14 +420,19 @@ def main() -> None:
             progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
 
             if writer is not None and step % cfg.LOG_EVERY == 0:
-                (
-                    decoder_accuracy,
-                    decoder_supertype_accuracies,
-                ) = accuracy_summary(
-                    np.concatenate(window_preds),
-                    np.concatenate(window_truth),
-                    num_classes=model.num_node_types,
-                )
+                decoder_accuracy = None
+                decoder_supertype_accuracies = None
+                if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
+                    (
+                        decoder_accuracy,
+                        decoder_supertype_accuracies,
+                    ) = accuracy_summary(
+                        np.concatenate(window_preds),
+                        np.concatenate(window_truth),
+                        num_classes=model.num_node_types,
+                    )
+                    window_preds.clear()
+                    window_truth.clear()
                 (
                     tf_decoder_accuracy,
                     tf_decoder_supertype_accuracies,
@@ -432,8 +449,6 @@ def main() -> None:
                     np.concatenate(single_window_truth),
                     num_classes=model.num_node_types,
                 )
-                window_preds.clear()
-                window_truth.clear()
                 tf_window_preds.clear()
                 tf_window_truth.clear()
                 single_window_preds.clear()

@@ -363,6 +363,7 @@ class DagnabbitAutoEncoder(nn.Module):
         mlp_expansion_factor: float,
         reconstruction_detach_target: bool = True,
         compute_reconstruction_loss: bool = False,
+        compute_aggregate_decode_pass: bool = True,
         transformer_num_layers: int = 1,
         transformer_mlp_depth: int = 1,
         transformer_num_register_tokens: int = 2,
@@ -386,6 +387,7 @@ class DagnabbitAutoEncoder(nn.Module):
         self.mlp_expansion_factor = mlp_expansion_factor
         self.reconstruction_detach_target = reconstruction_detach_target
         self.compute_reconstruction_loss = compute_reconstruction_loss
+        self.compute_aggregate_decode_pass = compute_aggregate_decode_pass
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.transformer_num_layers = transformer_num_layers
         self.transformer_mlp_depth = transformer_mlp_depth
@@ -860,6 +862,11 @@ class DagnabbitAutoEncoder(nn.Module):
         tuple[Tensor, Tensor, Tensor],
     ]:
         batch_size, num_nodes, _ = encoder_buffer.shape
+        # When the aggregate (autoregressive) stream is disabled it is dropped from
+        # every fused classifier/decoder call and its buffers are never read or
+        # scattered, so no compute is spent on it. Its result tensors stay at the
+        # zeros allocated below.
+        compute_ar = self.compute_aggregate_decode_pass
 
         def _alloc_pass_buffers():
             combined = torch.zeros(
@@ -917,29 +924,31 @@ class DagnabbitAutoEncoder(nn.Module):
             nodes = rank_batch.node_indices
             num_rank_rows = nodes.shape[0]
 
-            ar_counts = autoregressive_child_count[rows, nodes]
             tf_counts = teacher_forced_child_count[rows, nodes]
-            ar_combined_rank = autoregressive_child_sum[
-                rows, nodes
-            ] / ar_counts.sqrt().unsqueeze(-1)
             tf_combined_rank = teacher_forced_child_sum[
                 rows, nodes
             ] / tf_counts.sqrt().unsqueeze(-1)
-            ar_combined[rows, nodes] = ar_combined_rank
             tf_combined[rows, nodes] = tf_combined_rank
 
-            ar_mean = autoregressive_child_sum[rows, nodes] / ar_counts.unsqueeze(-1)
-            ar_var = (
-                (
-                    autoregressive_child_sumsq[rows, nodes] / ar_counts.unsqueeze(-1)
-                    - ar_mean**2
+            if compute_ar:
+                ar_counts = autoregressive_child_count[rows, nodes]
+                ar_combined_rank = autoregressive_child_sum[
+                    rows, nodes
+                ] / ar_counts.sqrt().unsqueeze(-1)
+                ar_combined[rows, nodes] = ar_combined_rank
+
+                ar_mean = autoregressive_child_sum[rows, nodes] / ar_counts.unsqueeze(-1)
+                ar_var = (
+                    (
+                        autoregressive_child_sumsq[rows, nodes] / ar_counts.unsqueeze(-1)
+                        - ar_mean**2
+                    )
+                    .mean(dim=-1)
+                    .clamp(min=0)
                 )
-                .mean(dim=-1)
-                .clamp(min=0)
-            )
-            ar_consistency[rows, nodes] = torch.where(
-                ar_counts > 1, ar_var, torch.zeros_like(ar_var)
-            )
+                ar_consistency[rows, nodes] = torch.where(
+                    ar_counts > 1, ar_var, torch.zeros_like(ar_var)
+                )
 
             tf_mean = teacher_forced_child_sum[rows, nodes] / tf_counts.unsqueeze(-1)
             tf_var = (
@@ -961,67 +970,59 @@ class DagnabbitAutoEncoder(nn.Module):
             single_combined_rank = single_emb[rows, nodes]
             single_combined[rows, nodes] = single_combined_rank
 
-            # One classifier call over all three streams; rows are independent so
-            # the ar/tf slices are bit-for-bit what they were before this stream.
-            combined_all = torch.cat(
-                [ar_combined_rank, tf_combined_rank, single_combined_rank], dim=0
-            )
+            # One classifier call over all active streams; rows are independent so
+            # each stream's slice is bit-for-bit what it would be computed alone.
+            # Stream order is [ar (only if enabled), tf, single]; every stream
+            # contributes ``num_rank_rows`` rows, so chunk() splits the fused
+            # output back into per-stream tensors.
+            classify_inputs = []
+            if compute_ar:
+                classify_inputs.append(ar_combined_rank)
+            classify_inputs.extend([tf_combined_rank, single_combined_rank])
+            num_streams = len(classify_inputs)
+            combined_all = torch.cat(classify_inputs, dim=0)
             logits_all = self.node_type_predictor(combined_all)
-            ar_logits[rows, nodes] = logits_all[:num_rank_rows].to(ar_logits.dtype)
-            tf_logits[rows, nodes] = logits_all[
-                num_rank_rows : 2 * num_rank_rows
-            ].to(tf_logits.dtype)
-            single_logits[rows, nodes] = logits_all[2 * num_rank_rows :].to(
-                single_logits.dtype
-            )
+            logit_chunks = logits_all.chunk(num_streams)
+            if compute_ar:
+                ar_logits[rows, nodes] = logit_chunks[0].to(ar_logits.dtype)
+            tf_logits[rows, nodes] = logit_chunks[-2].to(tf_logits.dtype)
+            single_logits[rows, nodes] = logit_chunks[-1].to(single_logits.dtype)
 
             rank_labels = labels[rows, nodes]
             cross_entropy_all = F.cross_entropy(
                 logits_all,
-                torch.cat([rank_labels, rank_labels, rank_labels]),
+                rank_labels.repeat(num_streams),
                 reduction="none",
             )
-            ar_class[rows, nodes] = cross_entropy_all[:num_rank_rows].to(
-                ar_class.dtype
-            )
-            tf_class[rows, nodes] = cross_entropy_all[
-                num_rank_rows : 2 * num_rank_rows
-            ].to(tf_class.dtype)
-            single_class[rows, nodes] = cross_entropy_all[2 * num_rank_rows :].to(
-                single_class.dtype
-            )
+            class_chunks = cross_entropy_all.chunk(num_streams)
+            if compute_ar:
+                ar_class[rows, nodes] = class_chunks[0].to(ar_class.dtype)
+            tf_class[rows, nodes] = class_chunks[-2].to(tf_class.dtype)
+            single_class[rows, nodes] = class_chunks[-1].to(single_class.dtype)
 
             if not rank_batch.has_valid_parents:
                 continue
 
-            decode_input_all = torch.cat(
-                [
-                    ar_combined[rows, nodes],
-                    encoder_buffer[rows, nodes],
-                    single_combined_rank,
-                ],
-                dim=0,
-            )
-            subtypes_all = torch.cat(
-                [rank_batch.subtypes, rank_batch.subtypes, rank_batch.subtypes]
-            )
+            decode_inputs = []
+            if compute_ar:
+                decode_inputs.append(ar_combined_rank)
+            decode_inputs.extend([encoder_buffer[rows, nodes], single_combined_rank])
+            decode_input_all = torch.cat(decode_inputs, dim=0)
+            subtypes_all = rank_batch.subtypes.repeat(num_streams)
             leaf_embeddings_for_rank = leaf_embeddings_by_graph[rows]
             leaf_embeddings_all = torch.cat(
-                [
-                    leaf_embeddings_for_rank,
-                    leaf_embeddings_for_rank,
-                    leaf_embeddings_for_rank,
-                ],
-                dim=0,
+                [leaf_embeddings_for_rank] * num_streams, dim=0
             )
             predicted_all = self.node_decoder.forward_batch(
                 decode_input_all,
                 subtypes_all,
                 leaf_embeddings_all,
             )
-            ar_predicted = predicted_all[:num_rank_rows]
-            tf_predicted = predicted_all[num_rank_rows : 2 * num_rank_rows]
-            single_predicted = predicted_all[2 * num_rank_rows :]
+            predicted_chunks = predicted_all.chunk(num_streams)
+            tf_predicted = predicted_chunks[-2]
+            single_predicted = predicted_chunks[-1]
+            if compute_ar:
+                ar_predicted = predicted_chunks[0]
 
             # Scatter every graph's predicted parents into the child buffers
             # without ever reading mask contents back to the host. We keep the
@@ -1042,12 +1043,13 @@ class DagnabbitAutoEncoder(nn.Module):
                 rows[:, None] * num_nodes + rank_batch.parent_indices
             ).reshape(-1)
 
-            ar_contrib = ar_predicted.reshape(-1, self.node_embedding_dim) * (
-                edge_weight.unsqueeze(-1)
-            )
             tf_contrib = tf_predicted.reshape(-1, self.node_embedding_dim) * (
                 edge_weight.unsqueeze(-1)
             )
+            if compute_ar:
+                ar_contrib = ar_predicted.reshape(-1, self.node_embedding_dim) * (
+                    edge_weight.unsqueeze(-1)
+                )
 
             if self.compute_reconstruction_loss:
                 valid_parent_mask = mask
@@ -1055,17 +1057,18 @@ class DagnabbitAutoEncoder(nn.Module):
                 flat_batch_indices = rows[:, None].expand_as(rank_batch.parent_indices)[
                     valid_parent_mask
                 ]
-                ar_flat = ar_predicted[valid_parent_mask]
                 tf_flat = tf_predicted[valid_parent_mask]
                 recon_target = encoder_buffer[flat_batch_indices, flat_parent_indices]
                 if self.reconstruction_detach_target:
                     recon_target = recon_target.detach()
-                ar_recon_edge_list.append(
-                    1.0
-                    - F.cosine_similarity(
-                        ar_flat.to(recon_target.dtype), recon_target, dim=-1
+                if compute_ar:
+                    ar_flat = ar_predicted[valid_parent_mask]
+                    ar_recon_edge_list.append(
+                        1.0
+                        - F.cosine_similarity(
+                            ar_flat.to(recon_target.dtype), recon_target, dim=-1
+                        )
                     )
-                )
                 tf_recon_edge_list.append(
                     1.0
                     - F.cosine_similarity(
@@ -1073,17 +1076,20 @@ class DagnabbitAutoEncoder(nn.Module):
                     )
                 )
 
-            autoregressive_child_sum.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, ar_contrib.to(autoregressive_child_sum.dtype)
-            )
-            autoregressive_child_count.view(-1).index_add_(
-                0, global_parent_indices, edge_weight
-            )
-            autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0,
-                global_parent_indices,
-                (ar_contrib**2).to(autoregressive_child_sumsq.dtype),
-            )
+            if compute_ar:
+                autoregressive_child_sum.view(batch_size * num_nodes, -1).index_add_(
+                    0,
+                    global_parent_indices,
+                    ar_contrib.to(autoregressive_child_sum.dtype),
+                )
+                autoregressive_child_count.view(-1).index_add_(
+                    0, global_parent_indices, edge_weight
+                )
+                autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
+                    0,
+                    global_parent_indices,
+                    (ar_contrib**2).to(autoregressive_child_sumsq.dtype),
+                )
             teacher_forced_child_sum.view(batch_size * num_nodes, -1).index_add_(
                 0, global_parent_indices, tf_contrib.to(teacher_forced_child_sum.dtype)
             )
