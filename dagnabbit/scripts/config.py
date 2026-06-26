@@ -91,7 +91,7 @@ COMPUTE_RECONSTRUCTION_LOSS = True
 W_PRIMARY_PARENT_RECONSTRUCTION = 0.0
 W_TF_PRIMARY_PARENT_RECONSTRUCTION = 0.1
 # parent-consistency (per-parent agreement among child predictions); opt-in
-W_PRIMARY_PARENT_CONSISTENCY = 0.1
+W_PRIMARY_PARENT_CONSISTENCY = 0.0
 W_TF_PRIMARY_PARENT_CONSISTENCY = 0.0
 # detach encoder_buffer when used as the reconstruction target (train decoder only)
 RECONSTRUCTION_DETACH_TARGET = True
