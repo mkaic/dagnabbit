@@ -293,6 +293,13 @@ class TrainingStepLossReturnType:
     # averaged over D. Node-indexed [B, N] tensor; zero for count <= 1 nodes.
     primary_node_parent_consistency_losses: Tensor
     teacher_forced_primary_node_parent_consistency_losses: Tensor
+    # Single-sample autoregressive stream: a third decode pass where each node is
+    # fed exactly one uniformly-sampled child prediction (no aggregation), passed
+    # forward down the DAG. This trains the decoder/classifier to be accurate from
+    # a single compounded embedding -- the blind-decode regime -- rather than only
+    # from the denoised aggregate. Same node alignment / true labels as above.
+    single_sample_primary_node_classification_losses: Tensor
+    single_sample_primary_node_predicted_type_logits: Tensor
 
 
 @dataclass
@@ -306,6 +313,15 @@ class _DecodePipelineResult:
     primary_recon: Tensor
     # Node-indexed 1-D tensor of per-parent consistency losses (zero for count<=1).
     primary_consistency: Tensor
+
+
+@dataclass
+class _SingleSampleResult:
+    """Dense per-node outputs of the single-sample autoregressive decode pass."""
+
+    primary_combined: Tensor
+    primary_logits: Tensor
+    primary_class_losses: Tensor
 
 
 @dataclass
@@ -652,7 +668,7 @@ class DagnabbitAutoEncoder(nn.Module):
         # autoregressive pass compounds predictions down each DAG; the
         # teacher-forced pass decodes each node from its true encode-side
         # embedding. Both passes are processed together rank-by-rank.
-        autoregressive, teacher_forced = self._decode_pipeline(
+        autoregressive, teacher_forced, single_sample = self._decode_pipeline(
             primary_graphs=primary_graphs,
             primary_buffer=primary_buffer,
             primary_labels=primary_labels,
@@ -678,6 +694,12 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_primary_node_parent_consistency_losses=(
                 teacher_forced.primary_consistency
             ),
+            single_sample_primary_node_classification_losses=(
+                single_sample.primary_class_losses
+            ),
+            single_sample_primary_node_predicted_type_logits=(
+                single_sample.primary_logits
+            ),
         )
 
         if return_buffers:
@@ -691,7 +713,7 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_labels: Tensor,
         rank_batches: Sequence[_BatchedRank],
         device: torch.device,
-    ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult"]:
+    ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult", "_SingleSampleResult"]:
         batch_size, num_nodes, _ = primary_buffer.shape
 
         def _zeros(dtype: torch.dtype):
@@ -739,6 +761,23 @@ class DagnabbitAutoEncoder(nn.Module):
             child_count[batch_rows, leaf_indices] = 1.0
             child_sumsq[batch_rows, leaf_indices] = leaf_embeddings**2
 
+        # Single-sample stream buffers: ``single_emb`` holds the one sampled child
+        # prediction that becomes each node's decode/classify input; ``single_key``
+        # holds the random reservoir key of the currently-selected child (-inf
+        # means "no child seen yet"). Leaves (output nodes) are fixed to their
+        # encoder embedding with key +inf so they are never overwritten.
+        single_primary_emb = torch.zeros_like(primary_buffer)
+        single_primary_key = torch.full(
+            (batch_size, num_nodes),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        single_primary_emb[batch_rows, leaf_indices] = leaf_embeddings_by_graph.to(
+            single_primary_emb.dtype
+        )
+        single_primary_key[batch_rows, leaf_indices] = float("inf")
+
         (
             (
                 ar_primary_combined,
@@ -754,6 +793,11 @@ class DagnabbitAutoEncoder(nn.Module):
                 tf_primary_recon,
                 tf_primary_consistency,
             ),
+            (
+                single_primary_combined,
+                single_primary_logits,
+                single_primary_class,
+            ),
         ) = self._decode_graph(
             graphs=primary_graphs,
             encoder_buffer=primary_buffer,
@@ -763,6 +807,8 @@ class DagnabbitAutoEncoder(nn.Module):
             teacher_forced_child_sum=tf_primary_sum,
             teacher_forced_child_count=tf_primary_count,
             teacher_forced_child_sumsq=tf_primary_sumsq,
+            single_sample_emb=single_primary_emb,
+            single_sample_key=single_primary_key,
             labels=primary_labels,
             leaf_embeddings_by_graph=leaf_embeddings_by_graph,
             process_roots=True,
@@ -784,7 +830,12 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_recon=tf_primary_recon,
             primary_consistency=tf_primary_consistency,
         )
-        return autoregressive, teacher_forced
+        single_sample = _SingleSampleResult(
+            primary_combined=single_primary_combined,
+            primary_logits=single_primary_logits,
+            primary_class_losses=single_primary_class,
+        )
+        return autoregressive, teacher_forced, single_sample
 
     def _decode_graph(
         self,
@@ -796,6 +847,8 @@ class DagnabbitAutoEncoder(nn.Module):
         teacher_forced_child_sum: Tensor,
         teacher_forced_child_count: Tensor,
         teacher_forced_child_sumsq: Tensor,
+        single_sample_emb: Tensor,
+        single_sample_key: Tensor,
         labels: Tensor,
         leaf_embeddings_by_graph: Tensor,
         process_roots: bool,
@@ -804,6 +857,7 @@ class DagnabbitAutoEncoder(nn.Module):
     ) -> tuple[
         tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
         tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        tuple[Tensor, Tensor, Tensor],
     ]:
         batch_size, num_nodes, _ = encoder_buffer.shape
 
@@ -838,6 +892,14 @@ class DagnabbitAutoEncoder(nn.Module):
 
         ar_combined, ar_logits, ar_class, ar_consistency = _alloc_pass_buffers()
         tf_combined, tf_logits, tf_class, tf_consistency = _alloc_pass_buffers()
+        # Single-sample stream needs no consistency buffer (it carries one child,
+        # so there is no within-parent variance to measure).
+        single_combined, single_logits, single_class, _ = _alloc_pass_buffers()
+        # ``single_emb`` / ``single_key`` are rebound out-of-place each rank (via
+        # torch.where below) so the autograd graph stays clean -- no in-place edits
+        # of a tensor that later ranks read back.
+        single_emb = single_sample_emb
+        single_key = single_sample_key
 
         ar_recon_edge_list: list[Tensor] = []
         tf_recon_edge_list: list[Tensor] = []
@@ -892,47 +954,74 @@ class DagnabbitAutoEncoder(nn.Module):
                 tf_counts > 1, tf_var, torch.zeros_like(tf_var)
             )
 
-            combined_both = torch.cat([ar_combined_rank, tf_combined_rank], dim=0)
-            logits_both = self.node_type_predictor(combined_both)
-            ar_logits[rows, nodes] = logits_both[:num_rank_rows].to(ar_logits.dtype)
-            tf_logits[rows, nodes] = logits_both[num_rank_rows:].to(tf_logits.dtype)
+            # Single-sample input for this rank: the one child prediction that won
+            # the reservoir for each node (its children, at higher ranks, have all
+            # been processed and scattered by now -- same ordering guarantee the
+            # autoregressive sum relies on).
+            single_combined_rank = single_emb[rows, nodes]
+            single_combined[rows, nodes] = single_combined_rank
+
+            # One classifier call over all three streams; rows are independent so
+            # the ar/tf slices are bit-for-bit what they were before this stream.
+            combined_all = torch.cat(
+                [ar_combined_rank, tf_combined_rank, single_combined_rank], dim=0
+            )
+            logits_all = self.node_type_predictor(combined_all)
+            ar_logits[rows, nodes] = logits_all[:num_rank_rows].to(ar_logits.dtype)
+            tf_logits[rows, nodes] = logits_all[
+                num_rank_rows : 2 * num_rank_rows
+            ].to(tf_logits.dtype)
+            single_logits[rows, nodes] = logits_all[2 * num_rank_rows :].to(
+                single_logits.dtype
+            )
 
             rank_labels = labels[rows, nodes]
-            cross_entropy_both = F.cross_entropy(
-                logits_both,
-                torch.cat([rank_labels, rank_labels]),
+            cross_entropy_all = F.cross_entropy(
+                logits_all,
+                torch.cat([rank_labels, rank_labels, rank_labels]),
                 reduction="none",
             )
-            ar_class[rows, nodes] = cross_entropy_both[:num_rank_rows].to(
+            ar_class[rows, nodes] = cross_entropy_all[:num_rank_rows].to(
                 ar_class.dtype
             )
-            tf_class[rows, nodes] = cross_entropy_both[num_rank_rows:].to(
-                tf_class.dtype
+            tf_class[rows, nodes] = cross_entropy_all[
+                num_rank_rows : 2 * num_rank_rows
+            ].to(tf_class.dtype)
+            single_class[rows, nodes] = cross_entropy_all[2 * num_rank_rows :].to(
+                single_class.dtype
             )
 
             if not rank_batch.has_valid_parents:
                 continue
 
-            decode_input_both = torch.cat(
+            decode_input_all = torch.cat(
                 [
                     ar_combined[rows, nodes],
                     encoder_buffer[rows, nodes],
+                    single_combined_rank,
                 ],
                 dim=0,
             )
-            subtypes_both = torch.cat([rank_batch.subtypes, rank_batch.subtypes])
+            subtypes_all = torch.cat(
+                [rank_batch.subtypes, rank_batch.subtypes, rank_batch.subtypes]
+            )
             leaf_embeddings_for_rank = leaf_embeddings_by_graph[rows]
-            leaf_embeddings_both = torch.cat(
-                [leaf_embeddings_for_rank, leaf_embeddings_for_rank],
+            leaf_embeddings_all = torch.cat(
+                [
+                    leaf_embeddings_for_rank,
+                    leaf_embeddings_for_rank,
+                    leaf_embeddings_for_rank,
+                ],
                 dim=0,
             )
-            predicted_both = self.node_decoder.forward_batch(
-                decode_input_both,
-                subtypes_both,
-                leaf_embeddings_both,
+            predicted_all = self.node_decoder.forward_batch(
+                decode_input_all,
+                subtypes_all,
+                leaf_embeddings_all,
             )
-            ar_predicted = predicted_both[:num_rank_rows]
-            tf_predicted = predicted_both[num_rank_rows:]
+            ar_predicted = predicted_all[:num_rank_rows]
+            tf_predicted = predicted_all[num_rank_rows : 2 * num_rank_rows]
+            single_predicted = predicted_all[2 * num_rank_rows :]
 
             # Scatter every graph's predicted parents into the child buffers
             # without ever reading mask contents back to the host. We keep the
@@ -1007,6 +1096,48 @@ class DagnabbitAutoEncoder(nn.Module):
                 (tf_contrib**2).to(teacher_forced_child_sumsq.dtype),
             )
 
+            # ---- single-sample reservoir scatter ----
+            # Pick exactly one child per parent: give each edge an iid uniform key
+            # and keep the child whose key is globally largest across all ranks,
+            # which is a uniform random draw among the parent's children. The
+            # selection is computed on detached random keys; gradient still flows
+            # into the chosen prediction through the torch.where below, so the
+            # decoder learns to make a single compounded embedding classify
+            # correctly. Invalid (padding) slots carry key -inf and are masked out.
+            flat_nodes = batch_size * num_nodes
+            single_pred_flat = single_predicted.reshape(-1, self.node_embedding_dim)
+            edge_key = torch.rand(
+                mask.shape, device=device, dtype=single_key.dtype
+            ).masked_fill(~mask, float("-inf"))
+            edge_key_flat = edge_key.reshape(-1)
+            batch_max_key = torch.full(
+                (flat_nodes,), float("-inf"), device=device, dtype=single_key.dtype
+            )
+            batch_max_key.scatter_reduce_(
+                0, global_parent_indices, edge_key_flat, reduce="amax", include_self=True
+            )
+            won = (edge_weight > 0) & (
+                edge_key_flat == batch_max_key.index_select(0, global_parent_indices)
+            )
+            batch_winner_emb = torch.zeros(
+                flat_nodes,
+                self.node_embedding_dim,
+                device=device,
+                dtype=single_pred_flat.dtype,
+            )
+            batch_winner_emb[global_parent_indices[won]] = single_pred_flat[won]
+
+            single_key_flat = single_key.reshape(-1)
+            take_batch = batch_max_key > single_key_flat
+            single_key = torch.where(
+                take_batch, batch_max_key, single_key_flat
+            ).reshape(batch_size, num_nodes)
+            single_emb = torch.where(
+                take_batch.unsqueeze(-1),
+                batch_winner_emb,
+                single_emb.reshape(flat_nodes, -1),
+            ).reshape(batch_size, num_nodes, self.node_embedding_dim)
+
         _empty = encoder_buffer.new_zeros(0)
         ar_recon = torch.cat(ar_recon_edge_list) if ar_recon_edge_list else _empty
         tf_recon = torch.cat(tf_recon_edge_list) if tf_recon_edge_list else _empty
@@ -1014,6 +1145,7 @@ class DagnabbitAutoEncoder(nn.Module):
         return (
             (ar_combined, ar_logits, ar_class, ar_recon, ar_consistency),
             (tf_combined, tf_logits, tf_class, tf_recon, tf_consistency),
+            (single_combined, single_logits, single_class),
         )
 
     @torch.no_grad()

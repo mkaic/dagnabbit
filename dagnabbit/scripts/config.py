@@ -73,6 +73,14 @@ GLOBAL_LOSS_MULTIPLIER = 1.0
 # logging, so zero it *and* skip logging if you want it fully gone).
 W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 
+# Single-sample autoregressive decode pass: each node is fed exactly one
+# uniformly-sampled child prediction (no aggregation), passed forward down the
+# DAG, and classified. Directly trains the blind-decode regime (single compounded
+# embedding) rather than only the denoised aggregate. The aggregate pass above is
+# kept as the gradient highway / fast learner; this is the auxiliary that closes
+# the train/blind-decode gap. Lower it if early training is unstable.
+W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
+
 # --- teacher-forced decode pass loss weights ---
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
 

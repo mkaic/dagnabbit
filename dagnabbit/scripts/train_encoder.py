@@ -15,6 +15,7 @@ from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
     accuracy_summary,
     format_param_count,
+    log_decoder_accuracies,
     log_run_config,
     log_step_metrics,
     step_preds_and_truth,
@@ -38,10 +39,12 @@ def combine_losses(
     tf_pc_cons_mean = _safe_mean(
         losses.teacher_forced_primary_node_parent_consistency_losses
     )
+    single_pc_mean = losses.single_sample_primary_node_classification_losses.mean()
 
     total = cfg.GLOBAL_LOSS_MULTIPLIER * (
         cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
         + cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
+        + cfg.W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION * single_pc_mean
         + cfg.W_PRIMARY_PARENT_RECONSTRUCTION * pr_mean
         + cfg.W_TF_PRIMARY_PARENT_RECONSTRUCTION * tf_pr_mean
         + cfg.W_PRIMARY_PARENT_CONSISTENCY * pc_cons_mean
@@ -53,6 +56,7 @@ def combine_losses(
     components = {
         "primary_decoded_classification": pc_mean,
         "tf_primary_decoded_classification": tf_pc_mean,
+        "single_sample_classification": single_pc_mean,
         "primary_parent_reconstruction": pr_mean,
         "tf_primary_parent_reconstruction": tf_pr_mean,
         "primary_parent_consistency": pc_cons_mean,
@@ -320,6 +324,8 @@ def main() -> None:
         window_truth: list[np.ndarray] = []
         tf_window_preds: list[np.ndarray] = []
         tf_window_truth: list[np.ndarray] = []
+        single_window_preds: list[np.ndarray] = []
+        single_window_truth: list[np.ndarray] = []
         loss_ema: float | None = None
         best_loss: float | None = None
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
@@ -384,6 +390,14 @@ def main() -> None:
                 tf_window_preds.append(tf_step_preds)
                 tf_window_truth.append(tf_step_truth)
 
+                # Single-sample stream shares the same true labels.
+                single_step_preds, single_step_truth = step_preds_and_truth(
+                    losses.single_sample_primary_node_predicted_type_logits,
+                    losses.primary_node_true_types,
+                )
+                single_window_preds.append(single_step_preds)
+                single_window_truth.append(single_step_truth)
+
             loss_val = total.item()
             graphs_seen = (step + 1) * cfg.GRAPH_BATCH_SIZE
             loss_window.append(loss_val)
@@ -410,10 +424,30 @@ def main() -> None:
                     np.concatenate(tf_window_truth),
                     num_classes=model.num_node_types,
                 )
+                (
+                    single_decoder_accuracy,
+                    single_decoder_supertype_accuracies,
+                ) = accuracy_summary(
+                    np.concatenate(single_window_preds),
+                    np.concatenate(single_window_truth),
+                    num_classes=model.num_node_types,
+                )
                 window_preds.clear()
                 window_truth.clear()
                 tf_window_preds.clear()
                 tf_window_truth.clear()
+                single_window_preds.clear()
+                single_window_truth.clear()
+                # Single-sample accuracy is the headline blind-decode-regime metric;
+                # log it next to the autoregressive and tf curves.
+                log_decoder_accuracies(
+                    writer,
+                    tensorboard_step,
+                    single_decoder_accuracy,
+                    single_decoder_supertype_accuracies,
+                    mean_tag="accuracy/single/decoder_mean",
+                    tag_prefix="accuracy/single",
+                )
                 log_step_metrics(
                     writer,
                     tensorboard_step,
