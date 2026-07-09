@@ -117,6 +117,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     loss: float,
+    best_loss: float | None = None,
 ) -> None:
     checkpoint = {
         # ``step`` is retained as the zero-based loop index for compatibility
@@ -127,6 +128,10 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "loss": loss,
+        # The best avg-loss seen so far, tracked separately from this
+        # checkpoint's own ``loss`` so a resume from latest.ckpt (which is not
+        # necessarily the best) does not reset the best-loss tracker.
+        "best_loss": best_loss,
     }
     if lr_scheduler is not None:
         checkpoint["lr_scheduler_state_dict"] = lr_scheduler.state_dict()
@@ -192,6 +197,17 @@ def parse_args() -> argparse.Namespace:
         help="Disable TensorBoard logging.",
     )
     parser.add_argument(
+        "--resume",
+        default=None,
+        help=(
+            "Resume training from a checkpoint. Pass a run directory (its "
+            "latest.ckpt is used, falling back to best.ckpt) or a specific "
+            ".ckpt file. Model, optimizer, LR-scheduler, step counter and "
+            "best-loss are restored, and TensorBoard logs continue in the same "
+            "run directory. Ignores --run-name."
+        ),
+    )
+    parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -251,16 +267,38 @@ def main() -> None:
                 "CHECKPOINT_EVERY_GRAPHS must land on an optimizer-update boundary"
             )
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
-    run_dir = Path(cfg.TENSORBOARD_LOG_DIR) / run_name
+    resume_checkpoint_path: Path | None = None
+    if args.resume is not None:
+        resume_arg = Path(args.resume)
+        if resume_arg.is_dir():
+            # Prefer latest.ckpt (saved every CHECK_BEST_EVERY steps) so a resume
+            # skips the dry spell since the last best; fall back to best.ckpt.
+            latest = resume_arg / "latest.ckpt"
+            resume_checkpoint_path = latest if latest.exists() else resume_arg / "best.ckpt"
+        else:
+            resume_checkpoint_path = resume_arg
+        if not resume_checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"--resume checkpoint not found: {resume_checkpoint_path}"
+            )
+        # Continue logging into the run the checkpoint lives in so TensorBoard
+        # sees one uninterrupted run rather than two disjoint ones.
+        run_dir = resume_checkpoint_path.parent
+        print(f"resuming from {resume_checkpoint_path}")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"{timestamp}-{args.run_name}" if args.run_name else timestamp
+        run_dir = Path(cfg.TENSORBOARD_LOG_DIR) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"run_dir={run_dir}")
 
     writer: SummaryWriter | None = None
     if not args.no_log:
+        # Reopening a SummaryWriter on the same log_dir appends a new event file;
+        # TensorBoard merges them into a single continuous run.
         writer = SummaryWriter(log_dir=str(run_dir))
-        log_run_config(writer)
+        if resume_checkpoint_path is None:
+            log_run_config(writer)
         print(f"tensorboard_log_dir={run_dir}")
 
     model = DagnabbitAutoEncoder(
@@ -301,6 +339,30 @@ def main() -> None:
             f"target_lr={target_lrs}"
         )
 
+    start_step = 0
+    resumed_best_loss: float | None = None
+    if resume_checkpoint_path is not None:
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if lr_scheduler is not None and "lr_scheduler_state_dict" in checkpoint:
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+        # ``completed_steps`` is the next zero-based loop index to run. Fall back
+        # to ``step + 1`` for older checkpoints that predate that field.
+        start_step = checkpoint.get("completed_steps", checkpoint["step"] + 1)
+        # Restore the best loss so a resumed run does not overwrite best.ckpt
+        # with a worse checkpoint before it beats the prior best. Prefer the
+        # dedicated ``best_loss`` field; fall back to ``loss`` for checkpoints
+        # predating it (where best.ckpt's loss is itself the best).
+        resumed_best_loss = checkpoint.get("best_loss")
+        if resumed_best_loss is None:
+            resumed_best_loss = checkpoint.get("loss")
+        resumed_graphs_seen = start_step * cfg.GRAPH_BATCH_SIZE
+        print(
+            f"resumed: start_step={start_step} graphs_seen={resumed_graphs_seen} "
+            f"best_loss={resumed_best_loss}"
+        )
+
     prof: profile | None = None
     total_profile_steps = 0
     if args.profile:
@@ -336,12 +398,17 @@ def main() -> None:
         single_window_preds: list[np.ndarray] = []
         single_window_truth: list[np.ndarray] = []
         loss_ema: float | None = None
-        best_loss: float | None = None
+        best_loss: float | None = resumed_best_loss
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
         last_grad_norm: float | None = None
         last_grad_was_clipped: bool | None = None
         last_optimizer_lr = optimizer.param_groups[0]["lr"]
-        progress = tqdm(range(cfg.NUM_STEPS), unit="step")
+        progress = tqdm(
+            range(start_step, cfg.NUM_STEPS),
+            initial=start_step,
+            total=cfg.NUM_STEPS,
+            unit="step",
+        )
         for step in progress:
             # TensorBoard's Step axis is the historical per-graph training
             # coordinate, not the optimizer/update index.
@@ -490,11 +557,24 @@ def main() -> None:
                         optimizer,
                         lr_scheduler,
                         avg_loss,
+                        best_loss=best_loss,
                     )
                     progress.write(
                         f"step {step + 1}: new best avg loss {avg_loss:.4g} "
                         f"-> {checkpoint_path}"
                     )
+                # Always refresh latest.ckpt so a resume can skip the dry spell
+                # since the last best rather than replaying it.
+                save_checkpoint(
+                    run_dir / "latest.ckpt",
+                    step,
+                    graphs_seen,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    avg_loss,
+                    best_loss=best_loss,
+                )
 
             if (
                 checkpoint_every_steps is not None
