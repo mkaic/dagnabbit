@@ -154,6 +154,7 @@ def main() -> None:
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
         compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
+        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,

@@ -311,6 +311,7 @@ def main() -> None:
         reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
         compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
         compute_aggregate_decode_pass=cfg.COMPUTE_AGGREGATE_DECODE_PASS,
+        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,

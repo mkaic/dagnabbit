@@ -46,7 +46,7 @@ COMPUTE_AGGREGATE_DECODE_PASS = False
 NUM_STEPS = 10_000_000
 GRAPH_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 
 OPTIMIZER_CLASS = torch.optim.Adam
 OPTIMIZER_KWARGS = {
@@ -92,6 +92,13 @@ W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 # kept as the gradient highway / fast learner; this is the auxiliary that closes
 # the train/blind-decode gap. Lower it if early training is unstable.
 W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
+
+# Scale each node's classification cross-entropy by ``1 / count_of_that_type``
+# within its graph, so every node type present contributes equally to the
+# graph's summed classification loss regardless of how many nodes share that
+# type. Applies to all classification streams (autoregressive, teacher-forced,
+# single-sample). Set False for plain per-node cross-entropy.
+CLASS_BALANCED_CLASSIFICATION_LOSSES = False
 
 # --- teacher-forced decode pass loss weights ---
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0

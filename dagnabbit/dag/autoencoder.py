@@ -364,6 +364,7 @@ class DagnabbitAutoEncoder(nn.Module):
         reconstruction_detach_target: bool = True,
         compute_reconstruction_loss: bool = False,
         compute_aggregate_decode_pass: bool = True,
+        class_balanced_classification_losses: bool = False,
         transformer_num_layers: int = 1,
         transformer_mlp_depth: int = 1,
         transformer_num_register_tokens: int = 2,
@@ -388,6 +389,9 @@ class DagnabbitAutoEncoder(nn.Module):
         self.reconstruction_detach_target = reconstruction_detach_target
         self.compute_reconstruction_loss = compute_reconstruction_loss
         self.compute_aggregate_decode_pass = compute_aggregate_decode_pass
+        self.class_balanced_classification_losses = (
+            class_balanced_classification_losses
+        )
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.transformer_num_layers = transformer_num_layers
         self.transformer_mlp_depth = transformer_mlp_depth
@@ -441,6 +445,19 @@ class DagnabbitAutoEncoder(nn.Module):
             self.node_embedding_dim,
             self.num_node_types,
         )
+
+    def _class_balance_weights(self, labels: Tensor) -> Tensor:
+        """Per-node weights of ``1 / count_of_that_type`` within each graph.
+
+        ``labels`` is ``[B, N]`` of node-type ids. Scaling each node's
+        classification loss by this weight makes every type present in a graph
+        contribute equally to that graph's summed loss, regardless of how many
+        nodes of that type appear.
+        """
+        one_hot = F.one_hot(labels, num_classes=self.num_node_types)
+        counts = one_hot.sum(dim=1)  # [B, num_node_types]
+        per_node_counts = counts.gather(1, labels)  # [B, N]
+        return 1.0 / per_node_counts.to(torch.float32)
 
     def evaluate_graph_batch(
         self,
@@ -666,6 +683,15 @@ class DagnabbitAutoEncoder(nn.Module):
             dim=0,
         ).to(device=device, non_blocking=True)
 
+        # Optional inverse-frequency class-balance weights, shared by all decode
+        # streams (same graph, same node types). ``None`` means plain per-node
+        # cross-entropy.
+        primary_weights = (
+            self._class_balance_weights(primary_labels)
+            if self.class_balanced_classification_losses
+            else None
+        )
+
         # Two decode passes over the same shared encode pass. The
         # autoregressive pass compounds predictions down each DAG; the
         # teacher-forced pass decodes each node from its true encode-side
@@ -674,6 +700,7 @@ class DagnabbitAutoEncoder(nn.Module):
             primary_graphs=primary_graphs,
             primary_buffer=primary_buffer,
             primary_labels=primary_labels,
+            primary_weights=primary_weights,
             rank_batches=rank_batches,
             device=device,
         )
@@ -713,6 +740,7 @@ class DagnabbitAutoEncoder(nn.Module):
         primary_graphs: Sequence[FixedInDegreeDAGDescription],
         primary_buffer: Tensor,
         primary_labels: Tensor,
+        primary_weights: Tensor | None,
         rank_batches: Sequence[_BatchedRank],
         device: torch.device,
     ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult", "_SingleSampleResult"]:
@@ -812,6 +840,7 @@ class DagnabbitAutoEncoder(nn.Module):
             single_sample_emb=single_primary_emb,
             single_sample_key=single_primary_key,
             labels=primary_labels,
+            class_weights=primary_weights,
             leaf_embeddings_by_graph=leaf_embeddings_by_graph,
             process_roots=True,
             rank_batches=rank_batches,
@@ -852,6 +881,7 @@ class DagnabbitAutoEncoder(nn.Module):
         single_sample_emb: Tensor,
         single_sample_key: Tensor,
         labels: Tensor,
+        class_weights: Tensor | None,
         leaf_embeddings_by_graph: Tensor,
         process_roots: bool,
         rank_batches: Sequence[_BatchedRank],
@@ -994,6 +1024,11 @@ class DagnabbitAutoEncoder(nn.Module):
                 rank_labels.repeat(num_streams),
                 reduction="none",
             )
+            if class_weights is not None:
+                rank_weights = class_weights[rows, nodes]
+                cross_entropy_all = cross_entropy_all * rank_weights.repeat(
+                    num_streams
+                ).to(cross_entropy_all.dtype)
             class_chunks = cross_entropy_all.chunk(num_streams)
             if compute_ar:
                 ar_class[rows, nodes] = class_chunks[0].to(ar_class.dtype)
