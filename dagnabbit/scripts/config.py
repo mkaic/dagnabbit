@@ -98,7 +98,7 @@ W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
 # graph's summed classification loss regardless of how many nodes share that
 # type. Applies to all classification streams (autoregressive, teacher-forced,
 # single-sample). Set False for plain per-node cross-entropy.
-CLASS_BALANCED_CLASSIFICATION_LOSSES = False
+CLASS_BALANCED_CLASSIFICATION_LOSSES = True
 
 # --- teacher-forced decode pass loss weights ---
 W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
