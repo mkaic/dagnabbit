@@ -459,18 +459,26 @@ class DagnabbitAutoEncoder(nn.Module):
           * group (b): trunk classes (``label < num_trunk_node_types``);
           * group (a): roots + the single output class (everything else).
 
-        Each node is weighted by ``1 / (nodes in its group)`` within its graph,
-        so the two groups contribute equally to the graph's summed classification
-        loss regardless of how many nodes fall in each.
+        The two groups are weighted equally -- each group's weights sum to the
+        same mass -- but the weights are normalized to average 1 across the
+        graph's nodes (they sum to the node count ``N``), so the overall
+        classification-loss magnitude matches plain unweighted cross-entropy.
+        Concretely each node gets ``(N / active_groups) / (nodes in its group)``,
+        which keeps the flag a pure reweighting rather than a rescaling.
         """
+        num_nodes = labels.shape[1]
         is_trunk = labels < self.num_trunk_node_types
-        trunk_counts = (
-            is_trunk.sum(dim=1, keepdim=True).to(torch.float32).clamp(min=1.0)
-        )
-        other_counts = (
-            (~is_trunk).sum(dim=1, keepdim=True).to(torch.float32).clamp(min=1.0)
-        )
-        return torch.where(is_trunk, 1.0 / trunk_counts, 1.0 / other_counts)
+        trunk_counts = is_trunk.sum(dim=1, keepdim=True).to(torch.float32)
+        other_counts = (~is_trunk).sum(dim=1, keepdim=True).to(torch.float32)
+        # Number of non-empty groups per graph (1 or 2); guards the group-mass
+        # split when a graph happens to contain only one of the two groups.
+        active_groups = (trunk_counts > 0).to(torch.float32) + (
+            other_counts > 0
+        ).to(torch.float32)
+        # Each node's own group size; always >= 1 for real nodes since a node is
+        # counted in its own group.
+        group_counts = torch.where(is_trunk, trunk_counts, other_counts)
+        return (num_nodes / active_groups) / group_counts
 
     def evaluate_graph_batch(
         self,

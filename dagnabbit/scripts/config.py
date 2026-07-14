@@ -94,10 +94,12 @@ W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
 
 # Balance the classification cross-entropy between two node groups so they
-# contribute equally to each graph's summed loss: (a) roots + the single output
-# class, and (b) trunk classes. Each node is scaled by 1 / (nodes in its group)
-# within its graph. Applies to all classification streams (autoregressive,
-# teacher-forced, single-sample). Set False for plain per-node cross-entropy.
+# contribute equally to each graph's loss: (a) roots + the single output class,
+# and (b) trunk classes. Weights are normalized to average 1 across each graph's
+# nodes, so this is a pure reweighting that preserves the overall loss magnitude
+# (it does not shrink the classification term relative to the other losses).
+# Applies to all classification streams (autoregressive, teacher-forced,
+# single-sample). Set False for plain per-node cross-entropy.
 CLASS_BALANCED_CLASSIFICATION_LOSSES = True
 
 # --- teacher-forced decode pass loss weights ---
