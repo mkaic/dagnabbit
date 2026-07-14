@@ -384,7 +384,10 @@ class DagnabbitAutoEncoder(nn.Module):
         self.num_root_nodes = num_root_nodes
         self.num_output_nodes = num_output_nodes
         self.trunk_node_in_degrees = trunk_node_type_in_degrees
-        self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
+        # All output nodes share one output class (they are identifiable by their
+        # fixed slot positions), so outputs contribute a single type index rather
+        # than one per output slot.
+        self.num_node_types = num_trunk_node_types + num_root_nodes + 1
         self.mlp_expansion_factor = mlp_expansion_factor
         self.reconstruction_detach_target = reconstruction_detach_target
         self.compute_reconstruction_loss = compute_reconstruction_loss
@@ -447,17 +450,27 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
     def _class_balance_weights(self, labels: Tensor) -> Tensor:
-        """Per-node weights of ``1 / count_of_that_type`` within each graph.
+        """Per-node weights balancing two class groups equally within each graph.
 
-        ``labels`` is ``[B, N]`` of node-type ids. Scaling each node's
-        classification loss by this weight makes every type present in a graph
-        contribute equally to that graph's summed loss, regardless of how many
-        nodes of that type appear.
+        ``labels`` is ``[B, N]`` of node-type ids. Nodes are split into two
+        groups by supertype, using the type-index layout
+        ``[trunk types | root types | single output type]``:
+
+          * group (b): trunk classes (``label < num_trunk_node_types``);
+          * group (a): roots + the single output class (everything else).
+
+        Each node is weighted by ``1 / (nodes in its group)`` within its graph,
+        so the two groups contribute equally to the graph's summed classification
+        loss regardless of how many nodes fall in each.
         """
-        one_hot = F.one_hot(labels, num_classes=self.num_node_types)
-        counts = one_hot.sum(dim=1)  # [B, num_node_types]
-        per_node_counts = counts.gather(1, labels)  # [B, N]
-        return 1.0 / per_node_counts.to(torch.float32)
+        is_trunk = labels < self.num_trunk_node_types
+        trunk_counts = (
+            is_trunk.sum(dim=1, keepdim=True).to(torch.float32).clamp(min=1.0)
+        )
+        other_counts = (
+            (~is_trunk).sum(dim=1, keepdim=True).to(torch.float32).clamp(min=1.0)
+        )
+        return torch.where(is_trunk, 1.0 / trunk_counts, 1.0 / other_counts)
 
     def evaluate_graph_batch(
         self,
@@ -1246,7 +1259,9 @@ class DagnabbitAutoEncoder(nn.Module):
                 _DecodeNode(
                     id=node_id,
                     embedding=output_embeddings[output_slot].detach().clone(),
-                    type_id=output_start + output_slot,
+                    # All outputs share the single output type; slot identity is
+                    # carried by the fixed pool ordering, not the type index.
+                    type_id=output_start,
                     is_root=False,
                     is_output=True,
                     parents=[None],
@@ -1490,7 +1505,6 @@ class DagnabbitAutoEncoder(nn.Module):
             type_id,
             num_trunk_node_types=self.num_trunk_node_types,
             num_root_nodes=self.num_root_nodes,
-            num_output_nodes=self.num_output_nodes,
         )
 
         if supertype is NodeSupertype.ROOT:
@@ -1563,14 +1577,15 @@ class DagnabbitAutoEncoder(nn.Module):
             node_inputs_indices.append(parents)
             node_types.append(node.type_id)
 
-        for output_slot, old_id in enumerate(output_ids):
+        for old_id in output_ids:
             final_index[old_id] = len(node_types)
             node = pool[old_id]
             parents = self._require_live_parents(node, final_index)
             if len(parents) != 1:
                 raise ValueError(f"output node {old_id} has {len(parents)} parents")
             node_inputs_indices.append(parents)
-            node_types.append(output_start + output_slot)
+            # All outputs share the single output class.
+            node_types.append(output_start)
 
         description = FixedInDegreeDAGDescription(
             num_root_nodes=self.num_root_nodes,

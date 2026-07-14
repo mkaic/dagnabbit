@@ -93,11 +93,11 @@ W_PRIMARY_DECODED_CLASSIFICATION = 1.0
 # the train/blind-decode gap. Lower it if early training is unstable.
 W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
 
-# Scale each node's classification cross-entropy by ``1 / count_of_that_type``
-# within its graph, so every node type present contributes equally to the
-# graph's summed classification loss regardless of how many nodes share that
-# type. Applies to all classification streams (autoregressive, teacher-forced,
-# single-sample). Set False for plain per-node cross-entropy.
+# Balance the classification cross-entropy between two node groups so they
+# contribute equally to each graph's summed loss: (a) roots + the single output
+# class, and (b) trunk classes. Each node is scaled by 1 / (nodes in its group)
+# within its graph. Applies to all classification streams (autoregressive,
+# teacher-forced, single-sample). Set False for plain per-node cross-entropy.
 CLASS_BALANCED_CLASSIFICATION_LOSSES = True
 
 # --- teacher-forced decode pass loss weights ---

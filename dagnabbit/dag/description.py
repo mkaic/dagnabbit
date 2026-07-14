@@ -17,35 +17,32 @@ def subtype_to_supertype(
     node_type: int,
     num_trunk_node_types: int | None = None,
     num_root_nodes: int | None = None,
-    num_output_nodes: int | None = None,
 ) -> NodeSupertype:
     """Map a raw ``node_type`` subtype index to its :class:`NodeSupertype`.
 
     Uses the unified type-index layout:
         [0, num_trunk_node_types)                        -> TRUNK
         [root_node_types_start, output_node_types_start) -> ROOT
-        [output_node_types_start, num_node_types)        -> OUTPUT
+        [output_node_types_start]                        -> OUTPUT (single class)
+
+    All output nodes share one output class -- individual outputs are already
+    identifiable by their fixed slot positions, so the classifier does not
+    distinguish between them.
 
     Any layout argument left as ``None`` falls back to the corresponding value
     in ``dagnabbit.scripts.config``, so training callsites can omit them.
     """
-    if (
-        num_trunk_node_types is None
-        or num_root_nodes is None
-        or num_output_nodes is None
-    ):
+    if num_trunk_node_types is None or num_root_nodes is None:
         from dagnabbit.scripts import config as cfg
 
         if num_trunk_node_types is None:
             num_trunk_node_types = cfg.NUM_TRUNK_NODE_TYPES
         if num_root_nodes is None:
             num_root_nodes = cfg.NUM_ROOT_NODES
-        if num_output_nodes is None:
-            num_output_nodes = cfg.NUM_OUTPUT_NODES
 
     root_node_types_start = num_trunk_node_types
     output_node_types_start = num_trunk_node_types + num_root_nodes
-    num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
+    num_node_types = num_trunk_node_types + num_root_nodes + 1
 
     if node_type < root_node_types_start:
         return NodeSupertype.TRUNK
@@ -120,14 +117,15 @@ class FixedInDegreeDAGDescription:
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
 
-        # Each root and output gets its own unique type index, laid out in a
-        # single type-index space immediately after the trunk types:
-        #   [0, num_trunk_node_types)                                    -> trunk types
-        #   [root_node_types_start, output_node_types_start)             -> one type per root slot
-        #   [output_node_types_start, num_node_types)                    -> one type per output slot
+        # Type-index layout in a single space immediately after the trunk types.
+        # Each root gets its own unique type; all output nodes share one class,
+        # since individual outputs are identifiable by their fixed slot positions:
+        #   [0, num_trunk_node_types)                        -> trunk types
+        #   [root_node_types_start, output_node_types_start) -> one type per root slot
+        #   [output_node_types_start]                        -> single shared output type
         self.root_node_types_start = num_trunk_node_types
         self.output_node_types_start = num_trunk_node_types + num_root_nodes
-        self.num_node_types = num_trunk_node_types + num_root_nodes + num_output_nodes
+        self.num_node_types = num_trunk_node_types + num_root_nodes + 1
 
         assert len(self.node_types) == self.num_nodes
 
@@ -145,7 +143,7 @@ class FixedInDegreeDAGDescription:
         for i in range(num_output_nodes):
             node_idx = num_root_nodes + num_trunk_nodes + i
             assert len(self.node_inputs_indices[node_idx]) == 1
-            assert self.node_types[node_idx] == self.output_node_types_start + i
+            assert self.node_types[node_idx] == self.output_node_types_start
 
         self.leaf_node_indices = self.identify_leaf_nodes()
         self.leaf_node_indices_tensor = torch.tensor(
@@ -422,8 +420,8 @@ def make_random_graph_description(
         in_degrees[node_idx] = trunk_node_in_degrees[trunk_type]
     for output_offset in range(num_output_nodes):
         node_idx = output_start + output_offset
-        # output_node_types_start (== num_trunk_node_types + num_root_nodes) + slot.
-        node_types[node_idx] = num_trunk_node_types + num_root_nodes + output_offset
+        # All outputs share the single output type (output_node_types_start).
+        node_types[node_idx] = num_trunk_node_types + num_root_nodes
         in_degrees[node_idx] = 1
 
     # Input slots per node; ``None`` marks an unfilled slot. Roots have none.
@@ -512,12 +510,12 @@ def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:
         memo[key] = key
         return key
 
+    output_start = graph.num_root_nodes + graph.num_trunk_nodes
     for node_idx, node_type in enumerate(graph.node_types):
         supertype = subtype_to_supertype(
             node_type,
             num_trunk_node_types=graph.num_trunk_node_types,
             num_root_nodes=graph.num_root_nodes,
-            num_output_nodes=graph.num_output_nodes,
         )
         if supertype is NodeSupertype.ROOT:
             root_slot = node_type - graph.root_node_types_start
@@ -528,7 +526,8 @@ def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:
             )
             canonical_ids.append(intern(("trunk", node_type, parent_ids)))
         else:
-            output_slot = node_type - graph.output_node_types_start
+            # Outputs share one type; slot identity comes from fixed position.
+            output_slot = node_idx - output_start
             parent_ids = tuple(
                 canonical_ids[p] for p in graph.node_inputs_indices[node_idx]
             )
