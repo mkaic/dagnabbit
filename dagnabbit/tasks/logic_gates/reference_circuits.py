@@ -212,11 +212,99 @@ def build_nand_ripple_carry_adder(
     annotations.core_gates = len(circuit.parents)
     output_sources = [sum_bits[(width - 1) - slot] for slot in range(num_output_nodes)]
 
-    # --- pad to the trunk budget with transparent buffers ---
+    graph, final_index = _pad_and_emit(
+        circuit=circuit,
+        annotations=annotations,
+        output_sources=output_sources,
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        num_trunk_node_types=num_trunk_node_types,
+    )
+    for bit, gate_id in sum_bits.items():
+        annotations.sum_node_of_bit[bit] = final_index[gate_id]
+    for bit, gate_id in carry_bits.items():
+        annotations.carry_node_of_bit[bit] = final_index[gate_id]
+    return graph, annotations
+
+
+def build_nand_bitwise_xor(
+    num_root_nodes: int = 16,
+    num_trunk_nodes: int = 128,
+    num_output_nodes: int = 8,
+    num_trunk_node_types: int = 2,
+) -> tuple[FixedInDegreeDAGDescription, AdderAnnotations]:
+    """Bitwise ``a XOR b``: the same inputs and outputs, no long-range structure.
+
+    Deliberately the adder's opposite. Output j depends on exactly two input
+    bits through four NAND gates, so nothing has to travel and there is no
+    carry chain -- the whole circuit is three ranks deep before padding.
+
+    It exists as a contrast for the round-trip probe. If a checkpoint can
+    round-trip this but not the adder, the failure is specifically about
+    long-range dependencies; if it can round-trip neither, the problem is
+    structured circuits in general.
+    """
+    if num_root_nodes % 2 != 0:
+        raise ValueError("bitwise XOR needs an even number of input bits")
+    width = num_root_nodes // 2
+    if num_output_nodes != width:
+        raise ValueError(
+            f"{num_root_nodes} inputs implies {width} output bits, but "
+            f"{num_output_nodes} were requested"
+        )
+
+    circuit = _SymbolicCircuit(num_root_nodes)
+    annotations = AdderAnnotations()
+    xor_bits: dict[int, int] = {}
+
+    for bit in range(width):
+        a = (width - 1) - bit
+        b = (num_root_nodes - 1) - bit
+        annotations.root_of_input[("a", bit)] = a
+        annotations.root_of_input[("b", bit)] = b
+        n1 = circuit.gate(a, b, "¬(a∧b)", bit)
+        xor_bits[bit] = circuit.gate(
+            circuit.gate(a, n1, "a·¬(a∧b)", bit),
+            circuit.gate(b, n1, "b·¬(a∧b)", bit),
+            "a⊕b",
+            bit,
+        )
+
+    annotations.core_gates = len(circuit.parents)
+    output_sources = [xor_bits[(width - 1) - slot] for slot in range(num_output_nodes)]
+    graph, final_index = _pad_and_emit(
+        circuit=circuit,
+        annotations=annotations,
+        output_sources=output_sources,
+        num_root_nodes=num_root_nodes,
+        num_trunk_nodes=num_trunk_nodes,
+        num_output_nodes=num_output_nodes,
+        num_trunk_node_types=num_trunk_node_types,
+    )
+    for bit, gate_id in xor_bits.items():
+        annotations.sum_node_of_bit[bit] = final_index[gate_id]
+    return graph, annotations
+
+
+def _pad_and_emit(
+    circuit: _SymbolicCircuit,
+    annotations: AdderAnnotations,
+    output_sources: list[int],
+    num_root_nodes: int,
+    num_trunk_nodes: int,
+    num_output_nodes: int,
+    num_trunk_node_types: int,
+) -> tuple[FixedInDegreeDAGDescription, dict[int, int]]:
+    """Pad a core circuit to the trunk budget with buffers, then emit it.
+
+    Returns the description and the symbolic-id -> final-index map, which the
+    caller needs to translate its own annotations.
+    """
     spare = num_trunk_nodes - annotations.core_gates
     if spare < 0:
         raise ValueError(
-            f"the adder needs {annotations.core_gates} gates but only "
+            f"the circuit needs {annotations.core_gates} gates but only "
             f"{num_trunk_nodes} trunk nodes are available"
         )
     if spare == 1:
@@ -256,7 +344,6 @@ def build_nand_ripple_carry_adder(
 
     annotations.buffer_gates = len(circuit.parents) - annotations.core_gates
 
-    # --- emit in topological order ---
     order = circuit.topological_order()
     if len(order) != num_trunk_nodes:
         raise AssertionError(
@@ -281,15 +368,11 @@ def build_nand_ripple_carry_adder(
             annotations.buffer_nodes.add(index)
 
     output_type = num_trunk_node_types + num_root_nodes
+    width = num_output_nodes
     for slot, source in enumerate(output_sources):
         node_inputs_indices.append([resolve(source)])
         node_types.append(output_type)
         annotations.output_of_bit[(width - 1) - slot] = len(node_inputs_indices) - 1
-
-    for bit, gate_id in sum_bits.items():
-        annotations.sum_node_of_bit[bit] = final_index[gate_id]
-    for bit, gate_id in carry_bits.items():
-        annotations.carry_node_of_bit[bit] = final_index[gate_id]
 
     graph = FixedInDegreeDAGDescription(
         num_root_nodes=num_root_nodes,
@@ -300,7 +383,7 @@ def build_nand_ripple_carry_adder(
         node_inputs_indices=node_inputs_indices,
         node_types=node_types,
     )
-    return graph, annotations
+    return graph, final_index
 
 
 def nand_ripple_carry_adder(

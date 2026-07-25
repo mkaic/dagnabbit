@@ -22,6 +22,7 @@ from dagnabbit.scripts.logging_utils import (
     step_pointer_stats,
     step_preds_and_truth,
 )
+from dagnabbit.tasks.logic_gates.roundtrip_probe import roundtrip_metrics
 
 
 def combine_losses(
@@ -523,6 +524,16 @@ def main() -> None:
                     avg_loss,
                     best_loss=best_loss,
                 )
+
+            # Diagnostic only: never enters the loss. The probe restores the
+            # model's mode and the RNG state, so it cannot perturb training.
+            if (
+                writer is not None
+                and cfg.ROUNDTRIP_PROBE_EVERY
+                and (step + 1) % cfg.ROUNDTRIP_PROBE_EVERY == 0
+            ):
+                for name, value in roundtrip_metrics(model, device).items():
+                    writer.add_scalar(name, value, tensorboard_step)
 
             if (
                 checkpoint_every_steps is not None

@@ -20,12 +20,12 @@ MLP_EXPANSION_FACTOR = 4.0
 # Set COMPRESSOR_NUM_LAYERS to None (or 0) to drop the Compressor entirely and
 # feed the encoder's own output-node embeddings straight into the Decoder as
 # the latent.
-COMPRESSOR_NUM_LAYERS = 6
+COMPRESSOR_NUM_LAYERS = None
 DECODER_NUM_LAYERS = 6
 # Layer count for the recursive structural encoder's shared per-node
 # transformer. The remaining block geometry (64-wide attention heads, MLP
 # depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
-ENCODER_NUM_LAYERS = 2
+ENCODER_NUM_LAYERS = 6
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,
@@ -78,6 +78,13 @@ GRADIENT_CLIP_MAX_NORM = 4.0
 
 LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
 CHECK_BEST_EVERY = 1000
+# Steps between encode->decode probes of the known-good reference circuits
+# (dagnabbit/tasks/logic_gates/roundtrip_probe.py). Purely diagnostic: the
+# result is logged and never enters the loss, and the probe restores both the
+# model's train/eval mode and the RNG state so it cannot perturb training.
+# Costs one batch-of-one forward pass plus a truth-table evaluation. Set to
+# None to disable.
+ROUNDTRIP_PROBE_EVERY = 1000
 # Save an immutable training snapshot after this many completed graphs. The
 # interval must land on both a graph-batch and optimizer-update boundary so a
 # checkpoint represents a complete training state. Set to None to disable.

@@ -7,7 +7,6 @@ subtly wrong: bit order, root/output slot mapping, padding contamination,
 cross-graph leakage in the batch, and popcount.
 """
 
-
 import numpy as np
 import pytest
 import torch
