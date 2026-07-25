@@ -276,7 +276,8 @@ def main() -> None:
     )
     w(
         f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  layers "
-        f"{cfg.ENCODER_NUM_LAYERS}  heads {model.num_attention_heads}"
+        f"{cfg.ENCODER_NUM_LAYERS}  heads "
+        f"{model.node_encoder.sequence_transformer.num_heads}"
     )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")

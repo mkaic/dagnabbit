@@ -12,13 +12,19 @@ from dagnabbit.dag.description import (
     PreparedRankBatch,
 )
 
-# Fixed transformer geometry shared by all three transformer stacks (encoder,
-# compressor, decoder). Head count is derived from the embedding dim so every
-# attention head is always the standard 64-wide.
-ATTENTION_HEAD_DIM = 64
-TRANSFORMER_MLP_DEPTH = 1
-TRANSFORMER_NUM_REGISTER_TOKENS = 2
-TRANSFORMER_DROPOUT = 0.0
+# Fixed geometry of the recursive encoder's per-node transformer. Head count
+# is derived from the embedding dim so every attention head is the standard
+# 64-wide.
+ENCODER_ATTENTION_HEAD_DIM = 64
+ENCODER_MLP_DEPTH = 1
+ENCODER_NUM_REGISTER_TOKENS = 2
+ENCODER_DROPOUT = 0.0
+
+# Fixed geometry of the sequence-space compressor/decoder blocks, independent
+# of the encoder's.
+SEQUENCE_ATTENTION_HEAD_DIM = 64
+SEQUENCE_MLP_DEPTH = 1
+SEQUENCE_DROPOUT = 0.0
 
 
 def _feed_forward_layers(
@@ -96,33 +102,30 @@ class TypeConditionedSequenceTransformer(nn.Module):
         num_node_types: int,
         max_context_length: int,
         num_layers: int,
-        num_register_tokens: int,
-        num_heads: int,
-        transformer_mlp_depth: int,
         mlp_expansion_factor: float,
-        dropout: float = 0.0,
     ):
         super().__init__()
         if max_context_length <= 0:
             raise ValueError("max_context_length must be positive")
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
-        if num_register_tokens < 0:
-            raise ValueError("num_register_tokens must be non-negative")
-        if transformer_mlp_depth < 0:
-            raise ValueError("transformer_mlp_depth must be non-negative")
-        if node_embedding_dim % num_heads != 0:
-            raise ValueError("node_embedding_dim must be divisible by num_heads")
+        if node_embedding_dim % ENCODER_ATTENTION_HEAD_DIM != 0:
+            raise ValueError(
+                "node_embedding_dim must be a multiple of the fixed "
+                f"{ENCODER_ATTENTION_HEAD_DIM}-wide encoder head dim; got "
+                f"{node_embedding_dim}"
+            )
+        num_heads = node_embedding_dim // ENCODER_ATTENTION_HEAD_DIM
 
         self.node_embedding_dim = node_embedding_dim
         self.max_context_length = max_context_length
-        self.num_register_tokens = num_register_tokens
-        self.transformer_mlp_depth = transformer_mlp_depth
+        self.num_heads = num_heads
+        self.num_register_tokens = ENCODER_NUM_REGISTER_TOKENS
         self.position_embeddings = nn.Parameter(
             torch.empty(max_context_length, node_embedding_dim)
         )
         self.register_tokens = nn.Parameter(
-            torch.empty(num_register_tokens, node_embedding_dim)
+            torch.empty(ENCODER_NUM_REGISTER_TOKENS, node_embedding_dim)
         )
         self.node_type_embeddings = nn.Embedding(num_node_types, node_embedding_dim)
         self.blocks = nn.ModuleList(
@@ -130,9 +133,9 @@ class TypeConditionedSequenceTransformer(nn.Module):
                 TransformerBlock(
                     node_embedding_dim=node_embedding_dim,
                     num_heads=num_heads,
-                    transformer_mlp_depth=transformer_mlp_depth,
+                    transformer_mlp_depth=ENCODER_MLP_DEPTH,
                     mlp_expansion_factor=mlp_expansion_factor,
-                    dropout=dropout,
+                    dropout=ENCODER_DROPOUT,
                 )
                 for _ in range(num_layers)
             ]
@@ -242,22 +245,27 @@ class SequenceTransformer(nn.Module):
         self,
         node_embedding_dim: int,
         num_layers: int,
-        num_heads: int,
-        transformer_mlp_depth: int,
         mlp_expansion_factor: float,
-        dropout: float = 0.0,
     ):
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
+        if node_embedding_dim % SEQUENCE_ATTENTION_HEAD_DIM != 0:
+            raise ValueError(
+                "node_embedding_dim must be a multiple of the fixed "
+                f"{SEQUENCE_ATTENTION_HEAD_DIM}-wide sequence head dim; got "
+                f"{node_embedding_dim}"
+            )
+        num_heads = node_embedding_dim // SEQUENCE_ATTENTION_HEAD_DIM
+        self.num_heads = num_heads
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     node_embedding_dim=node_embedding_dim,
                     num_heads=num_heads,
-                    transformer_mlp_depth=transformer_mlp_depth,
+                    transformer_mlp_depth=SEQUENCE_MLP_DEPTH,
                     mlp_expansion_factor=mlp_expansion_factor,
-                    dropout=dropout,
+                    dropout=SEQUENCE_DROPOUT,
                 )
                 for _ in range(num_layers)
             ]
@@ -327,14 +335,6 @@ class DagnabbitAutoEncoder(nn.Module):
     ):
         super().__init__()
 
-        if node_embedding_dim % ATTENTION_HEAD_DIM != 0:
-            raise ValueError(
-                "node_embedding_dim must be a multiple of the fixed "
-                f"{ATTENTION_HEAD_DIM}-wide attention head dim; got "
-                f"{node_embedding_dim}"
-            )
-        num_attention_heads = node_embedding_dim // ATTENTION_HEAD_DIM
-
         if isinstance(trunk_node_type_in_degrees, int):
             trunk_node_type_in_degrees = [
                 trunk_node_type_in_degrees
@@ -359,7 +359,6 @@ class DagnabbitAutoEncoder(nn.Module):
         self.mlp_expansion_factor = mlp_expansion_factor
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.encoder_num_layers = encoder_num_layers
-        self.num_attention_heads = num_attention_heads
         self.compressor_num_layers = compressor_num_layers
         self.decoder_num_layers = decoder_num_layers
 
@@ -367,18 +366,14 @@ class DagnabbitAutoEncoder(nn.Module):
         # The public context is the ordered parent-slot sequence padded to
         # maximum_indegree; the transformer appends its own registers and one
         # node-type token internally, so all trunk and output types share
-        # weights.
+        # weights. Block geometry is hardcoded in the transformer class.
         self.node_encoder = TransformerNodeEncoder(
             TypeConditionedSequenceTransformer(
                 node_embedding_dim=node_embedding_dim,
                 num_node_types=self.num_node_types,
                 max_context_length=self.maximum_indegree,
                 num_layers=encoder_num_layers,
-                num_register_tokens=TRANSFORMER_NUM_REGISTER_TOKENS,
-                num_heads=num_attention_heads,
-                transformer_mlp_depth=TRANSFORMER_MLP_DEPTH,
                 mlp_expansion_factor=mlp_expansion_factor,
-                dropout=TRANSFORMER_DROPOUT,
             )
         )
 
@@ -389,22 +384,17 @@ class DagnabbitAutoEncoder(nn.Module):
 
         # ---- Sequence-space compressor and decoder ----
         # Both are dense bidirectional transformers over the fixed-length
-        # canonical sequence; they share block geometry with the encoder but
-        # have their own weights and layer counts.
-        sequence_block_kwargs = dict(
-            node_embedding_dim=node_embedding_dim,
-            num_heads=num_attention_heads,
-            transformer_mlp_depth=TRANSFORMER_MLP_DEPTH,
-            mlp_expansion_factor=mlp_expansion_factor,
-            dropout=TRANSFORMER_DROPOUT,
-        )
+        # canonical sequence, with their own weights, layer counts, and
+        # hardcoded block geometry (independent of the encoder's).
         self.compressor = SequenceTransformer(
+            node_embedding_dim=node_embedding_dim,
             num_layers=compressor_num_layers,
-            **sequence_block_kwargs,
+            mlp_expansion_factor=mlp_expansion_factor,
         )
         self.decoder = SequenceTransformer(
+            node_embedding_dim=node_embedding_dim,
             num_layers=decoder_num_layers,
-            **sequence_block_kwargs,
+            mlp_expansion_factor=mlp_expansion_factor,
         )
         # Shared learned placeholder for all masked (non-output) decoder input
         # positions; position identity comes from the additive posenc.
