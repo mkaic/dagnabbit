@@ -123,9 +123,14 @@ def make_graph(
 
 
 def random_graph(seed: int, num_trunk_nodes: int = 32) -> FixedInDegreeDAGDescription:
-    """A reproducible random graph. The generator draws from the stdlib RNG."""
-    state = random.getstate()
-    random.seed(seed)
+    """A reproducible random graph.
+
+    make_random_graph_description seeds its own random.Random from
+    torch.randint, so torch is the channel that controls it -- random.seed()
+    would have no effect.
+    """
+    state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
     try:
         return make_random_graph_description(
             num_root_nodes=4,
@@ -135,7 +140,7 @@ def random_graph(seed: int, num_trunk_nodes: int = 32) -> FixedInDegreeDAGDescri
             num_trunk_node_types=NUM_TRUNK_NODE_TYPES,
         )
     finally:
-        random.setstate(state)
+        torch.random.set_rng_state(state)
 
 
 # --------------------------------------------------------------------------
