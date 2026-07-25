@@ -1,3 +1,4 @@
+import heapq
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -156,6 +157,20 @@ class FixedInDegreeDAGDescription:
         self.node_ranks = self.compute_node_ranks()
         self.rank_groups = self.build_rank_groups()
         self.rank_batches = self.build_rank_batches()
+
+        # Canonical sequence overlay: structure-derived topological order with
+        # roots pinned first and outputs pinned last, plus padded per-position
+        # parent tensors consumed by the sequence compressor/decoder.
+        self.canonical_order = self.compute_canonical_order()
+        self.canonical_positions = [0] * self.num_nodes
+        for position, node_idx in enumerate(self.canonical_order):
+            self.canonical_positions[node_idx] = position
+        (
+            self.canonical_order_tensor,
+            self.canonical_node_types,
+            self.canonical_parent_positions,
+            self.canonical_parent_slot_mask,
+        ) = self.build_canonical_tensors()
 
     def identify_leaf_nodes(self) -> list[int]:
         """
@@ -329,6 +344,99 @@ class FixedInDegreeDAGDescription:
             )
 
         return rank_batches
+
+    def compute_canonical_order(self) -> list[int]:
+        """Structure-canonical topological order of the graph's nodes.
+
+        Position layout: the ``num_root_nodes`` roots occupy positions
+        ``0..R-1`` in root-slot order, the ``num_output_nodes`` outputs occupy
+        the final positions in output-slot order, and trunk nodes fill the
+        middle. Trunk order comes from Kahn's algorithm with a deterministic
+        tie-break: among ready nodes, emit the one with the lexicographically
+        smallest key ``(parent canonical positions in slot order, node_type)``.
+        Parent positions are compared in slot order -- not sorted -- because
+        input-slot order is semantically meaningful.
+
+        The key depends only on graph structure, so isomorphic graphs produce
+        identical canonical sequences, with one residual ambiguity: exact
+        structural twins (same type, same parents in the same slots) compare
+        equal and fall back to original node index. Twins are interchangeable
+        as producers, but a consumer referencing both twins in different slots
+        can see its parent-position tuple swap under relabeling; this is
+        accepted rather than paying for full graph canonization.
+        """
+        output_start = self.num_root_nodes + self.num_trunk_nodes
+        positions: list[int | None] = [None] * self.num_nodes
+        for root_idx in range(self.num_root_nodes):
+            positions[root_idx] = root_idx
+
+        children: list[list[int]] = [[] for _ in range(output_start)]
+        blocking_parents = [0] * output_start
+        for node_idx in range(self.num_root_nodes, output_start):
+            for parent in self.node_inputs_indices[node_idx]:
+                if parent >= self.num_root_nodes:
+                    blocking_parents[node_idx] += 1
+                    children[parent].append(node_idx)
+
+        def ready_key(node_idx: int) -> tuple:
+            # All parents are guaranteed placed by the time a node enters the
+            # heap (roots are pre-placed; trunk parents gate readiness).
+            parent_positions = tuple(
+                positions[parent] for parent in self.node_inputs_indices[node_idx]
+            )
+            return (parent_positions, self.node_types[node_idx], node_idx)
+
+        heap = [
+            ready_key(node_idx)
+            for node_idx in range(self.num_root_nodes, output_start)
+            if blocking_parents[node_idx] == 0
+        ]
+        heapq.heapify(heap)
+
+        order = list(range(self.num_root_nodes))
+        while heap:
+            node_idx = heapq.heappop(heap)[-1]
+            positions[node_idx] = len(order)
+            order.append(node_idx)
+            for child in children[node_idx]:
+                blocking_parents[child] -= 1
+                if blocking_parents[child] == 0:
+                    heapq.heappush(heap, ready_key(child))
+
+        assert len(order) == output_start, "canonical sort left unplaced trunk nodes"
+        order.extend(range(output_start, self.num_nodes))
+        return order
+
+    def build_canonical_tensors(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Padded per-position CPU tensors of the canonical sequence overlay.
+
+        Returns ``(order, node_types, parent_positions, parent_slot_mask)``:
+        ``order`` is ``[N]`` long (sequence position -> original node index),
+        ``node_types`` is ``[N]`` long in sequence order, ``parent_positions``
+        is ``[N, maximum_indegree]`` long holding each valid slot's parent
+        canonical position (0-padded), and ``parent_slot_mask`` is the matching
+        ``[N, maximum_indegree]`` bool validity mask. Every valid parent
+        position is strictly less than its consumer's position and strictly
+        less than the first output position (outputs are leaves).
+        """
+        order = torch.tensor(self.canonical_order, dtype=torch.long)
+        node_types = torch.tensor(
+            [self.node_types[node_idx] for node_idx in self.canonical_order],
+            dtype=torch.long,
+        )
+        parent_positions = torch.zeros(
+            self.num_nodes, self.maximum_indegree, dtype=torch.long
+        )
+        parent_slot_mask = torch.zeros(
+            self.num_nodes, self.maximum_indegree, dtype=torch.bool
+        )
+        for position, node_idx in enumerate(self.canonical_order):
+            for slot, parent in enumerate(self.node_inputs_indices[node_idx]):
+                parent_positions[position, slot] = self.canonical_positions[parent]
+                parent_slot_mask[position, slot] = True
+        return order, node_types, parent_positions, parent_slot_mask
 
 
 def make_random_graph_description(
