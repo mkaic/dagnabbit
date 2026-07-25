@@ -14,8 +14,10 @@ What it measures, and why:
     the loop is launch-bound / CPU-bound, not compute-bound, and the win is
     fusing/batching Python-driven kernel launches rather than a bigger GPU.
 
-  * Encode vs decode split, because the decode pass has a nested per-graph
-    Python loop issuing many tiny index_add_ kernels.
+  * Encode vs compress vs decode split. The encoder is the remaining sequential
+    path -- a Python loop over topological ranks, one shared-transformer
+    invocation per rank -- while compress/decode are single dense passes over
+    the whole canonical sequence.
 
   * A torch.profiler pass: top ops by CUDA and by CPU time, total CUDA kernel
     count per step, and average kernel duration (tiny avg => launch-bound).
@@ -32,7 +34,7 @@ import argparse
 import platform
 import statistics
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -74,6 +76,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override cfg.TORCH_COMPILE.",
+    )
+    p.add_argument(
+        "--amp",
+        choices=("off", "bf16", "fp16"),
+        default="off",
+        help=(
+            "Wrap the forward in torch.autocast to measure mixed-precision "
+            "throughput. Timing-only: no GradScaler is used, so with fp16 the "
+            "gradients themselves are not trustworthy -- compare wall/step and "
+            "peak memory, not losses."
+        ),
     )
     p.add_argument(
         "--output-dir",
@@ -203,12 +216,21 @@ def main() -> None:
             for _ in range(cfg.GRAPH_BATCH_SIZE)
         ]
 
+    amp_dtype = {"off": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.amp]
+
+    def autocast_ctx():
+        if amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
     def run_step():
         with timer.phase("gen"):
             graphs = make_graphs()
         with timer.phase("forward"):
-            losses = model.training_forward_batch(graphs)
-            total, _ = combine_losses(losses)
+            # Backward stays outside the autocast region, as autocast intends.
+            with autocast_ctx():
+                losses = model.training_forward_batch(graphs)
+                total, _ = combine_losses(losses)
         with timer.phase("backward"):
             total.backward()
         with timer.phase("optimizer"):
@@ -276,12 +298,19 @@ def main() -> None:
         f"outputs {cfg.NUM_OUTPUT_NODES}"
     )
     w(
-        f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  layers "
-        f"{cfg.ENCODER_NUM_LAYERS}  heads "
+        f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  heads "
         f"{model.node_encoder.sequence_transformer.num_heads}"
+    )
+    # Spell out all three layer counts: they have churned independently, and a
+    # summary that reports only one is not comparable against archived runs.
+    w(
+        f"layers           encoder {cfg.ENCODER_NUM_LAYERS}  compressor "
+        f"{cfg.COMPRESSOR_NUM_LAYERS if model.compressor is not None else 'disabled'}"
+        f"  decoder {cfg.DECODER_NUM_LAYERS}"
     )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")
+    w(f"amp              {args.amp}")
     w(f"measured_steps   {args.steps} (after {args.warmup} warmup)")
     w("")
 
@@ -331,13 +360,12 @@ def main() -> None:
         busy = 100.0 * gpu_total / mean_wall
         w("")
         w(
-            f"  GPU BUSY FRACTION  {busy:5.1f}%  "
+            f"  event-span sum     {busy:5.1f}%  "
             f"(gpu_total {gpu_total:.2f} ms / wall {mean_wall:.2f} ms)"
         )
-        if busy < 50:
-            w("  => LAUNCH-BOUND: GPU mostly idle. The win is fewer/larger kernel")
-            w("     launches (batch the per-rank / per-graph Python loops), not a")
-            w("     faster GPU. Check the kernel count + avg duration below.")
+        w("    NOT a utilization figure: CUDA-event spans enclose the idle")
+        w("    bubbles between kernels, so this can exceed 100%. Use TRUE GPU")
+        w("    UTILIZATION below instead.")
         w("")
 
     # op tables
@@ -365,6 +393,23 @@ def main() -> None:
         total_kernel_us = sum(e.self_device_time_total for e in kernel_events)
         per_step_calls = total_kernel_calls / max(1, args.profiler_steps)
         avg_kernel_us = total_kernel_us / max(1, total_kernel_calls)
+        # Summed kernel self-time is real GPU-busy time with no idle included,
+        # so this ratio is the honest utilization number and the one that says
+        # whether shrinking kernels (AMP, bigger tensor cores) can pay at all.
+        kernel_ms_per_step = total_kernel_us / max(1, args.profiler_steps) / 1e3
+        true_util = 100.0 * kernel_ms_per_step / mean_wall
+        w("TRUE GPU UTILIZATION")
+        w(f"  kernel busy time / step       {kernel_ms_per_step:10.2f} ms")
+        w(f"  utilization                   {true_util:10.1f} %")
+        if true_util < 60:
+            w("  => LAUNCH-BOUND: the GPU is idle most of the step. Cutting kernel")
+            w("     *duration* (AMP/bf16, a faster GPU) caps out at the busy time")
+            w("     above; the win is fewer/larger launches -- batch the Python")
+            w("     rank loops. AMP also adds cast kernels to the dispatch path.")
+        else:
+            w("  => Approaching compute-bound: kernel duration is now worth")
+            w("     attacking, so AMP/bf16 can convert into real wall-clock time.")
+        w("")
         w("KERNEL-LAUNCH SIGNAL")
         w(f"  cuda kernel launches / step   {per_step_calls:10.0f}")
         w(f"  avg kernel duration           {avg_kernel_us:10.2f} us")
