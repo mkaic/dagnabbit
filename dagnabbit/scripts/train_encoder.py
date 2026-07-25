@@ -69,7 +69,8 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
 
     # The compressor/decoder run one dense fixed-shape [B, N, D] pass each per
     # step, so they compile cleanly alongside the per-rank encoder kernel.
-    model.compressor = torch.compile(model.compressor, **compile_kwargs)
+    if model.compressor is not None:
+        model.compressor = torch.compile(model.compressor, **compile_kwargs)
     model.decoder = torch.compile(model.decoder, **compile_kwargs)
     compile_mode = cfg.TORCH_COMPILE_MODE if cfg.TORCH_COMPILE_CUDAGRAPHS else "default"
     print(

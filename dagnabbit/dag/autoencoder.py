@@ -330,7 +330,7 @@ class DagnabbitAutoEncoder(nn.Module):
         num_output_nodes: int,
         mlp_expansion_factor: float,
         encoder_num_layers: int = 1,
-        compressor_num_layers: int = 4,
+        compressor_num_layers: int | None = 4,
         decoder_num_layers: int = 4,
     ):
         super().__init__()
@@ -386,10 +386,18 @@ class DagnabbitAutoEncoder(nn.Module):
         # Both are dense bidirectional transformers over the fixed-length
         # canonical sequence, with their own weights, layer counts, and
         # hardcoded block geometry (independent of the encoder's).
-        self.compressor = SequenceTransformer(
-            node_embedding_dim=node_embedding_dim,
-            num_layers=compressor_num_layers,
-            mlp_expansion_factor=mlp_expansion_factor,
+        #
+        # ``compressor_num_layers`` of None or 0 removes the compressor
+        # entirely: the latent is then the encoder's own output-node
+        # embeddings, taken straight out of the canonical sequence.
+        self.compressor = (
+            SequenceTransformer(
+                node_embedding_dim=node_embedding_dim,
+                num_layers=compressor_num_layers,
+                mlp_expansion_factor=mlp_expansion_factor,
+            )
+            if compressor_num_layers
+            else None
         )
         self.decoder = SequenceTransformer(
             node_embedding_dim=node_embedding_dim,
@@ -651,7 +659,9 @@ class DagnabbitAutoEncoder(nn.Module):
 
         The latent is the compressor's output at the K fixed output-node
         positions (the tail of the canonical sequence); everything else is
-        discarded.
+        discarded. With the compressor disabled
+        (``compressor_num_layers=None``/``0``) the latent is the encoder's own
+        embeddings at those same positions, passed through untouched.
         """
         if sequence.ndim != 3 or sequence.shape[1:] != (
             self.num_nodes,
@@ -661,6 +671,8 @@ class DagnabbitAutoEncoder(nn.Module):
                 "sequence must have shape [B, "
                 f"{self.num_nodes}, {self.node_embedding_dim}]"
             )
+        if self.compressor is None:
+            return sequence[:, self.output_start :]
         posenc = self.position_encodings.to(dtype=sequence.dtype)
         compressed = self.compressor(sequence + posenc)
         return compressed[:, self.output_start :]

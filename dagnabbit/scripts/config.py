@@ -17,8 +17,11 @@ MLP_EXPANSION_FACTOR = 4.0
 # recursive decode: the Compressor squeezes the canonical node sequence into
 # the output-position latent; the Decoder reconstructs the full sequence from
 # that latent plus mask tokens.
-COMPRESSOR_NUM_LAYERS = 2
-DECODER_NUM_LAYERS = 2
+# Set COMPRESSOR_NUM_LAYERS to None (or 0) to drop the Compressor entirely and
+# feed the encoder's own output-node embeddings straight into the Decoder as
+# the latent.
+COMPRESSOR_NUM_LAYERS = None
+DECODER_NUM_LAYERS = 4
 # Layer count for the recursive structural encoder's shared per-node
 # transformer. The remaining block geometry (64-wide attention heads, MLP
 # depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
