@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from dagnabbit.bitarrays import get_8bit_adder_truth_table
+from dagnabbit.tasks.logic_gates.bitarrays import get_8bit_adder_truth_table
 
 # Create output directory for images
 OUTPUT_DIR = Path(__file__).parent / "bitpacking_visualizations"

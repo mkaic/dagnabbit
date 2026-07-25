@@ -3,16 +3,21 @@ Visualization script for bitpacking and unpacking functions.
 Tests get_address_bitarrays and output_to_image_array to verify they work correctly.
 """
 
+from pathlib import Path
 from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from dagnabbit.bitarrays import (
+from dagnabbit.tasks.logic_gates.bitarrays import (
     calculate_required_bitdepth,
     get_address_bitarrays,
     output_to_image_array,
 )
+
+# Output directory alongside this script, matching visualize_bitpacking.py.
+OUTPUT_DIR = Path(__file__).parent / "address_bitpacking_visualizations"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
@@ -44,7 +49,9 @@ def visualize_bitpacking_roundtrip(shape: Tuple[int], verbose: bool = True):
     print(f"   Sum of bitdepths: {sum(bitdepths)}")
 
     # Step 2: Unpack back to image array
-    unpacked = output_to_image_array(packed, shape)
+    # output_to_image_array takes [batch, bits, bytes]; these address
+    # bitarrays are a single unbatched [bits, bytes] plane.
+    unpacked = output_to_image_array(packed[None], shape)
 
     print("\n2. Unpacking:")
     print(f"   Unpacked shape: {unpacked.shape}")
@@ -228,14 +235,9 @@ def create_visualization_plots(shape, packed: np.ndarray, unpacked: np.ndarray):
         ax.grid(True, which="minor", color="red", alpha=0.2, linewidth=0.5)
 
     plt.tight_layout()
-    plt.savefig(
-        f"/home/mkaic/dagnabbit/dagnabbit/outputs/bitpacking_test_{shape[0]}x{shape[1]}.png",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    print(
-        f"   Saved visualization to outputs/bitpacking_test_{shape[0]}x{shape[1]}.png"
-    )
+    path = OUTPUT_DIR / f"bitpacking_test_{shape[0]}x{shape[1]}.png"
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"   Saved visualization to {path}")
     plt.close()
 
 
@@ -245,7 +247,9 @@ def test_roundtrip_correctness(shape: Tuple[int]) -> bool:
     Returns True if test passes.
     """
     packed = get_address_bitarrays(shape)
-    unpacked = output_to_image_array(packed, shape)
+    # output_to_image_array takes [batch, bits, bytes]; these address
+    # bitarrays are a single unbatched [bits, bytes] plane.
+    unpacked = output_to_image_array(packed[None], shape)
 
     # The unpacked array should contain address information
     # For a simple test, we can verify that different positions have different values
