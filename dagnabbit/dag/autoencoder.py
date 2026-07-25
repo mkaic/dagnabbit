@@ -825,3 +825,98 @@ class DagnabbitAutoEncoder(nn.Module):
         if return_buffers:
             return losses, primary_buffer, reconstructed
         return losses
+
+    @torch.no_grad()
+    def encode_to_latent(
+        self,
+        graphs: Sequence[FixedInDegreeDAGDescription],
+    ) -> Tensor:
+        """Encode graphs and compress to their [B, K, D] graph latents."""
+        graphs = list(graphs)
+        device = self.root_node_embeddings.weight.device
+        rank_batches = self._make_batched_rank_cache(graphs, device)
+        buffer = self.evaluate_graph_batch(graphs=graphs, rank_batches=rank_batches)
+        order = torch.stack(
+            [graph.canonical_order_tensor for graph in graphs]
+        ).to(device=device, non_blocking=True)
+        batch_rows = torch.arange(len(graphs), dtype=torch.long, device=device)[
+            :, None
+        ]
+        return self.compress(buffer[batch_rows, order])
+
+    @torch.no_grad()
+    def generate(
+        self,
+        latent: Tensor,
+    ) -> FixedInDegreeDAGDescription | list[FixedInDegreeDAGDescription]:
+        """Decode graph latents into guaranteed-valid DAG descriptions.
+
+        ``latent`` is ``[B, K, D]``, or ``[K, D]`` for a single graph (which
+        returns a single description). Types at root/output positions are
+        fixed by the sequence layout; each trunk position takes the argmax
+        over trunk classes, and its predicted type decides how many input
+        slots to fill. Every valid slot then points at its argmax candidate.
+        Candidates are restricted to strictly-earlier non-output positions,
+        so parents always precede children: the result is a valid DAG by
+        construction and generation cannot fail to terminate.
+
+        Descriptions are built directly in canonical position space (node
+        index == canonical position). A slot may select the same parent as a
+        sibling slot, and producers that no slot selects stay as dead nodes;
+        ``graphs_match`` ignores both when comparing graphs.
+        """
+        single = latent.ndim == 2
+        if single:
+            latent = latent.unsqueeze(0)
+
+        reconstructed = self.decode_latent(latent)
+        type_logits = self.node_type_predictor(reconstructed)
+        trunk_types = type_logits[
+            :,
+            self.num_root_nodes : self.output_start,
+            : self.num_trunk_node_types,
+        ].argmax(dim=-1)
+        parent_choices = self.parent_pointer_logits(reconstructed).argmax(dim=-1)
+
+        trunk_types_by_graph = trunk_types.cpu().tolist()
+        parents_by_graph = parent_choices.cpu().tolist()
+
+        root_types_start = self.num_trunk_node_types
+        output_type = self.num_trunk_node_types + self.num_root_nodes
+        descriptions: list[FixedInDegreeDAGDescription] = []
+        for graph_idx in range(latent.shape[0]):
+            node_types = [
+                root_types_start + root_slot
+                for root_slot in range(self.num_root_nodes)
+            ]
+            node_inputs_indices: list[list[int]] = [
+                [] for _ in range(self.num_root_nodes)
+            ]
+            for trunk_offset, trunk_type in enumerate(
+                trunk_types_by_graph[graph_idx]
+            ):
+                position = self.num_root_nodes + trunk_offset
+                in_degree = self.trunk_node_in_degrees[trunk_type]
+                node_types.append(trunk_type)
+                node_inputs_indices.append(
+                    parents_by_graph[graph_idx][position][:in_degree]
+                )
+            for output_slot in range(self.num_output_nodes):
+                position = self.output_start + output_slot
+                node_types.append(output_type)
+                node_inputs_indices.append(
+                    parents_by_graph[graph_idx][position][:1]
+                )
+            descriptions.append(
+                FixedInDegreeDAGDescription(
+                    num_root_nodes=self.num_root_nodes,
+                    num_trunk_nodes=self.num_trunk_nodes,
+                    num_output_nodes=self.num_output_nodes,
+                    num_trunk_node_types=self.num_trunk_node_types,
+                    trunk_node_in_degrees=self.trunk_node_in_degrees,
+                    node_inputs_indices=node_inputs_indices,
+                    node_types=node_types,
+                )
+            )
+
+        return descriptions[0] if single else descriptions

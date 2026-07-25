@@ -144,11 +144,51 @@ def test_end_to_end_gradient_flow() -> None:
         assert stack_grad_mass > 0, prefix
 
 
+def assert_valid_generated(description) -> None:
+    """Structural validity beyond the constructor's own asserts."""
+    assert description.num_nodes == NUM_NODES
+    for node_idx, parents in enumerate(description.node_inputs_indices):
+        for parent in parents:
+            # Parents strictly precede children and are never outputs, so the
+            # graph is acyclic and outputs stay leaves.
+            assert parent < node_idx
+            assert parent < OUTPUT_START
+
+
+def test_generate_is_always_a_valid_dag() -> None:
+    torch.manual_seed(0)
+    model = build_small_model()
+    for _ in range(25):
+        latent = torch.randn(2, NUM_OUTPUTS, EMBEDDING_DIM)
+        descriptions = model.generate(latent)
+        assert len(descriptions) == 2
+        for description in descriptions:
+            assert_valid_generated(description)
+
+    # Single-graph convenience shape: [K, D] in, one description out.
+    description = model.generate(torch.randn(NUM_OUTPUTS, EMBEDDING_DIM))
+    assert_valid_generated(description)
+
+
+def test_encode_to_latent_roundtrips_through_generate() -> None:
+    torch.manual_seed(0)
+    model = build_small_model()
+    graphs = sample_graphs(3)
+    latent = model.encode_to_latent(graphs)
+    assert latent.shape == (3, NUM_OUTPUTS, EMBEDDING_DIM)
+    rebuilt = model.generate(latent)
+    assert len(rebuilt) == 3
+    for description in rebuilt:
+        assert_valid_generated(description)
+
+
 def main() -> None:
     test_training_forward_shapes_and_masks()
     test_pointer_candidate_mask_layout()
     test_pointer_logits_masked_exactly_outside_candidates()
     test_end_to_end_gradient_flow()
+    test_generate_is_always_a_valid_dag()
+    test_encode_to_latent_roundtrips_through_generate()
     print("ALL SEQUENCE-MODEL CHECKS PASSED")
 
 
