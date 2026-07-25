@@ -1,5 +1,7 @@
 import torch
 
+from dagnabbit.optimizers import AutoMuon
+
 # --- model ---
 NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
@@ -40,10 +42,29 @@ GRAPH_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-4
 
-OPTIMIZER_CLASS = torch.optim.Adam
+# AutoMuon runs torch.optim.Muon on the transformer blocks' attention/MLP
+# weight matrices and torch.optim.AdamW on everything Muon is not meant for
+# (biases, LayerNorm gains, embedding tables, learned position/register/mask
+# tokens). "match_rms_adamw" rescales Muon's orthogonal update to AdamW's RMS,
+# which is what lets both rules share one tuned LEARNING_RATE; the alternative
+# is adjust_lr_fn=None ("original"), where Muon wants its own much larger LR
+# (~0.02). LR warmup scales both groups.
+#
+# ``adam_module_names`` names the output heads: module type alone cannot tell a
+# classifier apart from a hidden layer, and the type predictor's output axis
+# indexes classes, not a hidden space. The pointer projections are ordinary
+# square hidden-space maps and stay on Muon.
+OPTIMIZER_CLASS = AutoMuon
 OPTIMIZER_KWARGS = {
-    "lr": LEARNING_RATE,
-    "betas": (0.9, 0.999),
+    "muon_lr": LEARNING_RATE,
+    "adam_lr": LEARNING_RATE,
+    "adjust_lr_fn": "match_rms_adamw",
+    "momentum": 0.95,
+    "adam_betas": (0.9, 0.999),
+    # No weight decay, matching the plain-Adam setup this replaced.
+    "muon_weight_decay": 0.0,
+    "adam_weight_decay": 0.0,
+    "adam_module_names": ("node_type_predictor",),
 }
 # Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
 LR_WARMUP_OPTIMIZER_STEPS = 100

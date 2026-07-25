@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import NodeSupertype, make_random_graph_description
+from dagnabbit.optimizers import AutoMuon, build_optimizer
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
     accuracy_summary,
@@ -65,10 +66,7 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
             "triton.cudagraphs": False,
             "triton.cudagraph_trees": False,
         }
-    model.node_encoder.forward_batch = torch.compile(
-        model.node_encoder.forward_batch,
-        **compile_kwargs,
-    )
+
     # The compressor/decoder run one dense fixed-shape [B, N, D] pass each per
     # step, so they compile cleanly alongside the per-rank encoder kernel.
     model.compressor = torch.compile(model.compressor, **compile_kwargs)
@@ -296,7 +294,9 @@ def main() -> None:
         f"({num_trainable_params})"
     )
 
-    optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
+    optimizer = build_optimizer(cfg.OPTIMIZER_CLASS, model, **cfg.OPTIMIZER_KWARGS)
+    if isinstance(optimizer, AutoMuon):
+        print(optimizer.summary())
     lr_scheduler = make_lr_warmup_scheduler(optimizer)
     if lr_scheduler is None:
         print("lr_warmup_optimizer_steps=0")

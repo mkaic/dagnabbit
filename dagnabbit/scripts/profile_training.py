@@ -41,6 +41,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.optimizers import build_optimizer
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.train_encoder import combine_losses
 
@@ -163,7 +164,7 @@ def main() -> None:
 
         apply_torch_compile(model, device)
 
-    optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
+    optimizer = build_optimizer(cfg.OPTIMIZER_CLASS, model, **cfg.OPTIMIZER_KWARGS)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     # Split forward into encode / compress / decode by wrapping the bound
