@@ -21,7 +21,7 @@ MLP_EXPANSION_FACTOR = 4.0
 # feed the encoder's own output-node embeddings straight into the Decoder as
 # the latent.
 COMPRESSOR_NUM_LAYERS = 4
-DECODER_NUM_LAYERS = 2
+DECODER_NUM_LAYERS = 4
 # Layer count for the recursive structural encoder's shared per-node
 # transformer. The remaining block geometry (64-wide attention heads, MLP
 # depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
