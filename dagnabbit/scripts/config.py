@@ -3,7 +3,7 @@ import torch
 from dagnabbit.optimizers import AutoMuon
 
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 512
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -17,8 +17,8 @@ MLP_EXPANSION_FACTOR = 4.0
 # recursive decode: the Compressor squeezes the canonical node sequence into
 # the output-position latent; the Decoder reconstructs the full sequence from
 # that latent plus mask tokens.
-COMPRESSOR_NUM_LAYERS = 4
-DECODER_NUM_LAYERS = 4
+COMPRESSOR_NUM_LAYERS = 2
+DECODER_NUM_LAYERS = 2
 # Layer count for the recursive structural encoder's shared per-node
 # transformer. The remaining block geometry (64-wide attention heads, MLP
 # depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
@@ -38,7 +38,7 @@ TORCH_COMPILE_CUDAGRAPHS = False
 
 # --- training ---
 NUM_STEPS = 10_000_000
-GRAPH_BATCH_SIZE = 64
+GRAPH_BATCH_SIZE = 16
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-4
 
