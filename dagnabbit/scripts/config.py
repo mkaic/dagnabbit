@@ -3,7 +3,7 @@ import torch
 from dagnabbit.optimizers import AutoMuon
 
 # --- model ---
-NODE_EMBEDDING_DIM = 512
+NODE_EMBEDDING_DIM = 256
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -27,7 +27,7 @@ ENCODER_NUM_LAYERS = 2
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,
 # whose Python DAG traversal changes every iteration.
-TORCH_COMPILE = False
+TORCH_COMPILE = True
 TORCH_COMPILE_MODE = "reduce-overhead"
 TORCH_COMPILE_DYNAMIC = True
 # The training step invokes compiled encoder/decoder kernels many times before
