@@ -55,12 +55,16 @@ def test_training_forward_shapes_and_masks() -> None:
     model = build_small_model()
     losses = model.training_forward_batch(sample_graphs(3))
 
-    assert losses.node_classification_losses.shape == (3, NUM_NODES)
+    # Classification covers trunk positions only; roots and outputs are fixed
+    # by the canonical layout.
+    assert losses.node_classification_losses.shape == (3, NUM_TRUNKS)
     assert losses.node_predicted_type_logits.shape == (
         3,
-        NUM_NODES,
-        model.num_node_types,
+        NUM_TRUNKS,
+        NUM_TRUNK_TYPES,
     )
+    assert losses.node_true_types.shape == (3, NUM_TRUNKS)
+    assert (losses.node_true_types < NUM_TRUNK_TYPES).all()
     assert losses.parent_pointer_losses.shape == (3, NUM_NODES, IN_DEGREES)
     assert losses.parent_pointer_logits.shape == (3, NUM_NODES, IN_DEGREES, NUM_NODES)
 

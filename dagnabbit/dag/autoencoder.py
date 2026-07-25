@@ -280,11 +280,13 @@ class TrainingStepLossReturnType:
     (roots first, outputs last), not original node-storage order.
     """
 
-    # [B, N] per-position type cross-entropy (class-balance weighted when the
-    # model flag is enabled).
+    # [B, T] per-trunk-position type cross-entropy. Root and output positions
+    # are never classified -- the canonical layout fixes their identities by
+    # construction.
     node_classification_losses: Tensor
-    # [B, N, num_node_types] raw classifier logits over reconstructed
-    # embeddings; ``node_true_types`` is the aligned [B, N] label tensor.
+    # [B, T, num_trunk_node_types] raw classifier logits over the trunk slice
+    # of the reconstruction; ``node_true_types`` is the aligned [B, T] label
+    # tensor of trunk-type ids.
     node_predicted_type_logits: Tensor
     node_true_types: Tensor
     # [B, N, S] per-slot parent-pointer cross-entropy. Invalid slots (roots,
@@ -319,7 +321,6 @@ class DagnabbitAutoEncoder(nn.Module):
         num_trunk_nodes: int,
         num_output_nodes: int,
         mlp_expansion_factor: float,
-        class_balanced_classification_losses: bool = False,
         encoder_num_layers: int = 1,
         compressor_num_layers: int = 4,
         decoder_num_layers: int = 4,
@@ -356,9 +357,6 @@ class DagnabbitAutoEncoder(nn.Module):
         self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
         self.output_start = num_root_nodes + num_trunk_nodes
         self.mlp_expansion_factor = mlp_expansion_factor
-        self.class_balanced_classification_losses = (
-            class_balanced_classification_losses
-        )
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
         self.encoder_num_layers = encoder_num_layers
         self.num_attention_heads = num_attention_heads
@@ -428,9 +426,12 @@ class DagnabbitAutoEncoder(nn.Module):
         )
 
         # ---- Heads ----
+        # Trunk-type classifier only: the canonical layout pins roots to the
+        # first positions and outputs to the last positions in slot order, so
+        # their identities are known by construction and never predicted.
         self.node_type_predictor = nn.Linear(
             self.node_embedding_dim,
-            self.num_node_types,
+            self.num_trunk_node_types,
         )
         # One key projector shared by all positions; one query projector per
         # input-slot index (type-agnostic -- slot 0 always uses projector 0,
@@ -442,37 +443,6 @@ class DagnabbitAutoEncoder(nn.Module):
                 for _ in range(self.maximum_indegree)
             ]
         )
-
-    def _class_balance_weights(self, labels: Tensor) -> Tensor:
-        """Per-node weights balancing two class groups equally within each graph.
-
-        ``labels`` is ``[B, N]`` of node-type ids. Nodes are split into two
-        groups by supertype, using the type-index layout
-        ``[trunk types | root types | single output type]``:
-
-          * group (b): trunk classes (``label < num_trunk_node_types``);
-          * group (a): roots + the single output class (everything else).
-
-        The two groups are weighted equally -- each group's weights sum to the
-        same mass -- but the weights are normalized to average 1 across the
-        graph's nodes (they sum to the node count ``N``), so the overall
-        classification-loss magnitude matches plain unweighted cross-entropy.
-        Concretely each node gets ``(N / active_groups) / (nodes in its group)``,
-        which keeps the flag a pure reweighting rather than a rescaling.
-        """
-        num_nodes = labels.shape[1]
-        is_trunk = labels < self.num_trunk_node_types
-        trunk_counts = is_trunk.sum(dim=1, keepdim=True).to(torch.float32)
-        other_counts = (~is_trunk).sum(dim=1, keepdim=True).to(torch.float32)
-        # Number of non-empty groups per graph (1 or 2); guards the group-mass
-        # split when a graph happens to contain only one of the two groups.
-        active_groups = (trunk_counts > 0).to(torch.float32) + (
-            other_counts > 0
-        ).to(torch.float32)
-        # Each node's own group size; always >= 1 for real nodes since a node is
-        # counted in its own group.
-        group_counts = torch.where(is_trunk, trunk_counts, other_counts)
-        return (num_nodes / active_groups) / group_counts
 
     def evaluate_graph_batch(
         self,
@@ -793,16 +763,17 @@ class DagnabbitAutoEncoder(nn.Module):
         latent = self.compress(sequence)
         reconstructed = self.decode_latent(latent)
 
-        type_logits = self.node_type_predictor(reconstructed)
+        # Only trunk positions are classified: the canonical layout already
+        # fixes root and output identities by position.
+        trunk_labels = labels[:, self.num_root_nodes : self.output_start]
+        type_logits = self.node_type_predictor(
+            reconstructed[:, self.num_root_nodes : self.output_start]
+        )
         class_losses = F.cross_entropy(
-            type_logits.reshape(-1, self.num_node_types),
-            labels.reshape(-1),
+            type_logits.reshape(-1, self.num_trunk_node_types),
+            trunk_labels.reshape(-1),
             reduction="none",
-        ).reshape(batch_size, num_nodes)
-        if self.class_balanced_classification_losses:
-            class_losses = class_losses * self._class_balance_weights(labels).to(
-                class_losses.dtype
-            )
+        ).reshape(batch_size, self.num_trunk_nodes)
 
         pointer_logits = self.parent_pointer_logits(reconstructed)
         # Invalid slots (roots, padding beyond a type's in-degree) can have
@@ -825,7 +796,7 @@ class DagnabbitAutoEncoder(nn.Module):
         losses = TrainingStepLossReturnType(
             node_classification_losses=class_losses,
             node_predicted_type_logits=type_logits,
-            node_true_types=labels,
+            node_true_types=trunk_labels,
             parent_pointer_losses=pointer_losses,
             parent_pointer_logits=pointer_logits,
             parent_pointer_true_positions=parent_positions,
@@ -879,12 +850,9 @@ class DagnabbitAutoEncoder(nn.Module):
             latent = latent.unsqueeze(0)
 
         reconstructed = self.decode_latent(latent)
-        type_logits = self.node_type_predictor(reconstructed)
-        trunk_types = type_logits[
-            :,
-            self.num_root_nodes : self.output_start,
-            : self.num_trunk_node_types,
-        ].argmax(dim=-1)
+        trunk_types = self.node_type_predictor(
+            reconstructed[:, self.num_root_nodes : self.output_start]
+        ).argmax(dim=-1)
         parent_choices = self.parent_pointer_logits(reconstructed).argmax(dim=-1)
 
         trunk_types_by_graph = trunk_types.cpu().tolist()

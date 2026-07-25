@@ -153,7 +153,6 @@ def main() -> None:
         num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         encoder_num_layers=cfg.ENCODER_NUM_LAYERS,
         compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
         decoder_num_layers=cfg.DECODER_NUM_LAYERS,

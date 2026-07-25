@@ -30,7 +30,7 @@ def combine_losses(
     slot_mask = losses.parent_pointer_slot_mask
     pointer_mean = losses.parent_pointer_losses.sum() / slot_mask.sum().clamp(min=1)
 
-    total = cfg.GLOBAL_LOSS_MULTIPLIER * (
+    total = (
         cfg.W_TYPE_CLASSIFICATION * type_mean
         + cfg.W_PARENT_POINTER * pointer_mean
     )
@@ -282,7 +282,6 @@ def main() -> None:
         num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         encoder_num_layers=cfg.ENCODER_NUM_LAYERS,
         compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
         decoder_num_layers=cfg.DECODER_NUM_LAYERS,
@@ -448,7 +447,7 @@ def main() -> None:
                 decoder_accuracy, decoder_supertype_accuracies = accuracy_summary(
                     np.concatenate(window_preds),
                     np.concatenate(window_truth),
-                    num_classes=model.num_node_types,
+                    num_classes=model.num_trunk_node_types,
                 )
                 window_preds.clear()
                 window_truth.clear()

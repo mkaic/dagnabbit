@@ -77,7 +77,6 @@ def build_model(device: torch.device) -> DagnabbitAutoEncoder:
         num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         encoder_num_layers=cfg.ENCODER_NUM_LAYERS,
         compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
         decoder_num_layers=cfg.DECODER_NUM_LAYERS,
@@ -149,7 +148,7 @@ def main() -> None:
     type_accuracy, type_by_supertype = accuracy_summary(
         np.concatenate(type_preds),
         np.concatenate(type_truth),
-        num_classes=model.num_node_types,
+        num_classes=model.num_trunk_node_types,
     )
     pointer_accuracy, pointer_by_supertype = pointer_accuracy_summary(
         np.concatenate(pointer_correct),

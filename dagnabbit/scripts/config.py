@@ -64,23 +64,14 @@ SEED = 1
 TENSORBOARD_LOG_DIR = "runs"
 
 # --- loss weights ---
-# Uniform scale applied to the weighted sum of all loss terms before backward.
-GLOBAL_LOSS_MULTIPLIER = 1.0
-
-# Node-type classification cross-entropy over the reconstructed sequence, at
-# every canonical position. Logged as loss/primary_decoded_classification so
-# new runs overlay the old scheme's primary decode curve in TensorBoard.
+# Trunk-type classification cross-entropy over the reconstructed sequence.
+# Only trunk positions are scored: the canonical layout fixes the first
+# positions as the ordered roots and the last positions as the ordered
+# outputs, so their identities are known by construction. Logged as
+# loss/primary_decoded_classification for TensorBoard continuity.
 W_TYPE_CLASSIFICATION = 1.0
 
 # Parent-pointer cross-entropy, averaged over valid input slots: each slot's
 # query must pick its true parent's canonical position from the
 # strictly-earlier non-output positions. Logged as loss/parent_pointer.
 W_PARENT_POINTER = 1.0
-
-# Balance the classification cross-entropy between two node groups so they
-# contribute equally to each graph's loss: (a) roots + the single output class,
-# and (b) trunk classes. Weights are normalized to average 1 across each graph's
-# nodes, so this is a pure reweighting that preserves the overall loss magnitude
-# (it does not shrink the classification term relative to the other losses).
-# Set False for plain per-node cross-entropy.
-CLASS_BALANCED_CLASSIFICATION_LOSSES = True
