@@ -37,17 +37,6 @@ TORCH_COMPILE_DYNAMIC = True
 TORCH_COMPILE_CUDAGRAPHS = False
 
 
-# --- decode passes ---
-# The training step runs up to three decode streams over one shared encode pass
-# (autoregressive-with-aggregation, teacher-forced, single-sample). Set this to
-# False to skip the autoregressive-with-aggregation stream entirely -- it is then
-# neither computed, scored, nor logged, so no compute is spent on it. Use this to
-# run with only the single-sample ("random child") and teacher-forced streams.
-# When False, W_PRIMARY_DECODED_CLASSIFICATION / W_PRIMARY_PARENT_RECONSTRUCTION /
-# W_PRIMARY_PARENT_CONSISTENCY are ignored.
-COMPUTE_AGGREGATE_DECODE_PASS = False
-
-
 # --- training ---
 NUM_STEPS = 10_000_000
 GRAPH_BATCH_SIZE = 16
@@ -81,44 +70,20 @@ TENSORBOARD_LOG_DIR = "runs"
 # Uniform scale applied to the weighted sum of all loss terms before backward.
 GLOBAL_LOSS_MULTIPLIER = 1.0
 
-# Each training step runs two decode passes over one shared encode pass:
-#   * autoregressive: the genuine model; predictions compound down the DAG.
-#   * teacher-forced (TF): every node decodes its true encode embedding, so the
-#     autoregressive chain is severed and the decoders are scored on recovering
-#     parent identity from clean inputs.
-# The two are weighted independently; set the TF weight to 0.0 to disable the
-# teacher-forced pass' contribution to the loss (it is still computed for
-# logging, so zero it *and* skip logging if you want it fully gone).
-W_PRIMARY_DECODED_CLASSIFICATION = 1.0
+# Node-type classification cross-entropy over the reconstructed sequence, at
+# every canonical position. Logged as loss/primary_decoded_classification so
+# new runs overlay the old scheme's primary decode curve in TensorBoard.
+W_TYPE_CLASSIFICATION = 1.0
 
-# Single-sample autoregressive decode pass: each node is fed exactly one
-# uniformly-sampled child prediction (no aggregation), passed forward down the
-# DAG, and classified. Directly trains the blind-decode regime (single compounded
-# embedding) rather than only the denoised aggregate. The aggregate pass above is
-# kept as the gradient highway / fast learner; this is the auxiliary that closes
-# the train/blind-decode gap. Lower it if early training is unstable.
-W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION = 1.0
+# Parent-pointer cross-entropy, averaged over valid input slots: each slot's
+# query must pick its true parent's canonical position from the
+# strictly-earlier non-output positions. Logged as loss/parent_pointer.
+W_PARENT_POINTER = 1.0
 
 # Balance the classification cross-entropy between two node groups so they
 # contribute equally to each graph's loss: (a) roots + the single output class,
 # and (b) trunk classes. Weights are normalized to average 1 across each graph's
 # nodes, so this is a pure reweighting that preserves the overall loss magnitude
 # (it does not shrink the classification term relative to the other losses).
-# Applies to all classification streams (autoregressive, teacher-forced,
-# single-sample). Set False for plain per-node cross-entropy.
+# Set False for plain per-node cross-entropy.
 CLASS_BALANCED_CLASSIFICATION_LOSSES = True
-
-# --- teacher-forced decode pass loss weights ---
-W_TF_PRIMARY_DECODED_CLASSIFICATION = 1.0
-
-# parent-reconstruction (per-edge: predicted parent vs true encode embedding).
-# Keep this disabled while both reconstruction weights are zero to avoid spending
-# each training step on a loss that cannot affect gradients.
-COMPUTE_RECONSTRUCTION_LOSS = True
-W_PRIMARY_PARENT_RECONSTRUCTION = 0.0
-W_TF_PRIMARY_PARENT_RECONSTRUCTION = 0.1
-# parent-consistency (per-parent agreement among child predictions); opt-in
-W_PRIMARY_PARENT_CONSISTENCY = 0.0
-W_TF_PRIMARY_PARENT_CONSISTENCY = 0.0
-# detach encoder_buffer when used as the reconstruction target (train decoder only)
-RECONSTRUCTION_DETACH_TARGET = True

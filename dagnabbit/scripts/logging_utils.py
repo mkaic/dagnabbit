@@ -31,6 +31,54 @@ def step_preds_and_truth(
     return preds, truth
 
 
+def step_pointer_stats(
+    pointer_logits: torch.Tensor,
+    true_positions: torch.Tensor,
+    slot_mask: torch.Tensor,
+    output_start: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-slot pointer correctness for one step, flattened over valid slots.
+
+    ``pointer_logits`` is ``[B, N, S, N]``, ``true_positions`` and
+    ``slot_mask`` are ``[B, N, S]``. Returns ``(correct, is_output)`` boolean
+    arrays over valid slots only: ``correct`` marks slots whose argmax matches
+    the true parent position; ``is_output`` marks slots belonging to output
+    positions (``>= output_start``), the rest belong to trunk positions.
+    """
+    predicted = pointer_logits.detach().argmax(dim=-1)
+    correct = predicted == true_positions
+    num_positions = slot_mask.shape[1]
+    is_output = (
+        torch.arange(num_positions, device=slot_mask.device)[None, :, None]
+        >= output_start
+    ).expand_as(slot_mask)
+
+    valid = slot_mask.detach().reshape(-1).cpu().numpy()
+    correct_np = correct.reshape(-1).cpu().numpy()[valid]
+    is_output_np = is_output.reshape(-1).cpu().numpy()[valid]
+    return correct_np, is_output_np
+
+
+def pointer_accuracy_summary(
+    correct: np.ndarray,
+    is_output: np.ndarray,
+) -> tuple[float, dict[NodeSupertype, float]]:
+    """Overall and per-supertype pointer accuracy over a logging window.
+
+    Unlike :func:`accuracy_summary`, the mean here is the plain fraction of
+    valid slots pointed at the right parent (there is no class axis to
+    balance). Groups split by consumer supertype: trunk vs output positions.
+    """
+    mean = float(correct.mean()) if correct.size else float("nan")
+    by_supertype: dict[NodeSupertype, float] = {}
+    trunk_mask = ~is_output
+    if trunk_mask.any():
+        by_supertype[NodeSupertype.TRUNK] = float(correct[trunk_mask].mean())
+    if is_output.any():
+        by_supertype[NodeSupertype.OUTPUT] = float(correct[is_output].mean())
+    return mean, by_supertype
+
+
 def accuracy_summary(
     preds: np.ndarray,
     truth: np.ndarray,
@@ -110,8 +158,8 @@ def log_step_metrics(
     components: dict[str, float],
     decoder_accuracy: float | None = None,
     decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
-    tf_decoder_accuracy: float | None = None,
-    tf_decoder_supertype_accuracies: dict[NodeSupertype, float] | None = None,
+    pointer_accuracy: float | None = None,
+    pointer_supertype_accuracies: dict[NodeSupertype, float] | None = None,
     grad_norm: float | None = None,
     grad_was_clipped: bool | None = None,
     learning_rate: float | None = None,
@@ -134,8 +182,9 @@ def log_step_metrics(
                     step,
                 )
 
-    # Aggregate (autoregressive-with-aggregation) decode accuracies; absent when
-    # that stream is disabled.
+    # Node-type classification accuracy of the reconstructed sequence. Reuses
+    # the old scheme's canonical primary-decode tags (accuracy/decoder_mean,
+    # accuracy/<supertype>, plus error/ mirrors) so new runs overlay old ones.
     if decoder_accuracy is not None and decoder_supertype_accuracies is not None:
         log_decoder_accuracies(
             writer,
@@ -146,16 +195,16 @@ def log_step_metrics(
             tag_prefix="accuracy",
         )
 
-    # Teacher-forced decode accuracies (logged under a parallel ``tf`` namespace
-    # so they sit next to the autoregressive curves in TensorBoard).
-    if tf_decoder_accuracy is not None and tf_decoder_supertype_accuracies is not None:
+    # Parent-pointer accuracy is new to the sequence scheme; it gets its own
+    # accuracy/pointer namespace (with error/ mirrors via the shared helper).
+    if pointer_accuracy is not None and pointer_supertype_accuracies is not None:
         log_decoder_accuracies(
             writer,
             step,
-            tf_decoder_accuracy,
-            tf_decoder_supertype_accuracies,
-            mean_tag="accuracy/tf/decoder_mean",
-            tag_prefix="accuracy/tf",
+            pointer_accuracy,
+            pointer_supertype_accuracies,
+            mean_tag="accuracy/pointer/mean",
+            tag_prefix="accuracy/pointer",
         )
 
 

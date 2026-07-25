@@ -150,16 +150,17 @@ def main() -> None:
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
         num_root_nodes=cfg.NUM_ROOT_NODES,
+        num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
-        compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
         class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
+        decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     ).to(device)
 
     if cfg.TORCH_COMPILE and device.type == "cuda":
@@ -170,22 +171,29 @@ def main() -> None:
     optimizer = cfg.OPTIMIZER_CLASS(model.parameters(), **cfg.OPTIMIZER_KWARGS)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Split forward into encode vs decode by wrapping the bound methods. The
-    # wrappers only time; they call straight through to the originals.
+    # Split forward into encode / compress / decode by wrapping the bound
+    # methods. The wrappers only time; they call straight through to the
+    # originals.
     timer = PhaseTimer(device)
     orig_encode = model.evaluate_graph_batch
-    orig_decode = model._decode_pipeline
+    orig_compress = model.compress
+    orig_decode = model.decode_latent
 
     def timed_encode(*a, **k):
         with timer.phase("encode"):
             return orig_encode(*a, **k)
+
+    def timed_compress(*a, **k):
+        with timer.phase("compress"):
+            return orig_compress(*a, **k)
 
     def timed_decode(*a, **k):
         with timer.phase("decode"):
             return orig_decode(*a, **k)
 
     model.evaluate_graph_batch = timed_encode
-    model._decode_pipeline = timed_decode
+    model.compress = timed_compress
+    model.decode_latent = timed_decode
 
     def make_graphs():
         return [
@@ -289,7 +297,15 @@ def main() -> None:
 
     w("PER-PHASE HOST TIME (CPU + kernel-launch overhead), ms/step")
     w("  phase            host_ms")
-    phase_order = ["gen", "forward", "encode", "decode", "backward", "optimizer"]
+    phase_order = [
+        "gen",
+        "forward",
+        "encode",
+        "compress",
+        "decode",
+        "backward",
+        "optimizer",
+    ]
     host_sum = 0.0
     for name in phase_order:
         if name in timer.host:
@@ -298,7 +314,10 @@ def main() -> None:
             if name in ("gen", "forward", "backward", "optimizer"):
                 host_sum += statistics.mean(vals)
     w(f"  {'(sum top-level)':14s} {host_sum:8.2f}")
-    w("    note: encode+decode are sub-phases of forward, not added to the sum.")
+    w(
+        "    note: encode/compress/decode are sub-phases of forward, "
+        "not added to the sum."
+    )
     w("")
 
     if device.type == "cuda":

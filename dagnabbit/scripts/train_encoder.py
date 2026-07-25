@@ -15,61 +15,34 @@ from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
     accuracy_summary,
     format_param_count,
-    log_decoder_accuracies,
     log_run_config,
     log_step_metrics,
+    pointer_accuracy_summary,
+    step_pointer_stats,
     step_preds_and_truth,
 )
-
-
-def _safe_mean(t: torch.Tensor) -> torch.Tensor:
-    return t.mean() if t.numel() else t.new_zeros(())
 
 
 def combine_losses(
     losses: TrainingStepLossReturnType,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    tf_pc_mean = losses.teacher_forced_primary_node_classification_losses.mean()
-    tf_pr_mean = _safe_mean(
-        losses.teacher_forced_primary_node_parent_reconstruction_losses
-    )
-    tf_pc_cons_mean = _safe_mean(
-        losses.teacher_forced_primary_node_parent_consistency_losses
-    )
-    single_pc_mean = losses.single_sample_primary_node_classification_losses.mean()
+    type_mean = losses.node_classification_losses.mean()
+    slot_mask = losses.parent_pointer_slot_mask
+    pointer_mean = losses.parent_pointer_losses.sum() / slot_mask.sum().clamp(min=1)
 
     total = cfg.GLOBAL_LOSS_MULTIPLIER * (
-        cfg.W_TF_PRIMARY_DECODED_CLASSIFICATION * tf_pc_mean
-        + cfg.W_PRIMARY_SINGLE_SAMPLE_CLASSIFICATION * single_pc_mean
-        + cfg.W_TF_PRIMARY_PARENT_RECONSTRUCTION * tf_pr_mean
-        + cfg.W_TF_PRIMARY_PARENT_CONSISTENCY * tf_pc_cons_mean
+        cfg.W_TYPE_CLASSIFICATION * type_mean
+        + cfg.W_PARENT_POINTER * pointer_mean
     )
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
-    # steps that actually log them, rather than every step.
+    # steps that actually log them, rather than every step. The classification
+    # tag is inherited from the old scheme's primary decode stream so new runs
+    # overlay old runs in TensorBoard.
     components = {
-        "tf_primary_decoded_classification": tf_pc_mean,
-        "single_sample_classification": single_pc_mean,
-        "tf_primary_parent_reconstruction": tf_pr_mean,
-        "tf_primary_parent_consistency": tf_pc_cons_mean,
+        "primary_decoded_classification": type_mean,
+        "parent_pointer": pointer_mean,
     }
-
-    # The aggregate (autoregressive-with-aggregation) stream is only computed when
-    # enabled; its loss tensors are otherwise zeros and must not be scored or
-    # logged. Fold it in only when the model actually ran it.
-    if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
-        pc_mean = losses.primary_node_classification_losses.mean()
-        pr_mean = _safe_mean(losses.primary_node_parent_reconstruction_losses)
-        pc_cons_mean = _safe_mean(losses.primary_node_parent_consistency_losses)
-        total = total + cfg.GLOBAL_LOSS_MULTIPLIER * (
-            cfg.W_PRIMARY_DECODED_CLASSIFICATION * pc_mean
-            + cfg.W_PRIMARY_PARENT_RECONSTRUCTION * pr_mean
-            + cfg.W_PRIMARY_PARENT_CONSISTENCY * pc_cons_mean
-        )
-        components["primary_decoded_classification"] = pc_mean
-        components["primary_parent_reconstruction"] = pr_mean
-        components["primary_parent_consistency"] = pc_cons_mean
-
     return total, components
 
 
@@ -96,10 +69,10 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
         model.node_encoder.forward_batch,
         **compile_kwargs,
     )
-    model.node_decoder.forward_batch = torch.compile(
-        model.node_decoder.forward_batch,
-        **compile_kwargs,
-    )
+    # The compressor/decoder run one dense fixed-shape [B, N, D] pass each per
+    # step, so they compile cleanly alongside the per-rank encoder kernel.
+    model.compressor = torch.compile(model.compressor, **compile_kwargs)
+    model.decoder = torch.compile(model.decoder, **compile_kwargs)
     compile_mode = cfg.TORCH_COMPILE_MODE if cfg.TORCH_COMPILE_CUDAGRAPHS else "default"
     print(
         "torch_compile=enabled "
@@ -306,17 +279,17 @@ def main() -> None:
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
         num_root_nodes=cfg.NUM_ROOT_NODES,
+        num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
-        compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
-        compute_aggregate_decode_pass=cfg.COMPUTE_AGGREGATE_DECODE_PASS,
         class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
+        decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     ).to(device)
 
     apply_torch_compile(model, device)
@@ -394,10 +367,8 @@ def main() -> None:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
         window_truth: list[np.ndarray] = []
-        tf_window_preds: list[np.ndarray] = []
-        tf_window_truth: list[np.ndarray] = []
-        single_window_preds: list[np.ndarray] = []
-        single_window_truth: list[np.ndarray] = []
+        pointer_window_correct: list[np.ndarray] = []
+        pointer_window_is_output: list[np.ndarray] = []
         loss_ema: float | None = None
         best_loss: float | None = resumed_best_loss
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
@@ -452,31 +423,21 @@ def main() -> None:
                 optimizer.zero_grad()
 
             if writer is not None:
-                # Aggregate stream is only populated when enabled; skip its
-                # accuracy bookkeeping otherwise (its logits are all zeros).
-                if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
-                    step_preds, step_truth = step_preds_and_truth(
-                        losses.primary_node_predicted_type_logits,
-                        losses.primary_node_true_types,
-                    )
-                    window_preds.append(step_preds)
-                    window_truth.append(step_truth)
-
-                # Teacher-forced predictions share the autoregressive true labels.
-                tf_step_preds, tf_step_truth = step_preds_and_truth(
-                    losses.teacher_forced_primary_node_predicted_type_logits,
-                    losses.primary_node_true_types,
+                step_preds, step_truth = step_preds_and_truth(
+                    losses.node_predicted_type_logits,
+                    losses.node_true_types,
                 )
-                tf_window_preds.append(tf_step_preds)
-                tf_window_truth.append(tf_step_truth)
+                window_preds.append(step_preds)
+                window_truth.append(step_truth)
 
-                # Single-sample stream shares the same true labels.
-                single_step_preds, single_step_truth = step_preds_and_truth(
-                    losses.single_sample_primary_node_predicted_type_logits,
-                    losses.primary_node_true_types,
+                step_correct, step_is_output = step_pointer_stats(
+                    losses.parent_pointer_logits,
+                    losses.parent_pointer_true_positions,
+                    losses.parent_pointer_slot_mask,
+                    output_start=model.output_start,
                 )
-                single_window_preds.append(single_step_preds)
-                single_window_truth.append(single_step_truth)
+                pointer_window_correct.append(step_correct)
+                pointer_window_is_output.append(step_is_output)
 
             loss_val = total.item()
             graphs_seen = (step + 1) * cfg.GRAPH_BATCH_SIZE
@@ -488,49 +449,21 @@ def main() -> None:
             progress.set_postfix(loss_ema=f"{loss_ema:.4g}", refresh=False)
 
             if writer is not None and step % cfg.LOG_EVERY == 0:
-                decoder_accuracy = None
-                decoder_supertype_accuracies = None
-                if cfg.COMPUTE_AGGREGATE_DECODE_PASS:
-                    (
-                        decoder_accuracy,
-                        decoder_supertype_accuracies,
-                    ) = accuracy_summary(
-                        np.concatenate(window_preds),
-                        np.concatenate(window_truth),
-                        num_classes=model.num_node_types,
+                decoder_accuracy, decoder_supertype_accuracies = accuracy_summary(
+                    np.concatenate(window_preds),
+                    np.concatenate(window_truth),
+                    num_classes=model.num_node_types,
+                )
+                window_preds.clear()
+                window_truth.clear()
+                pointer_accuracy, pointer_supertype_accuracies = (
+                    pointer_accuracy_summary(
+                        np.concatenate(pointer_window_correct),
+                        np.concatenate(pointer_window_is_output),
                     )
-                    window_preds.clear()
-                    window_truth.clear()
-                (
-                    tf_decoder_accuracy,
-                    tf_decoder_supertype_accuracies,
-                ) = accuracy_summary(
-                    np.concatenate(tf_window_preds),
-                    np.concatenate(tf_window_truth),
-                    num_classes=model.num_node_types,
                 )
-                (
-                    single_decoder_accuracy,
-                    single_decoder_supertype_accuracies,
-                ) = accuracy_summary(
-                    np.concatenate(single_window_preds),
-                    np.concatenate(single_window_truth),
-                    num_classes=model.num_node_types,
-                )
-                tf_window_preds.clear()
-                tf_window_truth.clear()
-                single_window_preds.clear()
-                single_window_truth.clear()
-                # Single-sample accuracy is the headline blind-decode-regime metric;
-                # log it next to the autoregressive and tf curves.
-                log_decoder_accuracies(
-                    writer,
-                    tensorboard_step,
-                    single_decoder_accuracy,
-                    single_decoder_supertype_accuracies,
-                    mean_tag="accuracy/single/decoder_mean",
-                    tag_prefix="accuracy/single",
-                )
+                pointer_window_correct.clear()
+                pointer_window_is_output.clear()
                 log_step_metrics(
                     writer,
                     tensorboard_step,
@@ -538,8 +471,8 @@ def main() -> None:
                     {name: value.item() for name, value in components.items()},
                     decoder_accuracy,
                     decoder_supertype_accuracies,
-                    tf_decoder_accuracy,
-                    tf_decoder_supertype_accuracies,
+                    pointer_accuracy,
+                    pointer_supertype_accuracies,
                     grad_norm=last_grad_norm,
                     grad_was_clipped=last_grad_was_clipped,
                     learning_rate=last_optimizer_lr,
