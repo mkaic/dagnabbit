@@ -103,6 +103,7 @@ def main() -> None:
     type_truth: list[np.ndarray] = []
     pointer_correct: list[np.ndarray] = []
     pointer_is_output: list[np.ndarray] = []
+    pointer_is_root_parent: list[np.ndarray] = []
     matches = 0
     total = 0
 
@@ -128,14 +129,16 @@ def main() -> None:
             )
             type_preds.append(preds)
             type_truth.append(truth)
-            correct, is_output = step_pointer_stats(
+            correct, is_output, is_root_parent = step_pointer_stats(
                 losses.parent_pointer_logits,
                 losses.parent_pointer_true_positions,
                 losses.parent_pointer_slot_mask,
                 output_start=model.output_start,
+                num_root_nodes=model.num_root_nodes,
             )
             pointer_correct.append(correct)
             pointer_is_output.append(is_output)
+            pointer_is_root_parent.append(is_root_parent)
 
             # Genuine generation path: predicted types decide slot counts.
             rebuilt = model.generate(model.encode_to_latent(graphs))
@@ -150,9 +153,12 @@ def main() -> None:
         np.concatenate(type_truth),
         num_classes=model.num_trunk_node_types,
     )
-    pointer_accuracy, pointer_by_supertype = pointer_accuracy_summary(
-        np.concatenate(pointer_correct),
-        np.concatenate(pointer_is_output),
+    pointer_accuracy, pointer_by_supertype, root_parent_accuracy = (
+        pointer_accuracy_summary(
+            np.concatenate(pointer_correct),
+            np.concatenate(pointer_is_output),
+            np.concatenate(pointer_is_root_parent),
+        )
     )
 
     print(f"graphs evaluated        {total}")
@@ -162,6 +168,7 @@ def main() -> None:
     print(f"pointer accuracy (valid slots)              {pointer_accuracy:.4f}")
     for supertype, accuracy in pointer_by_supertype.items():
         print(f"  pointer accuracy [{supertype.value:6s}]  {accuracy:.4f}")
+    print(f"root-parent pointer accuracy                {root_parent_accuracy:.4f}")
     print(f"exact graph match rate                      {matches / total:.4f}"
           f"  ({matches}/{total})")
 

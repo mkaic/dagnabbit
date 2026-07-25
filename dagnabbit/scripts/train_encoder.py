@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.description import NodeSupertype, make_random_graph_description
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
     accuracy_summary,
@@ -364,6 +364,7 @@ def main() -> None:
         window_truth: list[np.ndarray] = []
         pointer_window_correct: list[np.ndarray] = []
         pointer_window_is_output: list[np.ndarray] = []
+        pointer_window_is_root_parent: list[np.ndarray] = []
         loss_ema: float | None = None
         best_loss: float | None = resumed_best_loss
         loss_window: deque[float] = deque(maxlen=cfg.CHECK_BEST_EVERY)
@@ -425,14 +426,18 @@ def main() -> None:
                 window_preds.append(step_preds)
                 window_truth.append(step_truth)
 
-                step_correct, step_is_output = step_pointer_stats(
-                    losses.parent_pointer_logits,
-                    losses.parent_pointer_true_positions,
-                    losses.parent_pointer_slot_mask,
-                    output_start=model.output_start,
+                step_correct, step_is_output, step_is_root_parent = (
+                    step_pointer_stats(
+                        losses.parent_pointer_logits,
+                        losses.parent_pointer_true_positions,
+                        losses.parent_pointer_slot_mask,
+                        output_start=model.output_start,
+                        num_root_nodes=model.num_root_nodes,
+                    )
                 )
                 pointer_window_correct.append(step_correct)
                 pointer_window_is_output.append(step_is_output)
+                pointer_window_is_root_parent.append(step_is_root_parent)
 
             loss_val = total.item()
             graphs_seen = (step + 1) * cfg.GRAPH_BATCH_SIZE
@@ -451,14 +456,27 @@ def main() -> None:
                 )
                 window_preds.clear()
                 window_truth.clear()
-                pointer_accuracy, pointer_supertype_accuracies = (
-                    pointer_accuracy_summary(
-                        np.concatenate(pointer_window_correct),
-                        np.concatenate(pointer_window_is_output),
-                    )
+                (
+                    pointer_accuracy,
+                    pointer_supertype_accuracies,
+                    root_parent_accuracy,
+                ) = pointer_accuracy_summary(
+                    np.concatenate(pointer_window_correct),
+                    np.concatenate(pointer_window_is_output),
+                    np.concatenate(pointer_window_is_root_parent),
                 )
                 pointer_window_correct.clear()
                 pointer_window_is_output.clear()
+                pointer_window_is_root_parent.clear()
+                # Root identity is never classified anymore, but root-parented
+                # slots selecting the right root through the pointer head carry
+                # the same information; log it as accuracy/root so the old
+                # curve's role continues. (It stays out of accuracy/pointer's
+                # mean, which stays a plain fraction over all valid slots.)
+                if not np.isnan(root_parent_accuracy):
+                    decoder_supertype_accuracies[NodeSupertype.ROOT] = (
+                        root_parent_accuracy
+                    )
                 log_step_metrics(
                     writer,
                     tensorboard_step,

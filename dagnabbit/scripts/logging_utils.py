@@ -36,14 +36,17 @@ def step_pointer_stats(
     true_positions: torch.Tensor,
     slot_mask: torch.Tensor,
     output_start: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    num_root_nodes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-slot pointer correctness for one step, flattened over valid slots.
 
     ``pointer_logits`` is ``[B, N, S, N]``, ``true_positions`` and
-    ``slot_mask`` are ``[B, N, S]``. Returns ``(correct, is_output)`` boolean
-    arrays over valid slots only: ``correct`` marks slots whose argmax matches
-    the true parent position; ``is_output`` marks slots belonging to output
-    positions (``>= output_start``), the rest belong to trunk positions.
+    ``slot_mask`` are ``[B, N, S]``. Returns ``(correct, is_output,
+    is_root_parent)`` boolean arrays over valid slots only: ``correct`` marks
+    slots whose argmax matches the true parent position; ``is_output`` marks
+    slots belonging to output positions (``>= output_start``), the rest
+    belong to trunk positions; ``is_root_parent`` marks slots whose *true
+    parent* is a root node (canonical position ``< num_root_nodes``).
     """
     predicted = pointer_logits.detach().argmax(dim=-1)
     correct = predicted == true_positions
@@ -52,22 +55,32 @@ def step_pointer_stats(
         torch.arange(num_positions, device=slot_mask.device)[None, :, None]
         >= output_start
     ).expand_as(slot_mask)
+    is_root_parent = true_positions < num_root_nodes
 
     valid = slot_mask.detach().reshape(-1).cpu().numpy()
     correct_np = correct.reshape(-1).cpu().numpy()[valid]
     is_output_np = is_output.reshape(-1).cpu().numpy()[valid]
-    return correct_np, is_output_np
+    is_root_parent_np = is_root_parent.reshape(-1).cpu().numpy()[valid]
+    return correct_np, is_output_np, is_root_parent_np
 
 
 def pointer_accuracy_summary(
     correct: np.ndarray,
     is_output: np.ndarray,
-) -> tuple[float, dict[NodeSupertype, float]]:
-    """Overall and per-supertype pointer accuracy over a logging window.
+    is_root_parent: np.ndarray,
+) -> tuple[float, dict[NodeSupertype, float], float]:
+    """Pointer accuracies over a logging window.
 
     Unlike :func:`accuracy_summary`, the mean here is the plain fraction of
     valid slots pointed at the right parent (there is no class axis to
     balance). Groups split by consumer supertype: trunk vs output positions.
+
+    The third return is the root-parent accuracy: among slots whose true
+    parent is a root node, the fraction that select exactly that root in that
+    slot. Root identity is no longer classified directly, but this measures
+    the same recoverable information through the pointer head; it is logged
+    as ``accuracy/root`` to continue the old curve's role. NaN when the
+    window contains no root-parented slots.
     """
     mean = float(correct.mean()) if correct.size else float("nan")
     by_supertype: dict[NodeSupertype, float] = {}
@@ -76,7 +89,12 @@ def pointer_accuracy_summary(
         by_supertype[NodeSupertype.TRUNK] = float(correct[trunk_mask].mean())
     if is_output.any():
         by_supertype[NodeSupertype.OUTPUT] = float(correct[is_output].mean())
-    return mean, by_supertype
+    root_parent_accuracy = (
+        float(correct[is_root_parent].mean())
+        if is_root_parent.any()
+        else float("nan")
+    )
+    return mean, by_supertype, root_parent_accuracy
 
 
 def accuracy_summary(
