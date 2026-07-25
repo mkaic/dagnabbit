@@ -17,13 +17,10 @@ MLP_EXPANSION_FACTOR = 4.0
 # that latent plus mask tokens.
 COMPRESSOR_NUM_LAYERS = 4
 DECODER_NUM_LAYERS = 4
-# Shared residual transformer settings for the encoder and decoder.
-TRANSFORMER_NUM_LAYERS = 2
-# Number of expanded hidden layers inside each transformer feed-forward MLP.
-TRANSFORMER_MLP_DEPTH = 1
-TRANSFORMER_NUM_REGISTER_TOKENS = 2
-TRANSFORMER_NUM_HEADS = 16
-TRANSFORMER_DROPOUT = 0.0
+# Layer count for the recursive structural encoder's shared per-node
+# transformer. The remaining block geometry (64-wide attention heads, MLP
+# depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
+ENCODER_NUM_LAYERS = 2
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,

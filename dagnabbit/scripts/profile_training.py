@@ -154,11 +154,7 @@ def main() -> None:
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
         class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
-        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
-        transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
-        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
-        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
-        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        encoder_num_layers=cfg.ENCODER_NUM_LAYERS,
         compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
         decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     ).to(device)
@@ -281,7 +277,7 @@ def main() -> None:
     )
     w(
         f"embedding_dim    {cfg.NODE_EMBEDDING_DIM}  layers "
-        f"{cfg.TRANSFORMER_NUM_LAYERS}  heads {cfg.TRANSFORMER_NUM_HEADS}"
+        f"{cfg.ENCODER_NUM_LAYERS}  heads {model.num_attention_heads}"
     )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")

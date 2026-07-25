@@ -39,11 +39,7 @@ def build_model() -> DagnabbitAutoEncoder:
         num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
-        transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
-        transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
-        transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
-        transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        encoder_num_layers=cfg.ENCODER_NUM_LAYERS,
         compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
         decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     )

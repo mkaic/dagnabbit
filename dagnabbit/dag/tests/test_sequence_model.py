@@ -31,10 +31,7 @@ def build_small_model() -> DagnabbitAutoEncoder:
         num_trunk_nodes=NUM_TRUNKS,
         num_output_nodes=NUM_OUTPUTS,
         mlp_expansion_factor=2.0,
-        transformer_num_layers=1,
-        transformer_mlp_depth=1,
-        transformer_num_register_tokens=1,
-        transformer_num_heads=4,
+        encoder_num_layers=1,
         compressor_num_layers=2,
         decoder_num_layers=2,
     )

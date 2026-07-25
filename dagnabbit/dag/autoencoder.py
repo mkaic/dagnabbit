@@ -12,6 +12,14 @@ from dagnabbit.dag.description import (
     PreparedRankBatch,
 )
 
+# Fixed transformer geometry shared by all three transformer stacks (encoder,
+# compressor, decoder). Head count is derived from the embedding dim so every
+# attention head is always the standard 64-wide.
+ATTENTION_HEAD_DIM = 64
+TRANSFORMER_MLP_DEPTH = 1
+TRANSFORMER_NUM_REGISTER_TOKENS = 2
+TRANSFORMER_DROPOUT = 0.0
+
 
 def _feed_forward_layers(
     vector_dims: Iterable[int],
@@ -312,15 +320,19 @@ class DagnabbitAutoEncoder(nn.Module):
         num_output_nodes: int,
         mlp_expansion_factor: float,
         class_balanced_classification_losses: bool = False,
-        transformer_num_layers: int = 1,
-        transformer_mlp_depth: int = 1,
-        transformer_num_register_tokens: int = 2,
-        transformer_num_heads: int = 4,
-        transformer_dropout: float = 0.0,
+        encoder_num_layers: int = 1,
         compressor_num_layers: int = 4,
         decoder_num_layers: int = 4,
     ):
         super().__init__()
+
+        if node_embedding_dim % ATTENTION_HEAD_DIM != 0:
+            raise ValueError(
+                "node_embedding_dim must be a multiple of the fixed "
+                f"{ATTENTION_HEAD_DIM}-wide attention head dim; got "
+                f"{node_embedding_dim}"
+            )
+        num_attention_heads = node_embedding_dim // ATTENTION_HEAD_DIM
 
         if isinstance(trunk_node_type_in_degrees, int):
             trunk_node_type_in_degrees = [
@@ -348,11 +360,8 @@ class DagnabbitAutoEncoder(nn.Module):
             class_balanced_classification_losses
         )
         self.maximum_indegree = max([1, *self.trunk_node_in_degrees])
-        self.transformer_num_layers = transformer_num_layers
-        self.transformer_mlp_depth = transformer_mlp_depth
-        self.transformer_num_register_tokens = transformer_num_register_tokens
-        self.transformer_num_heads = transformer_num_heads
-        self.transformer_dropout = transformer_dropout
+        self.encoder_num_layers = encoder_num_layers
+        self.num_attention_heads = num_attention_heads
         self.compressor_num_layers = compressor_num_layers
         self.decoder_num_layers = decoder_num_layers
 
@@ -366,12 +375,12 @@ class DagnabbitAutoEncoder(nn.Module):
                 node_embedding_dim=node_embedding_dim,
                 num_node_types=self.num_node_types,
                 max_context_length=self.maximum_indegree,
-                num_layers=self.transformer_num_layers,
-                num_register_tokens=transformer_num_register_tokens,
-                num_heads=transformer_num_heads,
-                transformer_mlp_depth=transformer_mlp_depth,
+                num_layers=encoder_num_layers,
+                num_register_tokens=TRANSFORMER_NUM_REGISTER_TOKENS,
+                num_heads=num_attention_heads,
+                transformer_mlp_depth=TRANSFORMER_MLP_DEPTH,
                 mlp_expansion_factor=mlp_expansion_factor,
-                dropout=transformer_dropout,
+                dropout=TRANSFORMER_DROPOUT,
             )
         )
 
@@ -386,10 +395,10 @@ class DagnabbitAutoEncoder(nn.Module):
         # have their own weights and layer counts.
         sequence_block_kwargs = dict(
             node_embedding_dim=node_embedding_dim,
-            num_heads=transformer_num_heads,
-            transformer_mlp_depth=transformer_mlp_depth,
+            num_heads=num_attention_heads,
+            transformer_mlp_depth=TRANSFORMER_MLP_DEPTH,
             mlp_expansion_factor=mlp_expansion_factor,
-            dropout=transformer_dropout,
+            dropout=TRANSFORMER_DROPOUT,
         )
         self.compressor = SequenceTransformer(
             num_layers=compressor_num_layers,
