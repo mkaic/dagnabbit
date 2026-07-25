@@ -9,15 +9,17 @@ def main() -> None:
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
         num_root_nodes=cfg.NUM_ROOT_NODES,
+        num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
-        compute_reconstruction_loss=cfg.COMPUTE_RECONSTRUCTION_LOSS,
+        class_balanced_classification_losses=cfg.CLASS_BALANCED_CLASSIFICATION_LOSSES,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
+        decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)

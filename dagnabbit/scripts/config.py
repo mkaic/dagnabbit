@@ -11,6 +11,12 @@ NUM_TRUNK_NODES = 128
 # Hidden-layer width as a multiplicative expansion factor of each transformer
 # feed-forward input dim.
 MLP_EXPANSION_FACTOR = 4.0
+# Layer counts for the dense sequence-space transformers that replace the old
+# recursive decode: the Compressor squeezes the canonical node sequence into
+# the output-position latent; the Decoder reconstructs the full sequence from
+# that latent plus mask tokens.
+COMPRESSOR_NUM_LAYERS = 4
+DECODER_NUM_LAYERS = 4
 # Shared residual transformer settings for the encoder and decoder.
 TRANSFORMER_NUM_LAYERS = 2
 # Number of expanded hidden layers inside each transformer feed-forward MLP.

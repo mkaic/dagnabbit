@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -8,9 +9,7 @@ from torch import Tensor
 
 from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
-    NodeSupertype,
     PreparedRankBatch,
-    subtype_to_supertype,
 )
 
 
@@ -208,120 +207,88 @@ class TransformerNodeEncoder(nn.Module):
         return self.output_norm(pooled)
 
 
-class TransformerNodeDecoder(nn.Module):
+def sinusoidal_position_encodings(length: int, dim: int) -> Tensor:
+    """Fixed sin/cos position table [length, dim] (Vaswani et al. layout)."""
+    if dim % 2 != 0:
+        raise ValueError("dim must be even for sinusoidal position encodings")
+    positions = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+    frequencies = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
+    )
+    encodings = torch.zeros(length, dim)
+    encodings[:, 0::2] = torch.sin(positions * frequencies)
+    encodings[:, 1::2] = torch.cos(positions * frequencies)
+    return encodings
+
+
+class SequenceTransformer(nn.Module):
+    """Plain bidirectional transformer over the full canonical token sequence.
+
+    A stack of the shared pre-norm :class:`TransformerBlock`s with a final
+    LayerNorm. No causal mask and no padding: every graph in a batch has the
+    same fixed node count, so attention runs dense over all positions
+    (``nn.MultiheadAttention`` routes through ``scaled_dot_product_attention``).
+    """
+
     def __init__(
         self,
-        sequence_transformer: TypeConditionedSequenceTransformer,
-        num_parent_slots: int,
-        num_leaf_context_slots: int,
+        node_embedding_dim: int,
+        num_layers: int,
+        num_heads: int,
+        transformer_mlp_depth: int,
+        mlp_expansion_factor: float,
+        dropout: float = 0.0,
     ):
         super().__init__()
-        self.sequence_transformer = sequence_transformer
-        self.num_parent_slots = num_parent_slots
-        self.num_leaf_context_slots = num_leaf_context_slots
-
-        if num_parent_slots <= 0:
-            raise ValueError("num_parent_slots must be positive")
-        if num_leaf_context_slots < 0:
-            raise ValueError("num_leaf_context_slots must be non-negative")
-
-        expected_context_length = num_parent_slots + num_leaf_context_slots
-        if sequence_transformer.max_context_length != expected_context_length:
-            raise ValueError(
-                "decoder transformer context length must equal parent slots plus "
-                "leaf context slots; got "
-                f"{sequence_transformer.max_context_length} vs "
-                f"{expected_context_length}"
-            )
-
-    def forward_batch(
-        self,
-        node_embeddings: Tensor,
-        subtypes: Tensor,
-        leaf_embeddings: Tensor,
-    ) -> Tensor:
-        if node_embeddings.ndim != 2:
-            raise ValueError("node_embeddings must have shape [B, D]")
-        batch_size, embedding_dim = node_embeddings.shape
-        if embedding_dim != self.sequence_transformer.node_embedding_dim:
-            raise ValueError(
-                "node_embeddings embedding dim must be "
-                f"{self.sequence_transformer.node_embedding_dim}; got {embedding_dim}"
-            )
-
-        local_context = node_embeddings.unsqueeze(1).expand(
-            -1,
-            self.num_parent_slots,
-            -1,
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    node_embedding_dim=node_embedding_dim,
+                    num_heads=num_heads,
+                    transformer_mlp_depth=transformer_mlp_depth,
+                    mlp_expansion_factor=mlp_expansion_factor,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        leaf_context = self._prepare_leaf_context(leaf_embeddings, node_embeddings)
-        context = torch.cat([local_context, leaf_context], dim=1)
-        transformed = self.sequence_transformer(context, subtypes)
-        return transformed[:, : self.num_parent_slots]
+        self.output_norm = nn.LayerNorm(node_embedding_dim)
 
-    def _prepare_leaf_context(
-        self,
-        leaf_embeddings: Tensor,
-        node_embeddings: Tensor,
-    ) -> Tensor:
-        return leaf_embeddings.to(
-            device=node_embeddings.device,
-            dtype=node_embeddings.dtype,
-        )
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 3:
+            raise ValueError("x must have shape [B, N, D]")
+        for block in self.blocks:
+            x = block(x, None)
+        return self.output_norm(x)
 
 
 @dataclass
 class TrainingStepLossReturnType:
-    # Node-aligned tensor over the primary graph batch: [B, N].
-    primary_node_classification_losses: Tensor
-    # Raw per-node logits and true type labels for downstream diagnostics.
-    # ``primary_node_predicted_type_logits[b, i]`` corresponds to
-    # ``primary_node_true_types[b, i]``.
-    primary_node_predicted_type_logits: Tensor
-    primary_node_true_types: Tensor
-    # Teacher-forced counterparts (same node alignment, same true labels). These
-    # come from a second decode pass that feeds each node its true encode
-    # embedding instead of its own prediction; see
-    # ``DagnabbitAutoEncoder._decode_pipeline``.
-    teacher_forced_primary_node_classification_losses: Tensor
-    teacher_forced_primary_node_predicted_type_logits: Tensor
-    # Per-edge reconstruction: 1 - cos(predicted_parent, encoder_buffer[parent]).
-    # Edge-flat 1-D tensor (empty when no edges exist in the graph).
-    primary_node_parent_reconstruction_losses: Tensor
-    teacher_forced_primary_node_parent_reconstruction_losses: Tensor
-    # Per-node consistency: variance of predictions landing on the same parent,
-    # averaged over D. Node-indexed [B, N] tensor; zero for count <= 1 nodes.
-    primary_node_parent_consistency_losses: Tensor
-    teacher_forced_primary_node_parent_consistency_losses: Tensor
-    # Single-sample autoregressive stream: a third decode pass where each node is
-    # fed exactly one uniformly-sampled child prediction (no aggregation), passed
-    # forward down the DAG. This trains the decoder/classifier to be accurate from
-    # a single compounded embedding -- the blind-decode regime -- rather than only
-    # from the denoised aggregate. Same node alignment / true labels as above.
-    single_sample_primary_node_classification_losses: Tensor
-    single_sample_primary_node_predicted_type_logits: Tensor
+    """Per-position/per-slot training losses for one graph batch.
 
+    Every tensor's position axis is the graph's canonical sequence order
+    (roots first, outputs last), not original node-storage order.
+    """
 
-@dataclass
-class _DecodePipelineResult:
-    """Dense per-node outputs of a single decode pass over the primary graph."""
-
-    primary_combined: Tensor
-    primary_logits: Tensor
-    primary_class_losses: Tensor
-    # Edge-flat 1-D tensor of per-edge reconstruction losses.
-    primary_recon: Tensor
-    # Node-indexed 1-D tensor of per-parent consistency losses (zero for count<=1).
-    primary_consistency: Tensor
-
-
-@dataclass
-class _SingleSampleResult:
-    """Dense per-node outputs of the single-sample autoregressive decode pass."""
-
-    primary_combined: Tensor
-    primary_logits: Tensor
-    primary_class_losses: Tensor
+    # [B, N] per-position type cross-entropy (class-balance weighted when the
+    # model flag is enabled).
+    node_classification_losses: Tensor
+    # [B, N, num_node_types] raw classifier logits over reconstructed
+    # embeddings; ``node_true_types`` is the aligned [B, N] label tensor.
+    node_predicted_type_logits: Tensor
+    node_true_types: Tensor
+    # [B, N, S] per-slot parent-pointer cross-entropy. Invalid slots (roots,
+    # padding beyond a type's in-degree) are exactly zero.
+    parent_pointer_losses: Tensor
+    # [B, N, S, N] pointer logits; -inf outside each position's candidate set
+    # (strictly-earlier, non-output positions).
+    parent_pointer_logits: Tensor
+    # [B, N, S] true parent canonical positions (0-padded) and the matching
+    # slot-validity mask.
+    parent_pointer_true_positions: Tensor
+    parent_pointer_slot_mask: Tensor
 
 
 @dataclass
@@ -334,24 +301,6 @@ class _BatchedRank:
     has_valid_parents: bool = False
 
 
-@dataclass
-class _DecodeNode:
-    id: int
-    embedding: Tensor
-    type_id: int | None
-    is_root: bool
-    is_output: bool
-    parents: list[int | None]
-    expanded: bool = False
-
-
-@dataclass
-class _ParentPrediction:
-    child_id: int
-    slot: int
-    embedding: Tensor
-
-
 class DagnabbitAutoEncoder(nn.Module):
     def __init__(
         self,
@@ -359,17 +308,17 @@ class DagnabbitAutoEncoder(nn.Module):
         trunk_node_type_in_degrees: int | list[int],
         num_trunk_node_types: int,
         num_root_nodes: int,
+        num_trunk_nodes: int,
         num_output_nodes: int,
         mlp_expansion_factor: float,
-        reconstruction_detach_target: bool = True,
-        compute_reconstruction_loss: bool = False,
-        compute_aggregate_decode_pass: bool = True,
         class_balanced_classification_losses: bool = False,
         transformer_num_layers: int = 1,
         transformer_mlp_depth: int = 1,
         transformer_num_register_tokens: int = 2,
         transformer_num_heads: int = 4,
         transformer_dropout: float = 0.0,
+        compressor_num_layers: int = 4,
+        decoder_num_layers: int = 4,
     ):
         super().__init__()
 
@@ -382,16 +331,19 @@ class DagnabbitAutoEncoder(nn.Module):
         self.node_embedding_dim = node_embedding_dim
         self.num_trunk_node_types = num_trunk_node_types
         self.num_root_nodes = num_root_nodes
+        self.num_trunk_nodes = num_trunk_nodes
         self.num_output_nodes = num_output_nodes
         self.trunk_node_in_degrees = trunk_node_type_in_degrees
         # All output nodes share one output class (they are identifiable by their
         # fixed slot positions), so outputs contribute a single type index rather
         # than one per output slot.
         self.num_node_types = num_trunk_node_types + num_root_nodes + 1
+        # The canonical sequence has a fixed length and layout: roots at
+        # positions [0, R), trunks at [R, output_start), outputs at
+        # [output_start, num_nodes).
+        self.num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
+        self.output_start = num_root_nodes + num_trunk_nodes
         self.mlp_expansion_factor = mlp_expansion_factor
-        self.reconstruction_detach_target = reconstruction_detach_target
-        self.compute_reconstruction_loss = compute_reconstruction_loss
-        self.compute_aggregate_decode_pass = compute_aggregate_decode_pass
         self.class_balanced_classification_losses = (
             class_balanced_classification_losses
         )
@@ -401,14 +353,14 @@ class DagnabbitAutoEncoder(nn.Module):
         self.transformer_num_register_tokens = transformer_num_register_tokens
         self.transformer_num_heads = transformer_num_heads
         self.transformer_dropout = transformer_dropout
+        self.compressor_num_layers = compressor_num_layers
+        self.decoder_num_layers = decoder_num_layers
 
-        # ---- Shared, type-conditioned node transformers ----
-        # The encoder public context is the ordered parent-slot sequence padded
-        # to maximum_indegree. The decoder public context starts with those same
-        # parent-output slots, then appends one auxiliary slot per graph leaf
-        # (the fixed output nodes in generated graphs). Each transformer appends
-        # its own registers and one node-type token internally, so all trunk and
-        # output types share weights.
+        # ---- Recursive structural encoder (unchanged from the old scheme) ----
+        # The public context is the ordered parent-slot sequence padded to
+        # maximum_indegree; the transformer appends its own registers and one
+        # node-type token internally, so all trunk and output types share
+        # weights.
         self.node_encoder = TransformerNodeEncoder(
             TypeConditionedSequenceTransformer(
                 node_embedding_dim=node_embedding_dim,
@@ -422,31 +374,64 @@ class DagnabbitAutoEncoder(nn.Module):
                 dropout=transformer_dropout,
             )
         )
-        self.node_decoder = TransformerNodeDecoder(
-            TypeConditionedSequenceTransformer(
-                node_embedding_dim=node_embedding_dim,
-                num_node_types=self.num_node_types,
-                max_context_length=self.maximum_indegree + self.num_output_nodes,
-                num_layers=self.transformer_num_layers,
-                num_register_tokens=transformer_num_register_tokens,
-                num_heads=transformer_num_heads,
-                transformer_mlp_depth=transformer_mlp_depth,
-                mlp_expansion_factor=mlp_expansion_factor,
-                dropout=transformer_dropout,
-            ),
-            num_parent_slots=self.maximum_indegree,
-            num_leaf_context_slots=self.num_output_nodes,
-        )
 
         # ---- Root node embeddings ----
         self.root_node_embeddings = nn.Embedding(
             self.num_root_nodes, self.node_embedding_dim
         )
 
-        # ---- Auxiliary node-type prediction head ----
+        # ---- Sequence-space compressor and decoder ----
+        # Both are dense bidirectional transformers over the fixed-length
+        # canonical sequence; they share block geometry with the encoder but
+        # have their own weights and layer counts.
+        sequence_block_kwargs = dict(
+            node_embedding_dim=node_embedding_dim,
+            num_heads=transformer_num_heads,
+            transformer_mlp_depth=transformer_mlp_depth,
+            mlp_expansion_factor=mlp_expansion_factor,
+            dropout=transformer_dropout,
+        )
+        self.compressor = SequenceTransformer(
+            num_layers=compressor_num_layers,
+            **sequence_block_kwargs,
+        )
+        self.decoder = SequenceTransformer(
+            num_layers=decoder_num_layers,
+            **sequence_block_kwargs,
+        )
+        # Shared learned placeholder for all masked (non-output) decoder input
+        # positions; position identity comes from the additive posenc.
+        self.mask_token = nn.Parameter(torch.empty(node_embedding_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+        self.register_buffer(
+            "position_encodings",
+            sinusoidal_position_encodings(self.num_nodes, node_embedding_dim),
+            persistent=False,
+        )
+        # Pointer candidates for position i: strictly-earlier positions that
+        # are not outputs (outputs are leaves and can never be parents).
+        positions = torch.arange(self.num_nodes)
+        self.register_buffer(
+            "pointer_candidate_mask",
+            (positions[None, :] < positions[:, None])
+            & (positions[None, :] < self.output_start),
+            persistent=False,
+        )
+
+        # ---- Heads ----
         self.node_type_predictor = nn.Linear(
             self.node_embedding_dim,
             self.num_node_types,
+        )
+        # One key projector shared by all positions; one query projector per
+        # input-slot index (type-agnostic -- slot 0 always uses projector 0,
+        # and a node's type only decides how many slots are active).
+        self.pointer_key_proj = nn.Linear(node_embedding_dim, node_embedding_dim)
+        self.pointer_slot_query_projs = nn.ModuleList(
+            [
+                nn.Linear(node_embedding_dim, node_embedding_dim)
+                for _ in range(self.maximum_indegree)
+            ]
         )
 
     def _class_balance_weights(self, labels: Tensor) -> Tensor:
@@ -672,24 +657,111 @@ class DagnabbitAutoEncoder(nn.Module):
             return 1
         raise ValueError(f"unknown node type {node_type}")
 
+    def _stacked_canonical_tensors(
+        self,
+        graphs: Sequence[FixedInDegreeDAGDescription],
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Stack each graph's cached canonical tensors into device batches."""
+        order = torch.stack(
+            [graph.canonical_order_tensor for graph in graphs]
+        ).to(device=device, non_blocking=True)
+        labels = torch.stack(
+            [graph.canonical_node_types for graph in graphs]
+        ).to(device=device, non_blocking=True)
+        parent_positions = torch.stack(
+            [graph.canonical_parent_positions for graph in graphs]
+        ).to(device=device, non_blocking=True)
+        slot_mask = torch.stack(
+            [graph.canonical_parent_slot_mask for graph in graphs]
+        ).to(device=device, non_blocking=True)
+        return order, labels, parent_positions, slot_mask
+
+    def compress(self, sequence: Tensor) -> Tensor:
+        """Canonical node-embedding sequence [B, N, D] -> graph latent [B, K, D].
+
+        The latent is the compressor's output at the K fixed output-node
+        positions (the tail of the canonical sequence); everything else is
+        discarded.
+        """
+        if sequence.ndim != 3 or sequence.shape[1:] != (
+            self.num_nodes,
+            self.node_embedding_dim,
+        ):
+            raise ValueError(
+                "sequence must have shape [B, "
+                f"{self.num_nodes}, {self.node_embedding_dim}]"
+            )
+        posenc = self.position_encodings.to(dtype=sequence.dtype)
+        compressed = self.compressor(sequence + posenc)
+        return compressed[:, self.output_start :]
+
+    def decode_latent(self, latent: Tensor) -> Tensor:
+        """Graph latent [B, K, D] -> reconstructed embeddings [B, N, D].
+
+        Non-output positions are filled with the shared learned mask token;
+        the latent tokens sit at their fixed output positions at the end of
+        the sequence. Additive sinusoidal posenc gives every token (masked or
+        latent) its position identity.
+        """
+        if latent.ndim != 3 or latent.shape[1:] != (
+            self.num_output_nodes,
+            self.node_embedding_dim,
+        ):
+            raise ValueError(
+                "latent must have shape [B, "
+                f"{self.num_output_nodes}, {self.node_embedding_dim}]"
+            )
+        batch_size = latent.shape[0]
+        placeholders = self.mask_token.to(latent.dtype).expand(
+            batch_size,
+            self.output_start,
+            -1,
+        )
+        tokens = torch.cat([placeholders, latent], dim=1)
+        posenc = self.position_encodings.to(dtype=latent.dtype)
+        return self.decoder(tokens + posenc)
+
+    def parent_pointer_logits(self, reconstructed: Tensor) -> Tensor:
+        """Reconstructed embeddings [B, N, D] -> pointer logits [B, N, S, N].
+
+        Position i's slot-s query is a slot-specific projection of its
+        reconstructed embedding; keys are one shared projection of all
+        positions. Non-candidate keys (j >= i, or j in the output block) are
+        -inf, so a softmax over the last axis is a distribution over exactly
+        the positions that may legally be parents of i.
+        """
+        keys = self.pointer_key_proj(reconstructed)
+        queries = torch.stack(
+            [proj(reconstructed) for proj in self.pointer_slot_query_projs],
+            dim=2,
+        )
+        logits = torch.einsum("bisd,bjd->bisj", queries, keys) / math.sqrt(
+            self.node_embedding_dim
+        )
+        candidate = self.pointer_candidate_mask.view(
+            1, self.num_nodes, 1, self.num_nodes
+        )
+        return logits.masked_fill(~candidate, float("-inf"))
+
     def training_forward_batch(
         self,
         primary_graphs: Sequence[FixedInDegreeDAGDescription],
         return_buffers: bool = False,
     ) -> (
         TrainingStepLossReturnType
-        | tuple[
-            TrainingStepLossReturnType,
-            Tensor,
-            Tensor,
-        ]
+        | tuple[TrainingStepLossReturnType, Tensor, Tensor]
     ):
-        """Batched training forward over multiple structurally compatible DAGs.
+        """Batched training forward over structurally compatible DAGs.
 
-        Per-node outputs keep an explicit ``[B, N, ...]`` graph-batch dimension.
-        Reconstruction losses remain edge-flat across the whole graph batch.
+        Encode recursively, line the node embeddings up in canonical
+        topological order, compress to the output-position latent, decode the
+        masked sequence, then score node-type classification at every position
+        and parent-pointer prediction at every valid input slot.
+
+        With ``return_buffers`` the encoder buffer (original node order) and
+        the reconstructed sequence (canonical order) are returned as well.
         """
-
         primary_graphs = list(primary_graphs)
         device = self.root_node_embeddings.weight.device
         rank_batches = self._make_batched_rank_cache(primary_graphs, device)
@@ -697,982 +769,59 @@ class DagnabbitAutoEncoder(nn.Module):
             graphs=primary_graphs,
             rank_batches=rank_batches,
         )
+        batch_size, num_nodes, _ = primary_buffer.shape
+        if num_nodes != self.num_nodes:
+            raise ValueError(
+                f"graphs have {num_nodes} nodes, but model expects {self.num_nodes}"
+            )
 
-        device = primary_buffer.device
-        primary_labels = torch.stack(
-            [graph.node_types_tensor for graph in primary_graphs],
-            dim=0,
-        ).to(device=device, non_blocking=True)
-
-        # Optional inverse-frequency class-balance weights, shared by all decode
-        # streams (same graph, same node types). ``None`` means plain per-node
-        # cross-entropy.
-        primary_weights = (
-            self._class_balance_weights(primary_labels)
-            if self.class_balanced_classification_losses
-            else None
+        order, labels, parent_positions, slot_mask = self._stacked_canonical_tensors(
+            primary_graphs, device
         )
+        batch_rows = torch.arange(batch_size, dtype=torch.long, device=device)[:, None]
+        sequence = primary_buffer[batch_rows, order]
 
-        # Two decode passes over the same shared encode pass. The
-        # autoregressive pass compounds predictions down each DAG; the
-        # teacher-forced pass decodes each node from its true encode-side
-        # embedding. Both passes are processed together rank-by-rank.
-        autoregressive, teacher_forced, single_sample = self._decode_pipeline(
-            primary_graphs=primary_graphs,
-            primary_buffer=primary_buffer,
-            primary_labels=primary_labels,
-            primary_weights=primary_weights,
-            rank_batches=rank_batches,
-            device=device,
+        latent = self.compress(sequence)
+        reconstructed = self.decode_latent(latent)
+
+        type_logits = self.node_type_predictor(reconstructed)
+        class_losses = F.cross_entropy(
+            type_logits.reshape(-1, self.num_node_types),
+            labels.reshape(-1),
+            reduction="none",
+        ).reshape(batch_size, num_nodes)
+        if self.class_balanced_classification_losses:
+            class_losses = class_losses * self._class_balance_weights(labels).to(
+                class_losses.dtype
+            )
+
+        pointer_logits = self.parent_pointer_logits(reconstructed)
+        # Invalid slots (roots, padding beyond a type's in-degree) can have
+        # fully -inf candidate rows (position 0) or meaningless finite rows;
+        # zero their logits so cross_entropy stays finite everywhere, then
+        # zero their losses via the slot mask. Valid rows keep their -inf
+        # non-candidates, which softmax treats as exact zeros.
+        safe_logits = torch.where(
+            slot_mask.unsqueeze(-1),
+            pointer_logits,
+            torch.zeros_like(pointer_logits),
         )
+        pointer_losses = F.cross_entropy(
+            safe_logits.reshape(-1, num_nodes),
+            parent_positions.reshape(-1),
+            reduction="none",
+        ).reshape(batch_size, num_nodes, self.maximum_indegree)
+        pointer_losses = pointer_losses * slot_mask.to(pointer_losses.dtype)
 
         losses = TrainingStepLossReturnType(
-            primary_node_classification_losses=autoregressive.primary_class_losses,
-            primary_node_predicted_type_logits=autoregressive.primary_logits,
-            primary_node_true_types=primary_labels,
-            teacher_forced_primary_node_classification_losses=(
-                teacher_forced.primary_class_losses
-            ),
-            teacher_forced_primary_node_predicted_type_logits=(
-                teacher_forced.primary_logits
-            ),
-            primary_node_parent_reconstruction_losses=autoregressive.primary_recon,
-            teacher_forced_primary_node_parent_reconstruction_losses=(
-                teacher_forced.primary_recon
-            ),
-            primary_node_parent_consistency_losses=autoregressive.primary_consistency,
-            teacher_forced_primary_node_parent_consistency_losses=(
-                teacher_forced.primary_consistency
-            ),
-            single_sample_primary_node_classification_losses=(
-                single_sample.primary_class_losses
-            ),
-            single_sample_primary_node_predicted_type_logits=(
-                single_sample.primary_logits
-            ),
+            node_classification_losses=class_losses,
+            node_predicted_type_logits=type_logits,
+            node_true_types=labels,
+            parent_pointer_losses=pointer_losses,
+            parent_pointer_logits=pointer_logits,
+            parent_pointer_true_positions=parent_positions,
+            parent_pointer_slot_mask=slot_mask,
         )
-
         if return_buffers:
-            return losses, primary_buffer, autoregressive.primary_combined
+            return losses, primary_buffer, reconstructed
         return losses
-
-    def _decode_pipeline(
-        self,
-        primary_graphs: Sequence[FixedInDegreeDAGDescription],
-        primary_buffer: Tensor,
-        primary_labels: Tensor,
-        primary_weights: Tensor | None,
-        rank_batches: Sequence[_BatchedRank],
-        device: torch.device,
-    ) -> tuple["_DecodePipelineResult", "_DecodePipelineResult", "_SingleSampleResult"]:
-        batch_size, num_nodes, _ = primary_buffer.shape
-
-        def _zeros(dtype: torch.dtype):
-            child_sum = torch.zeros(
-                batch_size,
-                num_nodes,
-                self.node_embedding_dim,
-                dtype=dtype,
-                device=device,
-            )
-            child_count = torch.zeros(
-                batch_size,
-                num_nodes,
-                dtype=dtype,
-                device=device,
-            )
-            child_sumsq = torch.zeros(
-                batch_size,
-                num_nodes,
-                self.node_embedding_dim,
-                dtype=dtype,
-                device=device,
-            )
-            return child_sum, child_count, child_sumsq
-
-        ar_primary_sum, ar_primary_count, ar_primary_sumsq = _zeros(
-            primary_buffer.dtype
-        )
-        tf_primary_sum, tf_primary_count, tf_primary_sumsq = _zeros(
-            primary_buffer.dtype
-        )
-
-        leaf_indices = torch.stack(
-            [graph.leaf_node_indices_tensor for graph in primary_graphs],
-            dim=0,
-        ).to(device=device, non_blocking=True)
-        batch_rows = torch.arange(batch_size, dtype=torch.long, device=device)[:, None]
-        leaf_embeddings_by_graph = primary_buffer[batch_rows, leaf_indices]
-        for child_sum, child_count, child_sumsq in (
-            (ar_primary_sum, ar_primary_count, ar_primary_sumsq),
-            (tf_primary_sum, tf_primary_count, tf_primary_sumsq),
-        ):
-            leaf_embeddings = leaf_embeddings_by_graph.to(child_sum.dtype)
-            child_sum[batch_rows, leaf_indices] = leaf_embeddings
-            child_count[batch_rows, leaf_indices] = 1.0
-            child_sumsq[batch_rows, leaf_indices] = leaf_embeddings**2
-
-        # Single-sample stream buffers: ``single_emb`` holds the one sampled child
-        # prediction that becomes each node's decode/classify input; ``single_key``
-        # holds the random reservoir key of the currently-selected child (-inf
-        # means "no child seen yet"). Leaves (output nodes) are fixed to their
-        # encoder embedding with key +inf so they are never overwritten.
-        single_primary_emb = torch.zeros_like(primary_buffer)
-        single_primary_key = torch.full(
-            (batch_size, num_nodes),
-            float("-inf"),
-            dtype=torch.float32,
-            device=device,
-        )
-        single_primary_emb[batch_rows, leaf_indices] = leaf_embeddings_by_graph.to(
-            single_primary_emb.dtype
-        )
-        single_primary_key[batch_rows, leaf_indices] = float("inf")
-
-        (
-            (
-                ar_primary_combined,
-                ar_primary_logits,
-                ar_primary_class,
-                ar_primary_recon,
-                ar_primary_consistency,
-            ),
-            (
-                tf_primary_combined,
-                tf_primary_logits,
-                tf_primary_class,
-                tf_primary_recon,
-                tf_primary_consistency,
-            ),
-            (
-                single_primary_combined,
-                single_primary_logits,
-                single_primary_class,
-            ),
-        ) = self._decode_graph(
-            graphs=primary_graphs,
-            encoder_buffer=primary_buffer,
-            autoregressive_child_sum=ar_primary_sum,
-            autoregressive_child_count=ar_primary_count,
-            autoregressive_child_sumsq=ar_primary_sumsq,
-            teacher_forced_child_sum=tf_primary_sum,
-            teacher_forced_child_count=tf_primary_count,
-            teacher_forced_child_sumsq=tf_primary_sumsq,
-            single_sample_emb=single_primary_emb,
-            single_sample_key=single_primary_key,
-            labels=primary_labels,
-            class_weights=primary_weights,
-            leaf_embeddings_by_graph=leaf_embeddings_by_graph,
-            process_roots=True,
-            rank_batches=rank_batches,
-            device=device,
-        )
-
-        autoregressive = _DecodePipelineResult(
-            primary_combined=ar_primary_combined,
-            primary_logits=ar_primary_logits,
-            primary_class_losses=ar_primary_class,
-            primary_recon=ar_primary_recon,
-            primary_consistency=ar_primary_consistency,
-        )
-        teacher_forced = _DecodePipelineResult(
-            primary_combined=tf_primary_combined,
-            primary_logits=tf_primary_logits,
-            primary_class_losses=tf_primary_class,
-            primary_recon=tf_primary_recon,
-            primary_consistency=tf_primary_consistency,
-        )
-        single_sample = _SingleSampleResult(
-            primary_combined=single_primary_combined,
-            primary_logits=single_primary_logits,
-            primary_class_losses=single_primary_class,
-        )
-        return autoregressive, teacher_forced, single_sample
-
-    def _decode_graph(
-        self,
-        graphs: Sequence[FixedInDegreeDAGDescription],
-        encoder_buffer: Tensor,
-        autoregressive_child_sum: Tensor,
-        autoregressive_child_count: Tensor,
-        autoregressive_child_sumsq: Tensor,
-        teacher_forced_child_sum: Tensor,
-        teacher_forced_child_count: Tensor,
-        teacher_forced_child_sumsq: Tensor,
-        single_sample_emb: Tensor,
-        single_sample_key: Tensor,
-        labels: Tensor,
-        class_weights: Tensor | None,
-        leaf_embeddings_by_graph: Tensor,
-        process_roots: bool,
-        rank_batches: Sequence[_BatchedRank],
-        device: torch.device,
-    ) -> tuple[
-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
-        tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
-        tuple[Tensor, Tensor, Tensor],
-    ]:
-        batch_size, num_nodes, _ = encoder_buffer.shape
-        # When the aggregate (autoregressive) stream is disabled it is dropped from
-        # every fused classifier/decoder call and its buffers are never read or
-        # scattered, so no compute is spent on it. Its result tensors stay at the
-        # zeros allocated below.
-        compute_ar = self.compute_aggregate_decode_pass
-
-        def _alloc_pass_buffers():
-            combined = torch.zeros(
-                batch_size,
-                num_nodes,
-                self.node_embedding_dim,
-                dtype=autoregressive_child_sum.dtype,
-                device=device,
-            )
-            logits = torch.zeros(
-                batch_size,
-                num_nodes,
-                self.num_node_types,
-                dtype=encoder_buffer.dtype,
-                device=device,
-            )
-            class_losses = torch.zeros(
-                batch_size,
-                num_nodes,
-                dtype=encoder_buffer.dtype,
-                device=device,
-            )
-            consistency = torch.zeros(
-                batch_size,
-                num_nodes,
-                dtype=encoder_buffer.dtype,
-                device=device,
-            )
-            return combined, logits, class_losses, consistency
-
-        ar_combined, ar_logits, ar_class, ar_consistency = _alloc_pass_buffers()
-        tf_combined, tf_logits, tf_class, tf_consistency = _alloc_pass_buffers()
-        # Single-sample stream needs no consistency buffer (it carries one child,
-        # so there is no within-parent variance to measure).
-        single_combined, single_logits, single_class, _ = _alloc_pass_buffers()
-        # ``single_emb`` / ``single_key`` are rebound out-of-place each rank (via
-        # torch.where below) so the autograd graph stays clean -- no in-place edits
-        # of a tensor that later ranks read back.
-        single_emb = single_sample_emb
-        single_key = single_sample_key
-
-        ar_recon_edge_list: list[Tensor] = []
-        tf_recon_edge_list: list[Tensor] = []
-
-        max_ranks = len(rank_batches)
-        for rank in reversed(range(max_ranks)):
-            if rank == 0 and not process_roots:
-                continue
-
-            rank_batch = rank_batches[rank]
-            if rank_batch.node_indices.numel() == 0:
-                continue
-
-            rows = rank_batch.batch_indices
-            nodes = rank_batch.node_indices
-            num_rank_rows = nodes.shape[0]
-
-            tf_counts = teacher_forced_child_count[rows, nodes]
-            tf_combined_rank = teacher_forced_child_sum[
-                rows, nodes
-            ] / tf_counts.sqrt().unsqueeze(-1)
-            tf_combined[rows, nodes] = tf_combined_rank
-
-            if compute_ar:
-                ar_counts = autoregressive_child_count[rows, nodes]
-                ar_combined_rank = autoregressive_child_sum[
-                    rows, nodes
-                ] / ar_counts.sqrt().unsqueeze(-1)
-                ar_combined[rows, nodes] = ar_combined_rank
-
-                ar_mean = autoregressive_child_sum[rows, nodes] / ar_counts.unsqueeze(-1)
-                ar_var = (
-                    (
-                        autoregressive_child_sumsq[rows, nodes] / ar_counts.unsqueeze(-1)
-                        - ar_mean**2
-                    )
-                    .mean(dim=-1)
-                    .clamp(min=0)
-                )
-                ar_consistency[rows, nodes] = torch.where(
-                    ar_counts > 1, ar_var, torch.zeros_like(ar_var)
-                )
-
-            tf_mean = teacher_forced_child_sum[rows, nodes] / tf_counts.unsqueeze(-1)
-            tf_var = (
-                (
-                    teacher_forced_child_sumsq[rows, nodes] / tf_counts.unsqueeze(-1)
-                    - tf_mean**2
-                )
-                .mean(dim=-1)
-                .clamp(min=0)
-            )
-            tf_consistency[rows, nodes] = torch.where(
-                tf_counts > 1, tf_var, torch.zeros_like(tf_var)
-            )
-
-            # Single-sample input for this rank: the one child prediction that won
-            # the reservoir for each node (its children, at higher ranks, have all
-            # been processed and scattered by now -- same ordering guarantee the
-            # autoregressive sum relies on).
-            single_combined_rank = single_emb[rows, nodes]
-            single_combined[rows, nodes] = single_combined_rank
-
-            # One classifier call over all active streams; rows are independent so
-            # each stream's slice is bit-for-bit what it would be computed alone.
-            # Stream order is [ar (only if enabled), tf, single]; every stream
-            # contributes ``num_rank_rows`` rows, so chunk() splits the fused
-            # output back into per-stream tensors.
-            classify_inputs = []
-            if compute_ar:
-                classify_inputs.append(ar_combined_rank)
-            classify_inputs.extend([tf_combined_rank, single_combined_rank])
-            num_streams = len(classify_inputs)
-            combined_all = torch.cat(classify_inputs, dim=0)
-            logits_all = self.node_type_predictor(combined_all)
-            logit_chunks = logits_all.chunk(num_streams)
-            if compute_ar:
-                ar_logits[rows, nodes] = logit_chunks[0].to(ar_logits.dtype)
-            tf_logits[rows, nodes] = logit_chunks[-2].to(tf_logits.dtype)
-            single_logits[rows, nodes] = logit_chunks[-1].to(single_logits.dtype)
-
-            rank_labels = labels[rows, nodes]
-            cross_entropy_all = F.cross_entropy(
-                logits_all,
-                rank_labels.repeat(num_streams),
-                reduction="none",
-            )
-            if class_weights is not None:
-                rank_weights = class_weights[rows, nodes]
-                cross_entropy_all = cross_entropy_all * rank_weights.repeat(
-                    num_streams
-                ).to(cross_entropy_all.dtype)
-            class_chunks = cross_entropy_all.chunk(num_streams)
-            if compute_ar:
-                ar_class[rows, nodes] = class_chunks[0].to(ar_class.dtype)
-            tf_class[rows, nodes] = class_chunks[-2].to(tf_class.dtype)
-            single_class[rows, nodes] = class_chunks[-1].to(single_class.dtype)
-
-            if not rank_batch.has_valid_parents:
-                continue
-
-            decode_inputs = []
-            if compute_ar:
-                decode_inputs.append(ar_combined_rank)
-            decode_inputs.extend([encoder_buffer[rows, nodes], single_combined_rank])
-            decode_input_all = torch.cat(decode_inputs, dim=0)
-            subtypes_all = rank_batch.subtypes.repeat(num_streams)
-            leaf_embeddings_for_rank = leaf_embeddings_by_graph[rows]
-            leaf_embeddings_all = torch.cat(
-                [leaf_embeddings_for_rank] * num_streams, dim=0
-            )
-            predicted_all = self.node_decoder.forward_batch(
-                decode_input_all,
-                subtypes_all,
-                leaf_embeddings_all,
-            )
-            predicted_chunks = predicted_all.chunk(num_streams)
-            tf_predicted = predicted_chunks[-2]
-            single_predicted = predicted_chunks[-1]
-            if compute_ar:
-                ar_predicted = predicted_chunks[0]
-
-            # Scatter every graph's predicted parents into the child buffers
-            # without ever reading mask contents back to the host. We keep the
-            # full padded [R, K] edge grid and zero out the invalid slots via the
-            # mask instead of boolean-compacting it (which would trigger a
-            # nonzero() + D2H sync). Invalid slots already carry parent index 0
-            # and now contribute a zero vector, so adding them is a true no-op;
-            # multiplying valid slots by 1.0 is exact, so the accumulated values
-            # are bitwise identical to the compacted version.
-            #
-            # As in the per-rank batched scatter, flattening the [B, N, ...]
-            # buffers to [B*N, ...] and offsetting each edge's parent by its
-            # graph row (batch * num_nodes + parent) gives every graph a disjoint
-            # index range, so one index_add_ per buffer accumulates the batch.
-            mask = rank_batch.valid_parent_mask
-            edge_weight = mask.reshape(-1).to(autoregressive_child_count.dtype)
-            global_parent_indices = (
-                rows[:, None] * num_nodes + rank_batch.parent_indices
-            ).reshape(-1)
-
-            tf_contrib = tf_predicted.reshape(-1, self.node_embedding_dim) * (
-                edge_weight.unsqueeze(-1)
-            )
-            if compute_ar:
-                ar_contrib = ar_predicted.reshape(-1, self.node_embedding_dim) * (
-                    edge_weight.unsqueeze(-1)
-                )
-
-            if self.compute_reconstruction_loss:
-                valid_parent_mask = mask
-                flat_parent_indices = rank_batch.parent_indices[valid_parent_mask]
-                flat_batch_indices = rows[:, None].expand_as(rank_batch.parent_indices)[
-                    valid_parent_mask
-                ]
-                tf_flat = tf_predicted[valid_parent_mask]
-                recon_target = encoder_buffer[flat_batch_indices, flat_parent_indices]
-                if self.reconstruction_detach_target:
-                    recon_target = recon_target.detach()
-                if compute_ar:
-                    ar_flat = ar_predicted[valid_parent_mask]
-                    ar_recon_edge_list.append(
-                        1.0
-                        - F.cosine_similarity(
-                            ar_flat.to(recon_target.dtype), recon_target, dim=-1
-                        )
-                    )
-                tf_recon_edge_list.append(
-                    1.0
-                    - F.cosine_similarity(
-                        tf_flat.to(recon_target.dtype), recon_target, dim=-1
-                    )
-                )
-
-            if compute_ar:
-                autoregressive_child_sum.view(batch_size * num_nodes, -1).index_add_(
-                    0,
-                    global_parent_indices,
-                    ar_contrib.to(autoregressive_child_sum.dtype),
-                )
-                autoregressive_child_count.view(-1).index_add_(
-                    0, global_parent_indices, edge_weight
-                )
-                autoregressive_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                    0,
-                    global_parent_indices,
-                    (ar_contrib**2).to(autoregressive_child_sumsq.dtype),
-                )
-            teacher_forced_child_sum.view(batch_size * num_nodes, -1).index_add_(
-                0, global_parent_indices, tf_contrib.to(teacher_forced_child_sum.dtype)
-            )
-            teacher_forced_child_count.view(-1).index_add_(
-                0, global_parent_indices, edge_weight
-            )
-            teacher_forced_child_sumsq.view(batch_size * num_nodes, -1).index_add_(
-                0,
-                global_parent_indices,
-                (tf_contrib**2).to(teacher_forced_child_sumsq.dtype),
-            )
-
-            # ---- single-sample reservoir scatter ----
-            # Pick exactly one child per parent: give each edge an iid uniform key
-            # and keep the child whose key is globally largest across all ranks,
-            # which is a uniform random draw among the parent's children. The
-            # selection is computed on detached random keys; gradient still flows
-            # into the chosen prediction through the torch.where below, so the
-            # decoder learns to make a single compounded embedding classify
-            # correctly. Invalid (padding) slots carry key -inf and are masked out.
-            flat_nodes = batch_size * num_nodes
-            single_pred_flat = single_predicted.reshape(-1, self.node_embedding_dim)
-            edge_key = torch.rand(
-                mask.shape, device=device, dtype=single_key.dtype
-            ).masked_fill(~mask, float("-inf"))
-            edge_key_flat = edge_key.reshape(-1)
-            batch_max_key = torch.full(
-                (flat_nodes,), float("-inf"), device=device, dtype=single_key.dtype
-            )
-            batch_max_key.scatter_reduce_(
-                0, global_parent_indices, edge_key_flat, reduce="amax", include_self=True
-            )
-            won = (edge_weight > 0) & (
-                edge_key_flat == batch_max_key.index_select(0, global_parent_indices)
-            )
-            batch_winner_emb = torch.zeros(
-                flat_nodes,
-                self.node_embedding_dim,
-                device=device,
-                dtype=single_pred_flat.dtype,
-            )
-            batch_winner_emb[global_parent_indices[won]] = single_pred_flat[won]
-
-            single_key_flat = single_key.reshape(-1)
-            take_batch = batch_max_key > single_key_flat
-            single_key = torch.where(
-                take_batch, batch_max_key, single_key_flat
-            ).reshape(batch_size, num_nodes)
-            single_emb = torch.where(
-                take_batch.unsqueeze(-1),
-                batch_winner_emb,
-                single_emb.reshape(flat_nodes, -1),
-            ).reshape(batch_size, num_nodes, self.node_embedding_dim)
-
-        _empty = encoder_buffer.new_zeros(0)
-        ar_recon = torch.cat(ar_recon_edge_list) if ar_recon_edge_list else _empty
-        tf_recon = torch.cat(tf_recon_edge_list) if tf_recon_edge_list else _empty
-
-        return (
-            (ar_combined, ar_logits, ar_class, ar_recon, ar_consistency),
-            (tf_combined, tf_logits, tf_class, tf_recon, tf_consistency),
-            (single_combined, single_logits, single_class),
-        )
-
-    @torch.no_grad()
-    def blind_autoregressive_decode(
-        self,
-        output_embeddings: Tensor,
-        *,
-        similarity_threshold: float = 0.99,
-        root_match_margin: float | None = None,
-        max_nodes: int = 4096,
-        return_diagnostics: bool = False,
-    ) -> FixedInDegreeDAGDescription | tuple[FixedInDegreeDAGDescription, dict]:
-        """Recover a DAG from ordered output-node embeddings via a global pool.
-
-        The decode walks backward from the fixed output slots. Each discovered
-        trunk node is expanded once from the embedding that created it; duplicate
-        parent predictions are merged by cosine similarity against one global
-        match-target pool (roots plus discovered trunks, never outputs).
-        """
-        if output_embeddings.ndim != 2:
-            raise ValueError("output_embeddings must have shape [num_outputs, D]")
-        if output_embeddings.shape != (self.num_output_nodes, self.node_embedding_dim):
-            raise ValueError(
-                "output_embeddings must have shape "
-                f"({self.num_output_nodes}, {self.node_embedding_dim}); got "
-                f"{tuple(output_embeddings.shape)}"
-            )
-        if max_nodes <= 0:
-            raise ValueError("max_nodes must be positive")
-
-        root_table = self.root_node_embeddings.weight.detach()
-        device = root_table.device
-        dtype = root_table.dtype
-        output_embeddings = output_embeddings.to(device=device, dtype=dtype)
-
-        pool: list[_DecodeNode] = []
-        root_start = self.num_trunk_node_types
-        output_start = self.num_trunk_node_types + self.num_root_nodes
-
-        for root_slot in range(self.num_root_nodes):
-            pool.append(
-                _DecodeNode(
-                    id=len(pool),
-                    embedding=root_table[root_slot].detach().clone(),
-                    type_id=root_start + root_slot,
-                    is_root=True,
-                    is_output=False,
-                    parents=[],
-                    expanded=True,
-                )
-            )
-
-        frontier: list[int] = []
-        for output_slot in range(self.num_output_nodes):
-            node_id = len(pool)
-            pool.append(
-                _DecodeNode(
-                    id=node_id,
-                    embedding=output_embeddings[output_slot].detach().clone(),
-                    # All outputs share the single output type; slot identity is
-                    # carried by the fixed pool ordering, not the type index.
-                    type_id=output_start,
-                    is_root=False,
-                    is_output=True,
-                    parents=[None],
-                )
-            )
-            frontier.append(node_id)
-
-        termination_reason = "natural"
-        if len(pool) > max_nodes:
-            termination_reason = "max_nodes"
-            frontier = []
-
-        while frontier:
-            if len(pool) >= max_nodes:
-                termination_reason = "max_nodes"
-                break
-
-            predictions = self._blind_decode_expand(
-                pool,
-                frontier,
-                output_embeddings,
-            )
-            frontier = self._blind_decode_integrate(
-                pool,
-                predictions,
-                similarity_threshold=similarity_threshold,
-                root_match_margin=root_match_margin,
-            )
-
-            if len(pool) >= max_nodes and frontier:
-                termination_reason = "max_nodes"
-                break
-
-        description = self._decode_pool_to_description(pool, termination_reason)
-        description.termination_reason = termination_reason
-        description.decode_pool_size = len(pool)
-
-        if return_diagnostics:
-            diagnostics = {
-                "termination_reason": termination_reason,
-                "pool_size": len(pool),
-                "recovered_nodes": description.num_nodes,
-                "dropped_pool_nodes": getattr(
-                    description, "decode_dropped_pool_nodes", []
-                ),
-            }
-            return description, diagnostics
-        return description
-
-    def _blind_decode_expand(
-        self,
-        pool: list[_DecodeNode],
-        frontier: list[int],
-        leaf_embeddings: Tensor,
-    ) -> list[_ParentPrediction]:
-        node_ids: list[int] = []
-        subtypes: list[int] = []
-        for node_id in frontier:
-            node = pool[node_id]
-            if node.expanded:
-                continue
-            if node.is_root:
-                continue
-            if node.type_id is None:
-                raise ValueError(f"frontier node {node_id} has unknown type")
-            node_ids.append(node_id)
-            subtypes.append(node.type_id)
-
-        predictions: list[_ParentPrediction] = []
-        if not node_ids:
-            return predictions
-
-        node_embeddings = torch.stack([pool[node_id].embedding for node_id in node_ids])
-        subtype_tensor = torch.as_tensor(
-            subtypes,
-            dtype=torch.long,
-            device=node_embeddings.device,
-        )
-        leaf_embeddings = leaf_embeddings.unsqueeze(0).expand(
-            node_embeddings.shape[0],
-            -1,
-            -1,
-        )
-        parent_embeddings = self.node_decoder.forward_batch(
-            node_embeddings,
-            subtype_tensor,
-            leaf_embeddings,
-        )
-
-        for row_idx, child_id in enumerate(node_ids):
-            pool[child_id].expanded = True
-            type_id = subtypes[row_idx]
-            for slot in range(self._in_degree_for_type(type_id)):
-                predictions.append(
-                    _ParentPrediction(
-                        child_id=child_id,
-                        slot=slot,
-                        embedding=parent_embeddings[row_idx, slot].detach().clone(),
-                    )
-                )
-
-        return predictions
-
-    def _blind_decode_integrate(
-        self,
-        pool: list[_DecodeNode],
-        predictions: list[_ParentPrediction],
-        *,
-        similarity_threshold: float,
-        root_match_margin: float | None,
-    ) -> list[int]:
-        if not predictions:
-            return []
-
-        pred_embs = torch.stack([p.embedding for p in predictions])
-        target_ids, target_embs = self._decode_match_targets(pool, pred_embs)
-        assignments, new_components = self._assign_node_ids(
-            pool=pool,
-            pred_embs=pred_embs,
-            target_ids=target_ids,
-            target_embs=target_embs,
-            threshold=similarity_threshold,
-            root_match_margin=root_match_margin,
-        )
-
-        next_frontier: list[int] = []
-        for component in new_components:
-            representative = pred_embs[component[0]].detach().clone()
-            node_id = self._classify_and_add_decode_node(pool, representative)
-            if not pool[node_id].is_root:
-                next_frontier.append(node_id)
-            for pred_idx in component:
-                assignments[pred_idx] = node_id
-
-        for prediction, node_id in zip(predictions, assignments):
-            if node_id is None:
-                raise RuntimeError("unassigned decode prediction")
-            pool[prediction.child_id].parents[prediction.slot] = node_id
-
-        return next_frontier
-
-    def _decode_match_targets(
-        self,
-        pool: list[_DecodeNode],
-        pred_embs: Tensor,
-    ) -> tuple[list[int], Tensor]:
-        target_ids = [node.id for node in pool if not node.is_output]
-        if not target_ids:
-            return target_ids, pred_embs.new_zeros((0, self.node_embedding_dim))
-        return target_ids, torch.stack(
-            [pool[node_id].embedding for node_id in target_ids]
-        )
-
-    def _assign_node_ids(
-        self,
-        *,
-        pool: list[_DecodeNode],
-        pred_embs: Tensor,
-        target_ids: list[int],
-        target_embs: Tensor,
-        threshold: float,
-        root_match_margin: float | None,
-    ) -> tuple[list[int | None], list[list[int]]]:
-        assignments: list[int | None] = [None] * pred_embs.shape[0]
-
-        if target_embs.numel():
-            pred_norm = F.normalize(pred_embs.float(), dim=-1)
-            target_norm = F.normalize(target_embs.float(), dim=-1)
-            similarities = pred_norm @ target_norm.t()
-            best_similarities, best_target_positions = similarities.max(dim=1)
-
-            nonroot_target_positions = [
-                i for i, node_id in enumerate(target_ids) if not pool[node_id].is_root
-            ]
-            for pred_idx, best_similarity in enumerate(best_similarities.tolist()):
-                if best_similarity <= threshold:
-                    continue
-                target_pos = int(best_target_positions[pred_idx])
-                target_id = target_ids[target_pos]
-
-                if root_match_margin is not None and pool[target_id].is_root:
-                    best_nonroot_similarity = float("-inf")
-                    if nonroot_target_positions:
-                        nonroot_sims = similarities[pred_idx, nonroot_target_positions]
-                        best_nonroot_similarity = float(nonroot_sims.max())
-                    if best_similarity < best_nonroot_similarity + root_match_margin:
-                        continue
-
-                assignments[pred_idx] = target_id
-
-        unmatched = [idx for idx, node_id in enumerate(assignments) if node_id is None]
-        if not unmatched:
-            return assignments, []
-
-        parent = list(range(len(unmatched)))
-
-        def find(i: int) -> int:
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
-        def union(i: int, j: int) -> None:
-            ri = find(i)
-            rj = find(j)
-            if ri != rj:
-                parent[max(ri, rj)] = min(ri, rj)
-
-        unmatched_embs = pred_embs[unmatched]
-        if unmatched_embs.shape[0] > 1:
-            unmatched_norm = F.normalize(unmatched_embs.float(), dim=-1)
-            similarities = unmatched_norm @ unmatched_norm.t()
-            for i in range(unmatched_embs.shape[0]):
-                for j in range(i + 1, unmatched_embs.shape[0]):
-                    if float(similarities[i, j]) > threshold:
-                        union(i, j)
-
-        components_by_root: dict[int, list[int]] = {}
-        for local_idx, pred_idx in enumerate(unmatched):
-            components_by_root.setdefault(find(local_idx), []).append(pred_idx)
-
-        components = sorted(
-            components_by_root.values(),
-            key=lambda component: component[0],
-        )
-        return assignments, components
-
-    def _classify_and_add_decode_node(
-        self,
-        pool: list[_DecodeNode],
-        representative: Tensor,
-    ) -> int:
-        output_start = self.num_trunk_node_types + self.num_root_nodes
-
-        logits = self.node_type_predictor(representative.unsqueeze(0))[0].float()
-        logits = logits.clone()
-        logits[output_start:] = float("-inf")
-        type_id = int(logits.argmax())
-
-        supertype = subtype_to_supertype(
-            type_id,
-            num_trunk_node_types=self.num_trunk_node_types,
-            num_root_nodes=self.num_root_nodes,
-        )
-
-        if supertype is NodeSupertype.ROOT:
-            root_embeddings = self.root_node_embeddings.weight.detach()
-            root_sims = (
-                F.normalize(representative.float(), dim=-1).unsqueeze(0)
-                @ F.normalize(root_embeddings.float(), dim=-1).t()
-            )
-            root_slot = int(root_sims.argmax())
-            return root_slot
-
-        if supertype is not NodeSupertype.TRUNK:
-            raise RuntimeError(f"masked classifier selected non-parent type {type_id}")
-
-        node_id = len(pool)
-        pool.append(
-            _DecodeNode(
-                id=node_id,
-                embedding=representative.detach().clone(),
-                type_id=type_id,
-                is_root=False,
-                is_output=False,
-                parents=[None] * self.trunk_node_in_degrees[type_id],
-            )
-        )
-        return node_id
-
-    def _decode_pool_to_description(
-        self,
-        pool: list[_DecodeNode],
-        termination_reason: str,
-    ) -> FixedInDegreeDAGDescription:
-        live = self._live_decode_node_ids(pool)
-
-        trunk_ids = [
-            node.id
-            for node in pool
-            if node.id in live and not node.is_root and not node.is_output
-        ]
-        trunk_order = self._toposort_decode_trunks(pool, trunk_ids)
-        output_ids = [
-            node.id
-            for node in sorted(
-                pool,
-                key=lambda n: (
-                    n.type_id if n.type_id is not None else self.num_node_types,
-                    n.id,
-                ),
-            )
-            if node.id in live and node.is_output
-        ]
-
-        root_start = self.num_trunk_node_types
-        output_start = self.num_trunk_node_types + self.num_root_nodes
-
-        node_inputs_indices: list[list[int]] = [[] for _ in range(self.num_root_nodes)]
-        node_types: list[int] = [
-            root_start + root_slot for root_slot in range(self.num_root_nodes)
-        ]
-
-        final_index: dict[int, int] = {
-            root_slot: root_slot for root_slot in range(self.num_root_nodes)
-        }
-        for old_id in trunk_order:
-            final_index[old_id] = len(node_types)
-            node = pool[old_id]
-            if node.type_id is None:
-                raise ValueError(f"live trunk node {old_id} has unknown type")
-            parents = self._require_live_parents(node, final_index)
-            node_inputs_indices.append(parents)
-            node_types.append(node.type_id)
-
-        for old_id in output_ids:
-            final_index[old_id] = len(node_types)
-            node = pool[old_id]
-            parents = self._require_live_parents(node, final_index)
-            if len(parents) != 1:
-                raise ValueError(f"output node {old_id} has {len(parents)} parents")
-            node_inputs_indices.append(parents)
-            # All outputs share the single output class.
-            node_types.append(output_start)
-
-        description = FixedInDegreeDAGDescription(
-            num_root_nodes=self.num_root_nodes,
-            num_trunk_nodes=len(trunk_order),
-            num_output_nodes=len(output_ids),
-            num_trunk_node_types=self.num_trunk_node_types,
-            trunk_node_in_degrees=self.trunk_node_in_degrees,
-            node_inputs_indices=node_inputs_indices,
-            node_types=node_types,
-        )
-        description.termination_reason = termination_reason
-        description.decode_live_pool_nodes = sorted(live)
-        description.decode_dropped_pool_nodes = [
-            node.id for node in pool if node.id not in live
-        ]
-        return description
-
-    def _live_decode_node_ids(self, pool: list[_DecodeNode]) -> set[int]:
-        live = {node.id for node in pool if node.is_root}
-        changed = True
-        while changed:
-            changed = False
-            for node in pool:
-                if node.id in live or node.is_root:
-                    continue
-                if not node.expanded:
-                    continue
-                if any(parent is None or parent not in live for parent in node.parents):
-                    continue
-                live.add(node.id)
-                changed = True
-        return live
-
-    def _toposort_decode_trunks(
-        self,
-        pool: list[_DecodeNode],
-        trunk_ids: list[int],
-    ) -> list[int]:
-        trunk_set = set(trunk_ids)
-        indegree = {node_id: 0 for node_id in trunk_ids}
-        children: dict[int, list[int]] = {node_id: [] for node_id in trunk_ids}
-
-        for node_id in trunk_ids:
-            for parent_id in pool[node_id].parents:
-                if parent_id in trunk_set:
-                    indegree[node_id] += 1
-                    children[parent_id].append(node_id)
-
-        ready = sorted(node_id for node_id, degree in indegree.items() if degree == 0)
-        order: list[int] = []
-        while ready:
-            node_id = ready.pop(0)
-            order.append(node_id)
-            for child_id in sorted(children[node_id]):
-                indegree[child_id] -= 1
-                if indegree[child_id] == 0:
-                    ready.append(child_id)
-                    ready.sort()
-
-        if len(order) != len(trunk_ids):
-            stalled = sorted(set(trunk_ids) - set(order))
-            raise ValueError(
-                f"cycle or invalid parent relation among trunks: {stalled}"
-            )
-
-        return order
-
-    def _require_live_parents(
-        self,
-        node: _DecodeNode,
-        final_index: dict[int, int],
-    ) -> list[int]:
-        parents: list[int] = []
-        for parent_id in node.parents:
-            if parent_id is None:
-                raise ValueError(f"live node {node.id} has an unfilled parent slot")
-            if parent_id not in final_index:
-                raise ValueError(
-                    f"live node {node.id} references non-live parent {parent_id}"
-                )
-            parents.append(final_index[parent_id])
-        return parents

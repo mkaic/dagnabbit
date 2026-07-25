@@ -1,13 +1,14 @@
 """Signal-propagation sanity check for the DAG autoencoder.
 
-Because ``evaluate_graph`` recursively composes the shared residual transformer
-encoder at every non-root rank, the effective depth of the computation equals
-the depth of the DAG. The encoder and decoder use final LayerNorms on their
-outputs, keeping the per-node embedding norm bounded as DAG depth increases.
+Because ``evaluate_graph_batch`` recursively composes the shared residual
+transformer encoder at every non-root rank, the effective depth of the encode
+computation equals the depth of the DAG. The encoder, compressor, and decoder
+all use final LayerNorms on their outputs, keeping per-node embedding norms
+bounded as DAG depth increases.
 
-This covers both passes: the ``encode`` forward pass down the DAG, and the
-``decode`` guided-autoregressive pass that propagates predicted embeddings back
-up the DAG (each node's ``combined_predicted_embedding``).
+This covers both phases: the ``encode`` forward pass down the DAG, and the
+``decode`` reconstruction (compressor -> latent -> masked-sequence decoder),
+whose per-position embeddings are bucketed by the same node depths.
 
 Run it directly to eyeball the depth-vs-statistics tables::
 
@@ -29,26 +30,22 @@ from dagnabbit.dag.description import (
 from dagnabbit.scripts import config as cfg
 
 
-def build_model(
-    *,
-    compute_reconstruction_loss: bool | None = None,
-) -> DagnabbitAutoEncoder:
-    if compute_reconstruction_loss is None:
-        compute_reconstruction_loss = cfg.COMPUTE_RECONSTRUCTION_LOSS
+def build_model() -> DagnabbitAutoEncoder:
     return DagnabbitAutoEncoder(
         node_embedding_dim=cfg.NODE_EMBEDDING_DIM,
         trunk_node_type_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
         num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
         num_root_nodes=cfg.NUM_ROOT_NODES,
+        num_trunk_nodes=cfg.NUM_TRUNK_NODES,
         num_output_nodes=cfg.NUM_OUTPUT_NODES,
         mlp_expansion_factor=cfg.MLP_EXPANSION_FACTOR,
-        reconstruction_detach_target=cfg.RECONSTRUCTION_DETACH_TARGET,
-        compute_reconstruction_loss=compute_reconstruction_loss,
         transformer_num_layers=cfg.TRANSFORMER_NUM_LAYERS,
         transformer_mlp_depth=cfg.TRANSFORMER_MLP_DEPTH,
         transformer_num_register_tokens=cfg.TRANSFORMER_NUM_REGISTER_TOKENS,
         transformer_num_heads=cfg.TRANSFORMER_NUM_HEADS,
         transformer_dropout=cfg.TRANSFORMER_DROPOUT,
+        compressor_num_layers=cfg.COMPRESSOR_NUM_LAYERS,
+        decoder_num_layers=cfg.DECODER_NUM_LAYERS,
     )
 
 
@@ -109,8 +106,9 @@ def measure_signal_propagation(
 
     - ``"encode"``: the primary forward-pass buffer (shared transformer encoder
       composed down the DAG).
-    - ``"decode"``: each primary node's ``combined_predicted_embedding`` from the
-      guided-autoregressive decode (predictions propagated back up the DAG).
+    - ``"decode"``: the reconstructed per-node embeddings from the
+      compressor -> latent -> masked-sequence decoder path, permuted from
+      canonical sequence order back to node-storage order.
 
     Both phases are indexed by the same primary-graph nodes, so they share one
     depth assignment.
@@ -126,14 +124,19 @@ def measure_signal_propagation(
             model = build_model()
             for _ in range(graphs_per_model):
                 graph = sample_graph()
-                _, primary_buffer, decode_buffer = model.training_forward_batch(
+                _, primary_buffer, reconstructed = model.training_forward_batch(
                     [graph], return_buffers=True
                 )
                 depths = node_depths(graph)
 
+                # ``reconstructed`` is in canonical sequence order; gather each
+                # node's position to bucket by node-storage depth.
+                node_positions = torch.tensor(
+                    graph.canonical_positions, dtype=torch.long
+                )
                 phase_buffers = {
                     "encode": primary_buffer[0],
-                    "decode": decode_buffer[0],
+                    "decode": reconstructed[0][node_positions],
                 }
                 for phase, buffer in phase_buffers.items():
                     for depth, stats in _bucket_stats_by_depth(buffer, depths).items():
@@ -168,29 +171,6 @@ def format_table(phase: str, stats_by_depth: dict[int, dict[str, float]]) -> str
         for depth, s in stats_by_depth.items()
     ]
     return "\n".join([header, *rows])
-
-
-def test_reconstruction_loss_can_be_disabled_and_enabled() -> None:
-    graph = sample_graph()
-
-    with torch.no_grad():
-        disabled_losses = build_model(
-            compute_reconstruction_loss=False,
-        ).training_forward_batch([graph])
-        assert disabled_losses.primary_node_parent_reconstruction_losses.numel() == 0
-        assert (
-            disabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
-            == 0
-        )
-
-        enabled_losses = build_model(
-            compute_reconstruction_loss=True,
-        ).training_forward_batch([graph])
-        assert enabled_losses.primary_node_parent_reconstruction_losses.numel() > 0
-        assert (
-            enabled_losses.teacher_forced_primary_node_parent_reconstruction_losses.numel()
-            > 0
-        )
 
 
 def test_norms_stay_bounded() -> None:
@@ -229,7 +209,7 @@ def main() -> None:
     print(
         "Signal propagation through the primary DAG (fresh init, no training).\n"
         "encode = forward pass down the DAG; "
-        "decode = guided-autoregressive predictions back up the DAG.\n"
+        "decode = compressor -> latent -> masked-sequence reconstruction.\n"
     )
     print(format_table("encode", stats_by_phase["encode"]))
     print()
@@ -237,7 +217,6 @@ def main() -> None:
 
     test_norms_stay_bounded()
     test_no_mean_shift()
-    test_reconstruction_loss_can_be_disabled_and_enabled()
     print("\nALL SIGNAL-PROPAGATION CHECKS PASSED")
 
 
