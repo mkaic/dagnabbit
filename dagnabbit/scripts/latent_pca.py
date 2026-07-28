@@ -559,7 +559,7 @@ def main() -> None:
 
     flat_fit = fit_latents.reshape(fit_size, -1)
     eigenvalues, components = spectrum_of(flat_fit)
-    report_spectrum("flattened latent (what ES would search)", eigenvalues, latent_dim)
+    report_spectrum("flattened latent (the full search space)", eigenvalues, latent_dim)
 
     per_token_eigenvalues = []
     print(f"\n--- per-token spectra (ambient dim {model.node_embedding_dim}) ---")

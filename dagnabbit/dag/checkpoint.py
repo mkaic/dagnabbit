@@ -27,6 +27,18 @@ def resolve_checkpoint(argument: str | Path) -> Path:
     return resolved
 
 
+def strip_compile_prefix(state_dict: dict) -> dict:
+    """Drop the ``_orig_mod.`` segments ``torch.compile`` inserts into keys.
+
+    ``apply_torch_compile`` replaces ``model.compressor`` and ``model.decoder``
+    with compiled wrappers, so a checkpoint saved mid-training carries keys
+    like ``compressor._orig_mod.blocks.0...``. Loading those into an
+    uncompiled model fails on unexpected keys, and the geometry inference below
+    would see zero blocks and silently build a model with no compressor.
+    """
+    return {key.replace("._orig_mod.", "."): value for key, value in state_dict.items()}
+
+
 def count_blocks(state_dict: dict, prefix: str) -> int:
     """Number of transformer blocks under ``prefix`` in a state dict."""
     pattern = re.compile(re.escape(prefix) + r"\.blocks\.(\d+)\.")
@@ -51,6 +63,7 @@ def build_model_from_checkpoint(
     list is cross-checked against the number of slot query projections, so a
     mismatch raises rather than loading a subtly wrong model.
     """
+    state_dict = strip_compile_prefix(state_dict)
     node_embedding_dim = state_dict["mask_token"].shape[0]
     num_root_nodes = state_dict["root_node_embeddings.weight"].shape[0]
     num_trunk_node_types = state_dict["node_type_predictor.weight"].shape[0]
