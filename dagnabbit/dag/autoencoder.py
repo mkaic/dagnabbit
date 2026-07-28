@@ -11,20 +11,36 @@ from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     PreparedRankBatch,
 )
+from dagnabbit.scripts import config as cfg
 
-# Fixed geometry of the recursive encoder's per-node transformer. Head count
-# is derived from the embedding dim so every attention head is the standard
-# 64-wide.
-ENCODER_ATTENTION_HEAD_DIM = 64
+# Fixed geometry of the recursive encoder's per-node transformer. Head count is
+# derived from the embedding dim and the globally configured head width
+# (cfg.ATTENTION_HEAD_DIM), read at construction time.
 ENCODER_MLP_DEPTH = 1
 ENCODER_NUM_REGISTER_TOKENS = 2
 ENCODER_DROPOUT = 0.0
 
 # Fixed geometry of the sequence-space compressor/decoder blocks, independent
-# of the encoder's.
-SEQUENCE_ATTENTION_HEAD_DIM = 64
+# of the encoder's apart from the shared head width.
 SEQUENCE_MLP_DEPTH = 1
 SEQUENCE_DROPOUT = 0.0
+
+
+def _derive_num_heads(node_embedding_dim: int, what: str) -> int:
+    """Split ``node_embedding_dim`` into ``cfg.ATTENTION_HEAD_DIM``-wide heads.
+
+    Read at construction time rather than bound at import so tests and scripts
+    can override the config value before building a model.
+    """
+    head_dim = cfg.ATTENTION_HEAD_DIM
+    if head_dim <= 0:
+        raise ValueError(f"cfg.ATTENTION_HEAD_DIM must be positive; got {head_dim}")
+    if node_embedding_dim % head_dim != 0:
+        raise ValueError(
+            "node_embedding_dim must be a multiple of the configured "
+            f"{head_dim}-wide {what} head dim; got {node_embedding_dim}"
+        )
+    return node_embedding_dim // head_dim
 
 
 def _feed_forward_layers(
@@ -113,13 +129,7 @@ class TypeConditionedSequenceTransformer(nn.Module):
             raise ValueError("max_context_length must be positive")
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
-        if node_embedding_dim % ENCODER_ATTENTION_HEAD_DIM != 0:
-            raise ValueError(
-                "node_embedding_dim must be a multiple of the fixed "
-                f"{ENCODER_ATTENTION_HEAD_DIM}-wide encoder head dim; got "
-                f"{node_embedding_dim}"
-            )
-        num_heads = node_embedding_dim // ENCODER_ATTENTION_HEAD_DIM
+        num_heads = _derive_num_heads(node_embedding_dim, "encoder")
 
         self.node_embedding_dim = node_embedding_dim
         self.max_context_length = max_context_length
@@ -287,13 +297,7 @@ class SequenceTransformer(nn.Module):
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
-        if node_embedding_dim % SEQUENCE_ATTENTION_HEAD_DIM != 0:
-            raise ValueError(
-                "node_embedding_dim must be a multiple of the fixed "
-                f"{SEQUENCE_ATTENTION_HEAD_DIM}-wide sequence head dim; got "
-                f"{node_embedding_dim}"
-            )
-        num_heads = node_embedding_dim // SEQUENCE_ATTENTION_HEAD_DIM
+        num_heads = _derive_num_heads(node_embedding_dim, "sequence")
         self.num_heads = num_heads
         self.blocks = nn.ModuleList(
             [

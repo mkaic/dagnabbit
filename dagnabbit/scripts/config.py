@@ -23,9 +23,15 @@ MLP_EXPANSION_FACTOR = 4.0
 COMPRESSOR_NUM_LAYERS = 6
 DECODER_NUM_LAYERS = 6
 # Layer count for the recursive structural encoder's shared per-node
-# transformer. The remaining block geometry (64-wide attention heads, MLP
-# depth, register tokens, dropout) is fixed in dagnabbit/dag/autoencoder.py.
+# transformer. The remaining block geometry (MLP depth, register tokens,
+# dropout) is fixed in dagnabbit/dag/autoencoder.py.
 ENCODER_NUM_LAYERS = 2
+
+# Width of a single attention head, shared by every transformer in the model
+# (encoder, compressor, decoder). Head *count* is derived per module as
+# NODE_EMBEDDING_DIM // ATTENTION_HEAD_DIM, so NODE_EMBEDDING_DIM must be a
+# multiple of this; construction raises otherwise.
+ATTENTION_HEAD_DIM = 64
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,
