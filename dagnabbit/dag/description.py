@@ -1,3 +1,4 @@
+import functools
 import heapq
 import random
 from dataclasses import dataclass
@@ -153,9 +154,11 @@ class FixedInDegreeDAGDescription:
         )
 
         # Batch overlay over the (unchanged) flat arrays: longest-path rank per
-        # node, and the per-rank groups iterated over during grouped evaluation.
+        # node, and the per-rank padded tensors iterated over during grouped
+        # evaluation. ``rank_groups`` is the semantic (supertype/subtype) view of
+        # the same partition; nothing on the hot path reads it, so it is built
+        # lazily on first access rather than for every generated graph.
         self.node_ranks = self.compute_node_ranks()
-        self.rank_groups = self.build_rank_groups()
         self.rank_batches = self.build_rank_batches()
 
         # Canonical sequence overlay: structure-derived topological order with
@@ -207,6 +210,11 @@ class FixedInDegreeDAGDescription:
                 parent_rank = max(parent_rank, ranks[parent])
             ranks[node_idx] = parent_rank + 1
         return ranks
+
+    @functools.cached_property
+    def rank_groups(self) -> list[list[RankGroup]]:
+        """Semantic per-rank grouping, materialized on first access."""
+        return self.build_rank_groups()
 
     def build_rank_groups(self) -> list[list[RankGroup]]:
         """Group nodes by topological rank and batch key into :class:`RankGroup`s.
@@ -281,71 +289,65 @@ class FixedInDegreeDAGDescription:
     def build_rank_batches(self) -> list[PreparedRankBatch]:
         """Precompute padded CPU rank tensors used by the model hot path.
 
-        ``rank_groups`` keeps the semantic grouping for diagnostics and future
-        batching strategies. The training loop needs a node-sorted padded view
-        of each rank every encode/decode pass, so build that once when the graph
-        is created instead of rebuilding it on the compute device.
+        The training loop needs a node-sorted padded view of each rank every
+        encode/decode pass, so build that once when the graph is created instead
+        of rebuilding it on the compute device.
+
+        This runs once per generated graph in the training loop, so it builds
+        the padded rows for *every* rank as flat Python lists, converts them in
+        four ``torch.tensor`` calls total, and hands each rank a slice. Per-rank
+        (or per-:class:`RankGroup`) tensor construction costs tens of
+        microseconds of allocator/dispatch overhead each and dominated graph
+        generation when done that way.
         """
-        rank_batches: list[PreparedRankBatch] = []
-        for groups in self.rank_groups:
-            if not groups:
-                empty = torch.empty(0, dtype=torch.long)
-                rank_batches.append(
-                    PreparedRankBatch(
-                        node_indices=empty,
-                        parent_indices=torch.empty(
-                            0,
-                            self.maximum_indegree,
-                            dtype=torch.long,
-                        ),
-                        valid_parent_mask=torch.empty(
-                            0,
-                            self.maximum_indegree,
-                            dtype=torch.bool,
-                        ),
-                        subtypes=empty,
-                    )
-                )
-                continue
+        max_rank = max(self.node_ranks, default=0)
+        nodes_by_rank: list[list[int]] = [[] for _ in range(max_rank + 1)]
+        for node_idx, rank in enumerate(self.node_ranks):
+            nodes_by_rank[rank].append(node_idx)
 
-            node_indices = torch.cat([g.node_buffer_indices for g in groups])
-            subtypes = torch.cat([g.subtypes for g in groups])
-            parent_indices = torch.zeros(
-                node_indices.shape[0],
-                self.maximum_indegree,
-                dtype=torch.long,
-            )
-            valid_parent_mask = torch.zeros(
-                node_indices.shape[0],
-                self.maximum_indegree,
-                dtype=torch.bool,
-            )
+        pad = self.maximum_indegree
+        flat_nodes: list[int] = []
+        flat_subtypes: list[int] = []
+        flat_parents: list[list[int]] = []
+        flat_mask: list[list[bool]] = []
+        rank_has_valid_parents: list[bool] = []
 
-            offset = 0
+        # Nodes are visited in ascending index order above, so each rank's slice
+        # is already node-sorted -- what the old build did with an argsort.
+        for node_list in nodes_by_rank:
             has_valid_parents = False
-            for group in groups:
-                group_parents = group.parent_buffer_gather_indices
-                group_size, in_degree = group_parents.shape
-                if in_degree > self.maximum_indegree:
+            for node_idx in node_list:
+                parents = self.node_inputs_indices[node_idx]
+                in_degree = len(parents)
+                if in_degree > pad:
                     raise ValueError(
-                        f"rank contains in-degree {in_degree}, above maximum "
-                        f"{self.maximum_indegree}"
+                        f"rank contains in-degree {in_degree}, above maximum {pad}"
                     )
-                if in_degree and group_size:
-                    parent_indices[offset : offset + group_size, :in_degree] = (
-                        group_parents
-                    )
-                    valid_parent_mask[offset : offset + group_size, :in_degree] = True
-                    has_valid_parents = True
-                offset += group_size
+                has_valid_parents = has_valid_parents or in_degree > 0
+                flat_nodes.append(node_idx)
+                flat_subtypes.append(self.node_types[node_idx])
+                flat_parents.append([*parents, *(0,) * (pad - in_degree)])
+                flat_mask.append([*(True,) * in_degree, *(False,) * (pad - in_degree)])
+            rank_has_valid_parents.append(has_valid_parents)
 
-            order = node_indices.argsort()
+        total = len(flat_nodes)
+        all_nodes = torch.tensor(flat_nodes, dtype=torch.long)
+        all_subtypes = torch.tensor(flat_subtypes, dtype=torch.long)
+        all_parents = torch.tensor(flat_parents, dtype=torch.long).reshape(total, pad)
+        all_mask = torch.tensor(flat_mask, dtype=torch.bool).reshape(total, pad)
+
+        rank_batches: list[PreparedRankBatch] = []
+        offset = 0
+        for node_list, has_valid_parents in zip(nodes_by_rank, rank_has_valid_parents):
+            start = offset
+            offset += len(node_list)
+            end = offset
             rank_batches.append(
                 PreparedRankBatch(
-                    node_indices=node_indices[order],
-                    parent_indices=parent_indices[order],
-                    valid_parent_mask=valid_parent_mask[order],
-                    subtypes=subtypes[order],
+                    node_indices=all_nodes[start:end],
+                    parent_indices=all_parents[start:end],
+                    valid_parent_mask=all_mask[start:end],
+                    subtypes=all_subtypes[start:end],
                     has_valid_parents=has_valid_parents,
                 )
             )
@@ -428,21 +430,34 @@ class FixedInDegreeDAGDescription:
         position is strictly less than its consumer's position and strictly
         less than the first output position (outputs are leaves).
         """
+        pad = self.maximum_indegree
+        canonical_positions = self.canonical_positions
+        node_types_list: list[int] = []
+        position_rows: list[list[int]] = []
+        mask_rows: list[list[bool]] = []
+        # Build the padded rows in Python and convert once. Writing each slot
+        # through tensor ``__setitem__`` costs a dispatch per element and was one
+        # of the largest single costs in graph generation.
+        for node_idx in self.canonical_order:
+            node_types_list.append(self.node_types[node_idx])
+            parents = self.node_inputs_indices[node_idx]
+            in_degree = len(parents)
+            position_rows.append(
+                [
+                    *(canonical_positions[parent] for parent in parents),
+                    *(0,) * (pad - in_degree),
+                ]
+            )
+            mask_rows.append([*(True,) * in_degree, *(False,) * (pad - in_degree)])
+
         order = torch.tensor(self.canonical_order, dtype=torch.long)
-        node_types = torch.tensor(
-            [self.node_types[node_idx] for node_idx in self.canonical_order],
-            dtype=torch.long,
+        node_types = torch.tensor(node_types_list, dtype=torch.long)
+        parent_positions = torch.tensor(position_rows, dtype=torch.long).reshape(
+            self.num_nodes, pad
         )
-        parent_positions = torch.zeros(
-            self.num_nodes, self.maximum_indegree, dtype=torch.long
+        parent_slot_mask = torch.tensor(mask_rows, dtype=torch.bool).reshape(
+            self.num_nodes, pad
         )
-        parent_slot_mask = torch.zeros(
-            self.num_nodes, self.maximum_indegree, dtype=torch.bool
-        )
-        for position, node_idx in enumerate(self.canonical_order):
-            for slot, parent in enumerate(self.node_inputs_indices[node_idx]):
-                parent_positions[position, slot] = self.canonical_positions[parent]
-                parent_slot_mask[position, slot] = True
         return order, node_types, parent_positions, parent_slot_mask
 
 
@@ -539,68 +554,84 @@ def make_random_graph_description(
         node_types[node_idx] = num_trunk_node_types + num_root_nodes
         in_degrees[node_idx] = 1
 
-    # Input slots per node; ``None`` marks an unfilled slot. Roots have none.
-    parents: list[list[int | None]] = [
-        [None] * in_degrees[node_idx] for node_idx in range(num_nodes)
-    ]
+    # Filled input slots per node, appended to as the two passes run. Slot order
+    # here is an artifact of the passes and is shuffled away at the end, so both
+    # passes can simply append rather than hunt for the first open slot.
+    parents: list[list[int]] = [[] for _ in range(num_nodes)]
     # A producer (root or trunk) is "used" once some consumer slot points at it.
     has_child = [False] * num_nodes
 
-    def open_slot(consumer: int) -> int | None:
-        for slot, value in enumerate(parents[consumer]):
-            if value is None:
-                return slot
-        return None
-
     # Pass 1 -- coverage. Producers (roots + trunks) processed latest-first.
+    #
+    # ``coverable`` holds exactly the consumers eligible for the producer being
+    # processed: strictly later than it, and still holding an open slot. It is
+    # maintained incrementally instead of rescanning every later node per
+    # producer, which made this pass quadratic in the node count. Walking
+    # producers latest-first is what makes the incremental maintenance possible:
+    # the "strictly later" set only ever grows, one node per step. ``slot_of``
+    # tracks each consumer's index in ``coverable`` so a consumer whose slots
+    # just filled can be swap-removed in constant time.
+    #
+    # A producer is chosen at most once here and has never been assigned before
+    # its own turn, so a consumer can never already point at it: no duplicate
+    # check is needed, and every producer gets covered exactly once.
+    coverable: list[int] = []
+    slot_of = [-1] * num_nodes
+
+    def mark_coverable(consumer: int) -> None:
+        if in_degrees[consumer]:
+            slot_of[consumer] = len(coverable)
+            coverable.append(consumer)
+
+    def drop_coverable(consumer: int) -> None:
+        index = slot_of[consumer]
+        moved = coverable.pop()
+        if moved != consumer:
+            coverable[index] = moved
+            slot_of[moved] = index
+        slot_of[consumer] = -1
+
+    for consumer in range(output_start, num_nodes):
+        mark_coverable(consumer)
+
     for producer in range(output_start - 1, -1, -1):
-        if has_child[producer]:
-            continue
-        candidates = [
-            consumer
-            for consumer in range(producer + 1, num_nodes)
-            if open_slot(consumer) is not None and producer not in parents[consumer]
-        ]
         # The feasibility precondition guarantees a later open slot always
         # exists here; this is a defensive safety net.
-        assert candidates, f"coverage failed for producer {producer} (internal bug)"
-        consumer = rng.choice(candidates)
-        slot = open_slot(consumer)
-        assert slot is not None
-        parents[consumer][slot] = producer
+        assert coverable, f"coverage failed for producer {producer} (internal bug)"
+        consumer = coverable[rng.randrange(len(coverable))]
+        parents[consumer].append(producer)
+        if len(parents[consumer]) == in_degrees[consumer]:
+            drop_coverable(consumer)
         has_child[producer] = True
+        # The next producer is earlier, so this one becomes a legal consumer.
+        mark_coverable(producer)
 
     # Pass 2 -- fill every remaining slot with a random earlier producer.
+    # Every node before ``output_start`` is a producer, and a consumer may only
+    # reference strictly earlier nodes, so the eligible range is a contiguous
+    # ``[0, candidate_range)``. Rejection-sample from it rather than materializing
+    # the filtered pool per slot: ``existing`` holds at most in_degree - 1
+    # entries and the range is at least ``num_root_nodes >= max in-degree`` wide,
+    # so a draw is accepted with probability > 0 and in practice on the first try.
     for consumer in range(num_root_nodes, num_nodes):
-        for slot in range(len(parents[consumer])):
-            if parents[consumer][slot] is not None:
-                continue
-            existing = {value for value in parents[consumer] if value is not None}
-            # Every node before ``output_start`` is a producer, and a consumer
-            # may only reference strictly earlier nodes.
-            pool = [
-                candidate
-                for candidate in range(min(consumer, output_start))
-                if candidate not in existing
-            ]
-            chosen = rng.choice(pool)
-            parents[consumer][slot] = chosen
+        filled = parents[consumer]
+        existing = set(filled)
+        candidate_range = min(consumer, output_start)
+        while len(filled) < in_degrees[consumer]:
+            chosen = rng.randrange(candidate_range)
+            while chosen in existing:
+                chosen = rng.randrange(candidate_range)
+            filled.append(chosen)
+            existing.add(chosen)
             has_child[chosen] = True
 
     assert all(has_child[p] for p in range(output_start)), "uncovered producer remains"
 
     # Shuffle each consumer's parent order to erase the slot-position artifact
     # left by the two passes, then hand the flat arrays to the representation.
-    node_inputs_indices: list[list[int]] = []
-    for node_idx in range(num_nodes):
-        slot_values = parents[node_idx]
-        assert all(value is not None for value in slot_values)
-        ordered_parents: list[int] = [
-            value for value in slot_values if value is not None
-        ]
-        if node_idx >= num_root_nodes:
-            rng.shuffle(ordered_parents)
-        node_inputs_indices.append(ordered_parents)
+    node_inputs_indices = parents
+    for node_idx in range(num_root_nodes, num_nodes):
+        rng.shuffle(node_inputs_indices[node_idx])
 
     return FixedInDegreeDAGDescription(
         num_root_nodes=num_root_nodes,
