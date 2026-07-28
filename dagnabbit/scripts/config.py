@@ -3,7 +3,7 @@ import torch
 from dagnabbit.optimizers import AutoMuon
 
 # --- model ---
-NODE_EMBEDDING_DIM = 256
+NODE_EMBEDDING_DIM = 128
 TRUNK_NODE_TYPE_IN_DEGREES = 2
 NUM_TRUNK_NODE_TYPES = 2
 NUM_ROOT_NODES = 16
@@ -31,7 +31,7 @@ ENCODER_NUM_LAYERS = 2
 # (encoder, compressor, decoder). Head *count* is derived per module as
 # NODE_EMBEDDING_DIM // ATTENTION_HEAD_DIM, so NODE_EMBEDDING_DIM must be a
 # multiple of this; construction raises otherwise.
-ATTENTION_HEAD_DIM = 64
+ATTENTION_HEAD_DIM = 32
 
 # Compile the repeated encoder/decoder tensor kernels during CUDA training.
 # This intentionally does not compile the whole graph-shaped training step,
@@ -61,7 +61,7 @@ AMP_DTYPE = torch.bfloat16
 
 # --- training ---
 NUM_STEPS = 10_000_000
-GRAPH_BATCH_SIZE = 64
+GRAPH_BATCH_SIZE = 256
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-4
 
