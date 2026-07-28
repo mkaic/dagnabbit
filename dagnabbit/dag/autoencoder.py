@@ -94,6 +94,10 @@ class TypeConditionedSequenceTransformer(nn.Module):
     The public context length is ``max_context_length``. The module appends
     learnable register tokens and one node-type token internally, then returns
     only the transformed public context slots.
+
+    Attention here is unmasked and order-free, so a public slot's identity
+    comes entirely from its learned row of ``position_embeddings``. What each
+    slot *means* is the caller's business.
     """
 
     def __init__(
@@ -196,6 +200,17 @@ class TypeConditionedSequenceTransformer(nn.Module):
 
 
 class TransformerNodeEncoder(nn.Module):
+    """Pools one node's parent context into that node's embedding.
+
+    The context is three blocks: the K parent embeddings, then the K matching
+    absolute-position tokens, then one absolute-position token for the node
+    being encoded. Only the embedding block is pooled into the result; the
+    position tokens exist purely as attention context, telling the encoder
+    *where* in the graph each parent lives rather than just which slot it
+    fills. Their block layout is arbitrary -- attention is order-free, and the
+    transformer's learned per-slot embeddings are what actually name the slots.
+    """
+
     def __init__(self, sequence_transformer: TypeConditionedSequenceTransformer):
         super().__init__()
         self.sequence_transformer = sequence_transformer
@@ -204,17 +219,39 @@ class TransformerNodeEncoder(nn.Module):
     def forward_batch(
         self,
         parent_embeddings: Tensor,
+        parent_position_encodings: Tensor,
+        self_position_encoding: Tensor,
         subtypes: Tensor,
         valid_parent_mask: Tensor,
     ) -> Tensor:
-        transformed = self.sequence_transformer(
-            parent_embeddings,
-            subtypes,
-            valid_parent_mask,
+        num_slots = parent_embeddings.shape[1]
+        context = torch.cat(
+            [
+                parent_embeddings,
+                parent_position_encodings,
+                self_position_encoding.unsqueeze(1),
+            ],
+            dim=1,
         )
-        weights = valid_parent_mask.to(dtype=transformed.dtype).unsqueeze(-1)
+        # A padded slot masks out both of its tokens; the node's own position
+        # token is always valid.
+        valid_context_mask = torch.cat(
+            [
+                valid_parent_mask,
+                valid_parent_mask,
+                torch.ones_like(valid_parent_mask[:, :1]),
+            ],
+            dim=1,
+        )
+        transformed = self.sequence_transformer(
+            context,
+            subtypes,
+            valid_context_mask,
+        )
+        content = transformed[:, :num_slots]
+        weights = valid_parent_mask.to(dtype=content.dtype).unsqueeze(-1)
         counts = weights.sum(dim=1).clamp(min=1.0)
-        pooled = (transformed * weights).sum(dim=1) / counts.sqrt()
+        pooled = (content * weights).sum(dim=1) / counts.sqrt()
         return self.output_norm(pooled)
 
 
@@ -362,16 +399,19 @@ class DagnabbitAutoEncoder(nn.Module):
         self.compressor_num_layers = compressor_num_layers
         self.decoder_num_layers = decoder_num_layers
 
-        # ---- Recursive structural encoder (unchanged from the old scheme) ----
-        # The public context is the ordered parent-slot sequence padded to
-        # maximum_indegree; the transformer appends its own registers and one
-        # node-type token internally, so all trunk and output types share
-        # weights. Block geometry is hardcoded in the transformer class.
+        # ---- Recursive structural encoder ----
+        # The context is the ordered parent-slot sequence padded to
+        # maximum_indegree, followed by each of those parents' absolute
+        # (canonical) graph position, followed by the encoded node's own
+        # absolute position: 2K + 1 slots. The transformer appends its own
+        # registers and one node-type token internally, so all trunk and
+        # output types share weights. Block geometry is hardcoded in the
+        # transformer class.
         self.node_encoder = TransformerNodeEncoder(
             TypeConditionedSequenceTransformer(
                 node_embedding_dim=node_embedding_dim,
                 num_node_types=self.num_node_types,
-                max_context_length=self.maximum_indegree,
+                max_context_length=2 * self.maximum_indegree + 1,
                 num_layers=encoder_num_layers,
                 mlp_expansion_factor=mlp_expansion_factor,
             )
@@ -464,6 +504,14 @@ class DagnabbitAutoEncoder(nn.Module):
         )
         embeddings_buffer[:, : self.num_root_nodes] = root_node_embeddings
 
+        # Absolute graph position of every node, in the same coordinate system
+        # the compressor, decoder, and pointer head use: canonical sequence
+        # position, indexed here by node-storage index.
+        canonical_positions = self._stacked_canonical_positions(graphs, device)
+        position_encodings = self.position_encodings.to(
+            dtype=embeddings_buffer.dtype,
+        )
+
         # Walk topological ranks ascending. Rank 0 roots are seeded above. Every
         # non-root node in a rank can be encoded together because node type is an
         # input token to the shared transformer rather than a module selector.
@@ -482,11 +530,28 @@ class DagnabbitAutoEncoder(nn.Module):
                 ~rank_batch.valid_parent_mask.unsqueeze(-1),
                 0.0,
             )
+            parent_position_encodings = position_encodings[
+                canonical_positions[
+                    rank_batch.batch_indices[:, None],
+                    rank_batch.parent_indices,
+                ]
+            ].masked_fill(
+                ~rank_batch.valid_parent_mask.unsqueeze(-1),
+                0.0,
+            )
+            self_position_encoding = position_encodings[
+                canonical_positions[
+                    rank_batch.batch_indices,
+                    rank_batch.node_indices,
+                ]
+            ]
             embeddings_buffer[
                 rank_batch.batch_indices,
                 rank_batch.node_indices,
             ] = self.node_encoder.forward_batch(
                 parent_embeddings,
+                parent_position_encodings,
+                self_position_encoding,
                 rank_batch.subtypes,
                 rank_batch.valid_parent_mask,
             ).to(embeddings_buffer.dtype)
@@ -633,6 +698,16 @@ class DagnabbitAutoEncoder(nn.Module):
         if node_type < self.num_node_types:
             return 1
         raise ValueError(f"unknown node type {node_type}")
+
+    def _stacked_canonical_positions(
+        self,
+        graphs: Sequence[FixedInDegreeDAGDescription],
+        device: torch.device,
+    ) -> Tensor:
+        """Stack per-graph node-index -> canonical-position maps into [B, N]."""
+        return torch.stack(
+            [graph.canonical_positions_tensor for graph in graphs]
+        ).to(device=device, non_blocking=True)
 
     def _stacked_canonical_tensors(
         self,

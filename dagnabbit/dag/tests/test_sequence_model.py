@@ -10,7 +10,10 @@ Run directly::
 import torch
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.description import (
+    FixedInDegreeDAGDescription,
+    make_random_graph_description,
+)
 
 NUM_ROOTS = 8
 NUM_TRUNKS = 24
@@ -79,6 +82,57 @@ def test_training_forward_shapes_and_masks() -> None:
     assert not slot_mask[:, OUTPUT_START:, 1:].any()
     # Valid slots have strictly positive cross-entropy.
     assert (losses.parent_pointer_losses[slot_mask] > 0).all()
+
+
+def twin_graph() -> FixedInDegreeDAGDescription:
+    """Graph whose first two trunk nodes are exact structural twins.
+
+    Both have the same type and the same parents in the same slots, so the
+    only thing telling them apart is where they sit in the graph.
+    """
+    node_inputs_indices: list[list[int]] = [[] for _ in range(NUM_ROOTS)]
+    node_inputs_indices.append([0, 1])
+    node_inputs_indices.append([0, 1])
+    for node_idx in range(NUM_ROOTS + 2, OUTPUT_START):
+        node_inputs_indices.append([node_idx - 2, node_idx - 1])
+    for _ in range(NUM_OUTPUTS):
+        node_inputs_indices.append([OUTPUT_START - 1])
+
+    root_types_start = NUM_TRUNK_TYPES
+    node_types = [root_types_start + slot for slot in range(NUM_ROOTS)]
+    node_types += [0] * NUM_TRUNKS
+    node_types += [root_types_start + NUM_ROOTS] * NUM_OUTPUTS
+
+    return FixedInDegreeDAGDescription(
+        num_root_nodes=NUM_ROOTS,
+        num_trunk_nodes=NUM_TRUNKS,
+        num_output_nodes=NUM_OUTPUTS,
+        num_trunk_node_types=NUM_TRUNK_TYPES,
+        trunk_node_in_degrees=IN_DEGREES,
+        node_inputs_indices=node_inputs_indices,
+        node_types=node_types,
+    )
+
+
+def test_encoder_separates_structural_twins_by_position() -> None:
+    """The encoder's absolute-position tokens must reach the embeddings.
+
+    Without them the two twins are indistinguishable to the recursive encoder
+    and come out bit-identical.
+    """
+    torch.manual_seed(0)
+    model = build_small_model()
+    graph = twin_graph()
+    with torch.no_grad():
+        buffer = model.evaluate_graph_batch([graph])
+
+        assert torch.isfinite(buffer).all()
+        twins = buffer[0, NUM_ROOTS : NUM_ROOTS + 2]
+        assert float((twins[0] - twins[1]).abs().max()) > 1e-3
+
+        # Encoding is unaffected by what else shares the batch.
+        batched = model.evaluate_graph_batch([graph, sample_graphs(1)[0]])
+    assert torch.allclose(batched[0], buffer[0], atol=1e-5)
 
 
 def test_pointer_candidate_mask_layout() -> None:
@@ -185,6 +239,7 @@ def test_encode_to_latent_roundtrips_through_generate() -> None:
 
 def main() -> None:
     test_training_forward_shapes_and_masks()
+    test_encoder_separates_structural_twins_by_position()
     test_pointer_candidate_mask_layout()
     test_pointer_logits_masked_exactly_outside_candidates()
     test_end_to_end_gradient_flow()

@@ -165,6 +165,13 @@ class FixedInDegreeDAGDescription:
         self.canonical_positions = [0] * self.num_nodes
         for position, node_idx in enumerate(self.canonical_order):
             self.canonical_positions[node_idx] = position
+        # Node-storage-index -> canonical position, as a tensor: the recursive
+        # encoder gathers through it to give every node's context tokens the
+        # absolute graph positions the pointer head predicts into.
+        self.canonical_positions_tensor = torch.tensor(
+            self.canonical_positions,
+            dtype=torch.long,
+        )
         (
             self.canonical_order_tensor,
             self.canonical_node_types,
