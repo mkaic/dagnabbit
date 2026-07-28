@@ -14,6 +14,25 @@ from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.scripts import config as cfg
 
 
+def pick_device(requested: str) -> torch.device:
+    """CUDA if present, else CPU. ``auto`` deliberately never picks MPS.
+
+    On MPS the pointer argmax inside ``generate`` returns garbage indices
+    (values like 7.2e16 for a dimension of size 8), which surfaces as an
+    out-of-bounds error rather than a wrong answer only because the indices are
+    absurd. ``"mps"`` is still honoured if passed explicitly, for anyone who
+    wants to chase that down.
+
+    Lives here because every script that loads a checkpoint also has to decide
+    where to put it.
+    """
+    if requested != "auto":
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def resolve_checkpoint(argument: str | Path) -> Path:
     """Accept a .ckpt path or a run directory (best.ckpt, else latest.ckpt)."""
     path = Path(argument)

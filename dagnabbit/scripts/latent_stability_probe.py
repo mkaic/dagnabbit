@@ -39,7 +39,7 @@ import torch
 from torch import Tensor
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.checkpoint import load_model
+from dagnabbit.dag.checkpoint import load_model, pick_device
 from dagnabbit.dag.description import make_random_graph_description
 from dagnabbit.tasks.logic_gates.evaluate import (
     BitpackedTask,
@@ -51,21 +51,6 @@ from dagnabbit.tasks.logic_gates.evaluate import (
 # num_words] uint8 buffer -- ~1.2 MB per circuit for the adder table -- so an
 # unbounded batch would allocate tens of gigabytes.
 DEFAULT_EVAL_CHUNK = 128
-
-
-def pick_device(requested: str) -> torch.device:
-    """CUDA if present, else CPU. ``auto`` deliberately never picks MPS.
-
-    On MPS the pointer argmax inside ``generate`` returns garbage indices
-    (values like 7.2e16 for a dimension of size 8), which surfaces as an
-    out-of-bounds error rather than a wrong answer only because the indices are
-    absurd. ``--device mps`` is still accepted if you want to chase that down.
-    """
-    if requested != "auto":
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
 
 
 @torch.no_grad()
