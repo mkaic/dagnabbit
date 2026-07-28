@@ -39,6 +39,20 @@ TORCH_COMPILE_DYNAMIC = True
 TORCH_COMPILE_CUDAGRAPHS = False
 
 
+# --- mixed precision ---
+# Run the training forward pass under torch.autocast. The matmul-heavy ops
+# (attention, MLPs, the pointer einsum) then execute in AMP_DTYPE while master
+# weights, the optimizer, and the reductions autocast keeps in fp32
+# (cross-entropy, LayerNorm, softmax) stay full precision. Backward runs
+# outside the autocast region and produces fp32 grads, so nothing downstream --
+# clipping, Muon, checkpoints -- changes.
+#
+# bfloat16 only: it shares fp32's exponent range, so no loss scaling is needed.
+# float16 would require a GradScaler, which is deliberately not wired up.
+AMP_ENABLED = True
+AMP_DTYPE = torch.bfloat16
+
+
 # --- training ---
 NUM_STEPS = 10_000_000
 GRAPH_BATCH_SIZE = 64

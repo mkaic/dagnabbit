@@ -80,12 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--amp",
         choices=("off", "bf16", "fp16"),
-        default="off",
+        default=None,
         help=(
             "Wrap the forward in torch.autocast to measure mixed-precision "
-            "throughput. Timing-only: no GradScaler is used, so with fp16 the "
-            "gradients themselves are not trustworthy -- compare wall/step and "
-            "peak memory, not losses."
+            "throughput. Defaults to what config.py's AMP_ENABLED/AMP_DTYPE give "
+            "real training, so an unflagged profile reflects the real loop. "
+            "Timing-only: no GradScaler is used, so with fp16 the gradients "
+            "themselves are not trustworthy -- compare wall/step and peak "
+            "memory, not losses."
         ),
     )
     p.add_argument(
@@ -216,7 +218,14 @@ def main() -> None:
             for _ in range(cfg.GRAPH_BATCH_SIZE)
         ]
 
-    amp_dtype = {"off": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.amp]
+    amp_choice = args.amp
+    if amp_choice is None:
+        amp_choice = (
+            {torch.bfloat16: "bf16", torch.float16: "fp16"}[cfg.AMP_DTYPE]
+            if cfg.AMP_ENABLED
+            else "off"
+        )
+    amp_dtype = {"off": None, "bf16": torch.bfloat16, "fp16": torch.float16}[amp_choice]
 
     def autocast_ctx():
         if amp_dtype is None:
@@ -310,7 +319,7 @@ def main() -> None:
     )
     w(f"params           {num_params / 1e6:.2f}M")
     w(f"torch_compile    {cfg.TORCH_COMPILE}")
-    w(f"amp              {args.amp}")
+    w(f"amp              {amp_choice}")
     w(f"measured_steps   {args.steps} (after {args.warmup} warmup)")
     w("")
 

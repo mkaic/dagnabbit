@@ -1,7 +1,9 @@
 import argparse
 from collections import deque
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -80,6 +82,37 @@ def apply_torch_compile(model: DagnabbitAutoEncoder, device: torch.device) -> No
         f"dynamic={cfg.TORCH_COMPILE_DYNAMIC} "
         f"cudagraphs={cfg.TORCH_COMPILE_CUDAGRAPHS}"
     )
+
+
+def make_autocast_factory(device: torch.device) -> Callable[[], AbstractContextManager]:
+    """Build the per-step autocast context factory, or a no-op one if disabled.
+
+    Returns a zero-arg callable rather than a single reusable context manager so
+    each step enters a fresh one, which is how torch.autocast is meant to be
+    used. Only the forward pass belongs inside it: backward must run outside,
+    and autocast is what decides each op's precision there.
+    """
+    if not cfg.AMP_ENABLED:
+        print("amp=disabled")
+        return nullcontext
+
+    dtype = cfg.AMP_DTYPE
+    if dtype is not torch.bfloat16:
+        # fp16 needs a GradScaler to keep small gradients from flushing to zero,
+        # and none is wired into this loop. bf16 has fp32's exponent range and
+        # needs no scaling, which is why it is the only supported choice.
+        raise ValueError(
+            f"AMP_DTYPE must be torch.bfloat16; got {dtype}. Training with "
+            "float16 would need a GradScaler, which this loop does not use."
+        )
+    if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "AMP_ENABLED with bfloat16, but this CUDA device does not support it. "
+            "Set AMP_ENABLED = False in config.py (or pass --no-amp)."
+        )
+
+    print(f"amp=enabled dtype=bfloat16 device={device.type}")
+    return lambda: torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def save_checkpoint(
@@ -190,6 +223,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run the forward pass in bfloat16 under torch.autocast. "
+            "Defaults to AMP_ENABLED in config.py."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help=(
@@ -215,6 +257,8 @@ def main() -> None:
     args = parse_args()
     if args.compile is not None:
         cfg.TORCH_COMPILE = args.compile
+    if args.amp is not None:
+        cfg.AMP_ENABLED = args.amp
 
     torch.manual_seed(cfg.SEED)
     torch.set_float32_matmul_precision("high")
@@ -288,6 +332,7 @@ def main() -> None:
     ).to(device)
 
     apply_torch_compile(model, device)
+    autocast_ctx = make_autocast_factory(device)
 
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -394,8 +439,11 @@ def main() -> None:
                 for _ in range(cfg.GRAPH_BATCH_SIZE)
             ]
 
-            losses = model.training_forward_batch(graphs)
-            total, components = combine_losses(losses)
+            # Only the forward pass is autocast; backward inherits each op's
+            # recorded precision and must run outside the region.
+            with autocast_ctx():
+                losses = model.training_forward_batch(graphs)
+                total, components = combine_losses(losses)
 
             scaled_loss = total / cfg.GRADIENT_ACCUMULATION_STEPS
             scaled_loss.backward()
