@@ -98,7 +98,7 @@ CHECK_BEST_EVERY = 1000
 # model's train/eval mode and the RNG state so it cannot perturb training.
 # Costs one batch-of-one forward pass plus a truth-table evaluation. Set to
 # None to disable.
-ROUNDTRIP_PROBE_EVERY = 1000
+ROUNDTRIP_PROBE_EVERY = 100
 # Save an immutable training snapshot after this many completed graphs. The
 # interval must land on both a graph-batch and optimizer-update boundary so a
 # checkpoint represents a complete training state. Set to None to disable.
