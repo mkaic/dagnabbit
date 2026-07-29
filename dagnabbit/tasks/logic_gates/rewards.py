@@ -23,8 +23,10 @@ import torch
 from torch import Tensor
 
 from dagnabbit.dag.description import FixedInDegreeDAGDescription
+from dagnabbit.dag.policy import PolicySample
 from dagnabbit.tasks.logic_gates.evaluate import (
     BitpackedTask,
+    evaluate_choices,
     evaluate_graphs,
     popcount,
 )
@@ -83,11 +85,11 @@ def behaviour_accuracy(
 
 
 def behaviour_match_reward(
-    graphs: Sequence[FixedInDegreeDAGDescription],
+    sample: PolicySample,
     prompt_indices: Tensor,
     targets: Tensor,
     task: BitpackedTask,
-    chunk_size: int = DEFAULT_EVAL_CHUNK,
+    trunk_node_in_degrees: Sequence[int],
 ) -> Tensor:
     """Reward each sampled graph for matching its prompt's target behaviour.
 
@@ -95,8 +97,18 @@ def behaviour_match_reward(
     ``prompt_indices`` is ``[B]`` saying which prompt each graph was drawn for.
     Shaped to be bound into a
     :data:`~dagnabbit.search.grpo.RewardFunction` with ``functools.partial``.
+
+    Evaluation runs straight off the sample's choice tensors
+    (:func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices`), never
+    materializing description objects: at GRPO batch sizes that Python detour
+    dominated the training step.
     """
-    predicted = packed_behaviours(graphs, task, chunk_size)
+    predicted = evaluate_choices(
+        sample.trunk_types,
+        sample.parent_choices,
+        task,
+        trunk_node_in_degrees,
+    )
     goals = targets.to(predicted.device)[prompt_indices.to(predicted.device)]
     return behaviour_accuracy(predicted, goals, task)
 

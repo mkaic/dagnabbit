@@ -906,6 +906,24 @@ class DagnabbitAutoEncoder(nn.Module):
         return self.compress(buffer[batch_rows, order])
 
     @torch.no_grad()
+    def generate_choices(self, latent: Tensor) -> tuple[Tensor, Tensor]:
+        """Decode ``[B, K, D]`` latents into argmax choice tensors, on-device.
+
+        Returns ``(trunk_types, parent_choices)``: ``[B, T]`` trunk class ids
+        and ``[B, N, S]`` parent canonical positions. This is the whole of
+        generation except the Python description objects -- callers that only
+        need to *evaluate* the graphs (e.g. bitpacked circuit evaluation) can
+        consume these tensors directly and never leave the device;
+        :meth:`generate` builds the descriptions on top.
+        """
+        reconstructed = self.decode_latent(latent)
+        trunk_types = self.node_type_predictor(
+            reconstructed[:, self.num_root_nodes : self.output_start]
+        ).argmax(dim=-1)
+        parent_choices = self.parent_pointer_logits(reconstructed).argmax(dim=-1)
+        return trunk_types, parent_choices
+
+    @torch.no_grad()
     def generate(
         self,
         latent: Tensor,
@@ -930,12 +948,7 @@ class DagnabbitAutoEncoder(nn.Module):
         if single:
             latent = latent.unsqueeze(0)
 
-        reconstructed = self.decode_latent(latent)
-        trunk_types = self.node_type_predictor(
-            reconstructed[:, self.num_root_nodes : self.output_start]
-        ).argmax(dim=-1)
-        parent_choices = self.parent_pointer_logits(reconstructed).argmax(dim=-1)
-
+        trunk_types, parent_choices = self.generate_choices(latent)
         descriptions = self.descriptions_from_choices(trunk_types, parent_choices)
         return descriptions[0] if single else descriptions
 

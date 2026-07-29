@@ -41,14 +41,27 @@ from torch import Tensor
 from torch.distributions import Categorical, Normal
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
 
 
 @dataclass
 class PolicySample:
-    """One batch of graphs drawn from a policy, with what it costs to score them."""
+    """One batch of graphs drawn from a policy, with what it costs to score them.
 
-    graphs: list[FixedInDegreeDAGDescription]
+    Graphs stay in choice-tensor form -- the ``(trunk_types, parent_choices)``
+    pair that :meth:`DagnabbitAutoEncoder.descriptions_from_choices` consumes
+    -- rather than as built description objects. Reward evaluation reads the
+    tensors directly (:func:`~dagnabbit.tasks.logic_gates.evaluate.
+    evaluate_choices`), and building thousands of Python descriptions per
+    training step was the single largest cost of a GRPO step. Callers that
+    need real descriptions (rendering, structural comparison) can call
+    ``model.descriptions_from_choices(sample.trunk_types,
+    sample.parent_choices)`` themselves.
+    """
+
+    # [B, T] trunk class ids of each sampled graph.
+    trunk_types: Tensor
+    # [B, N, S] parent canonical positions (root rows ignored).
+    parent_choices: Tensor
     # [B] summed log-probability of the choices that produced each graph.
     log_probs: Tensor
     # [B] summed entropy of those choice distributions.
@@ -99,7 +112,7 @@ def sample_from_latent_noise(
     log_probs = distribution.log_prob(latents).sum(dim=(1, 2))
     entropies = distribution.entropy().sum(dim=(1, 2))
 
-    graphs = model.generate(project_to_shell(latents))
+    trunk_types, parent_choices = model.generate_choices(project_to_shell(latents))
     num_actions = torch.full(
         (mean_latent.shape[0],),
         mean_latent.shape[1] * mean_latent.shape[2],
@@ -107,7 +120,8 @@ def sample_from_latent_noise(
         dtype=log_probs.dtype,
     )
     return PolicySample(
-        graphs=graphs,
+        trunk_types=trunk_types,
+        parent_choices=parent_choices,
         log_probs=log_probs,
         entropies=entropies,
         num_actions=num_actions,
@@ -183,8 +197,8 @@ def sample_from_decoder(
         pointer_distribution.entropy() * weights
     ).sum(dim=(1, 2))
 
-    # descriptions_from_choices indexes parents by canonical position over all
-    # N nodes; pad the unsampled root rows back in so the layouts line up.
+    # Choice consumers index parents by canonical position over all N nodes;
+    # pad the unsampled root rows back in so the layouts line up.
     padded_choices = torch.zeros(
         batch_size,
         model.num_nodes,
@@ -195,7 +209,8 @@ def sample_from_decoder(
     padded_choices[:, model.num_root_nodes :] = parent_choices
 
     return PolicySample(
-        graphs=model.descriptions_from_choices(trunk_types, padded_choices),
+        trunk_types=trunk_types,
+        parent_choices=padded_choices,
         log_probs=log_probs,
         entropies=entropies,
         num_actions=model.num_trunk_nodes + slot_mask.sum(dim=(1, 2)),

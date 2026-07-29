@@ -40,7 +40,7 @@ from dagnabbit.dag.description import (
 from dagnabbit.dag.policy import sample_from_decoder, sample_from_latent_noise
 from dagnabbit.scripts import config as cfg
 from dagnabbit.search.grpo import GRPOConfig, grpo_step
-from dagnabbit.tasks.logic_gates.evaluate import adder_task
+from dagnabbit.tasks.logic_gates.evaluate import adder_task, evaluate_choices
 from dagnabbit.tasks.logic_gates.proposer import TruthTableProposer
 from dagnabbit.tasks.logic_gates.rewards import (
     behaviour_accuracy,
@@ -84,6 +84,7 @@ def evaluate_targets(
     group_size: int,
     gray: bool,
     device: torch.device,
+    trunk_node_in_degrees: list[int],
 ) -> dict[str, float]:
     """Sample a group per target and report how close the best one gets.
 
@@ -100,7 +101,13 @@ def evaluate_targets(
 
         # Encode once per target, then repeat the latent -- see grpo_step.
         latents = proposer(images).repeat_interleave(group_size, dim=0)
-        predicted = packed_behaviours(sampler(latents).graphs, task)
+        sampled = sampler(latents)
+        predicted = evaluate_choices(
+            sampled.trunk_types,
+            sampled.parent_choices,
+            task,
+            trunk_node_in_degrees,
+        )
         goals = targets.to(predicted.device)[prompt_indices.to(predicted.device)]
         rewards = behaviour_accuracy(predicted, goals, task).view(
             targets.shape[0], group_size
@@ -237,7 +244,12 @@ def main() -> None:
             proposer=proposer,
             specifications=images,
             sampler=sampler,
-            reward_fn=partial(behaviour_match_reward, targets=targets, task=task),
+            reward_fn=partial(
+                behaviour_match_reward,
+                targets=targets,
+                task=task,
+                trunk_node_in_degrees=model.trunk_node_in_degrees,
+            ),
             config=grpo_config,
         )
 
@@ -274,6 +286,7 @@ def main() -> None:
                 args.eval_group_size,
                 args.gray,
                 device,
+                model.trunk_node_in_degrees,
             )
             reference = evaluate_targets(
                 proposer,
@@ -283,6 +296,7 @@ def main() -> None:
                 args.eval_group_size,
                 args.gray,
                 device,
+                model.trunk_node_in_degrees,
             )
             for split, results in (
                 ("in_distribution", in_distribution),

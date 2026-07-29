@@ -28,19 +28,18 @@ Nothing here imports from :mod:`dagnabbit.tasks`. The reward arrives as a
 callable, so a new task swaps that and keeps the optimizer.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
 
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
 from dagnabbit.dag.policy import PolicySample
 
-# Given the sampled graphs and, for each one, the index of the prompt it was
-# drawn for, return a [B] float tensor of rewards.
+# Given the drawn sample (graphs in choice-tensor form) and, for each row, the
+# index of the prompt it was drawn for, return a [B] float tensor of rewards.
 RewardFunction = Callable[
-    [Sequence[FixedInDegreeDAGDescription], Tensor],
+    [PolicySample, Tensor],
     Tensor,
 ]
 
@@ -135,7 +134,7 @@ def grpo_step(
     ).repeat_interleave(group_size)
 
     sampled = sampler(proposer(specifications).repeat_interleave(group_size, dim=0))
-    rewards = reward_fn(sampled.graphs, prompt_indices).to(
+    rewards = reward_fn(sampled, prompt_indices).to(
         device=sampled.log_probs.device,
         dtype=sampled.log_probs.dtype,
     )

@@ -341,6 +341,133 @@ def evaluate_graphs(
     return buffer[:, output_start:]
 
 
+@torch.no_grad()
+def evaluate_choices(
+    trunk_types: Tensor,
+    parent_choices: Tensor,
+    task: BitpackedTask,
+    trunk_node_in_degrees: Sequence[int],
+    gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
+) -> Tensor:
+    """Evaluate circuits straight from decoder choice tensors, on-device.
+
+    ``trunk_types`` is ``[B, T]`` trunk class ids and ``parent_choices`` is
+    ``[B, N, S]`` parent canonical positions, exactly what
+    :meth:`DagnabbitAutoEncoder.generate_choices` returns: node index ==
+    canonical position, roots first, outputs last, and every choice already
+    restricted to strictly-earlier non-output positions. Returns the packed
+    outputs ``[B, num_output_nodes, num_words]`` uint8, matching
+    :func:`evaluate_graphs` bit for bit.
+
+    This is the hot path for policy-gradient training, where thousands of
+    sampled graphs are scored per step. Routing them through
+    :class:`~dagnabbit.dag.description.FixedInDegreeDAGDescription` costs
+    ~0.5 ms of pure Python per graph (device sync, ``.tolist()``, object
+    build, then re-flattening the metadata back into tensors) -- seconds per
+    step with the GPU idle throughout. Here the choices never leave the
+    device: one sequential sweep over trunk positions, each a batched gather
+    + gate over all B circuits. Positions cannot be batched by rank without
+    the per-graph topology this path exists to avoid, but a position step is
+    ~5 kernels over ``[B, num_words]``, so the sweep is launch-cheap and
+    bandwidth-bound.
+    """
+    if trunk_types.ndim != 2 or parent_choices.ndim != 3:
+        raise ValueError(
+            f"expected [B, T] types and [B, N, S] choices; got "
+            f"{tuple(trunk_types.shape)} and {tuple(parent_choices.shape)}"
+        )
+    device = task.root_values.device
+    trunk_types = trunk_types.to(device)
+    parent_choices = parent_choices.to(device)
+
+    batch_size, num_trunk_nodes = trunk_types.shape
+    num_root_nodes = task.num_root_nodes
+    num_output_nodes = task.num_output_nodes
+    output_start = num_root_nodes + num_trunk_nodes
+    num_nodes = output_start + num_output_nodes
+    num_words = task.num_words
+    if parent_choices.shape[:2] != (batch_size, num_nodes):
+        raise ValueError(
+            f"parent_choices is {tuple(parent_choices.shape)}, expected "
+            f"[{batch_size}, {num_nodes}, S]"
+        )
+    if len(gate_operators) < len(trunk_node_in_degrees):
+        raise ValueError(
+            f"{len(gate_operators)} gate operators for "
+            f"{len(trunk_node_in_degrees)} trunk node types"
+        )
+    max_in_degree = max(trunk_node_in_degrees)
+    if parent_choices.shape[2] < max_in_degree:
+        raise ValueError(
+            f"parent_choices has {parent_choices.shape[2]} slots, but the "
+            f"widest trunk type needs {max_in_degree}"
+        )
+
+    # The legality the description constructor would have asserted, checked
+    # once and vectorized: every read slot points strictly earlier and never
+    # at an output. Garbage indices would otherwise silently alias real nodes.
+    positions = torch.arange(num_nodes, device=device)
+    read_slots = parent_choices[:, num_root_nodes:, :max_in_degree]
+    if not bool(
+        (
+            (read_slots < positions[num_root_nodes:, None])
+            & (read_slots < output_start)
+        ).all()
+    ):
+        raise ValueError(
+            "parent_choices contains an index at or after its consumer "
+            "(or pointing into the output block)"
+        )
+
+    # MPS rejects gather sources above 2^31 elements; chunk the batch there.
+    # CUDA and CPU take the whole batch in one sweep.
+    chunk = batch_size
+    if device.type == "mps":
+        limit = 2**31 - 1
+        chunk = max(1, limit // (output_start * num_words))
+
+    outputs = []
+    for start in range(0, batch_size, chunk):
+        chunk_types = trunk_types[start : start + chunk]
+        chunk_choices = parent_choices[start : start + chunk]
+        rows = chunk_types.shape[0]
+
+        # Producer values only: outputs are leaves, never gathered from.
+        buffer = torch.empty(
+            rows, output_start, num_words, dtype=torch.uint8, device=device
+        )
+        buffer[:, :num_root_nodes] = task.root_values
+
+        for position in range(num_root_nodes, output_start):
+            trunk_offset = position - num_root_nodes
+            slot_indices = chunk_choices[:, position, :max_in_degree]
+            parents = buffer.gather(
+                1, slot_indices.unsqueeze(-1).expand(rows, max_in_degree, num_words)
+            )
+            value = None
+            for node_type, in_degree in enumerate(trunk_node_in_degrees):
+                candidate = gate_operators[node_type](parents[:, :in_degree])
+                if value is None:
+                    value = candidate
+                else:
+                    is_type = chunk_types[:, trunk_offset] == node_type
+                    value = torch.where(is_type[:, None], candidate, value)
+            buffer[:, position] = value
+
+        # Output nodes are in-degree-1 pass-throughs of their slot-0 parent.
+        output_indices = chunk_choices[:, output_start:, 0]
+        outputs.append(
+            buffer.gather(
+                1,
+                output_indices.unsqueeze(-1).expand(
+                    rows, num_output_nodes, num_words
+                ),
+            )
+        )
+
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+
 def popcount(words: Tensor) -> Tensor:
     """Per-byte set-bit count of a uint8 tensor, returned as uint8 (0-8).
 
