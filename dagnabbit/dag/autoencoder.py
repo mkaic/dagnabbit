@@ -936,13 +936,34 @@ class DagnabbitAutoEncoder(nn.Module):
         ).argmax(dim=-1)
         parent_choices = self.parent_pointer_logits(reconstructed).argmax(dim=-1)
 
-        trunk_types_by_graph = trunk_types.cpu().tolist()
-        parents_by_graph = parent_choices.cpu().tolist()
+        descriptions = self.descriptions_from_choices(trunk_types, parent_choices)
+        return descriptions[0] if single else descriptions
+
+    def descriptions_from_choices(
+        self,
+        trunk_types: Tensor,
+        parent_choices: Tensor,
+    ) -> list[FixedInDegreeDAGDescription]:
+        """Assemble DAG descriptions from already-chosen types and pointers.
+
+        ``trunk_types`` is ``[B, T]`` of trunk class ids and ``parent_choices``
+        is ``[B, N, S]`` of canonical positions, indexed by canonical position
+        over *all* nodes (root rows are ignored). How those choices were made
+        is the caller's business: :meth:`generate` takes argmaxes, while an RL
+        policy samples them.
+
+        Validity does not depend on the choices. Candidates were already
+        restricted to strictly-earlier non-output positions when the logits
+        were built, so parents always precede children and the result is a
+        valid DAG however the selection was made.
+        """
+        trunk_types_by_graph = trunk_types.detach().cpu().tolist()
+        parents_by_graph = parent_choices.detach().cpu().tolist()
 
         root_types_start = self.num_trunk_node_types
         output_type = self.num_trunk_node_types + self.num_root_nodes
         descriptions: list[FixedInDegreeDAGDescription] = []
-        for graph_idx in range(latent.shape[0]):
+        for graph_idx in range(len(trunk_types_by_graph)):
             node_types = [
                 root_types_start + root_slot
                 for root_slot in range(self.num_root_nodes)
@@ -977,4 +998,4 @@ class DagnabbitAutoEncoder(nn.Module):
                 )
             )
 
-        return descriptions[0] if single else descriptions
+        return descriptions
