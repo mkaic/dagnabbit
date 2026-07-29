@@ -34,9 +34,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.description import FixedInDegreeDAGDescription
-from dagnabbit.dag.policy import sample_graphs_from_latent
+from dagnabbit.dag.policy import PolicySample
 
 # Given the sampled graphs and, for each one, the index of the prompt it was
 # drawn for, return a [B] float tensor of rewards.
@@ -45,16 +44,19 @@ RewardFunction = Callable[
     Tensor,
 ]
 
+# Given [B, K, D] proposed latents, draw one graph per row and report the
+# log-probability of having drawn it. Which source of randomness that uses is
+# not this module's business; see :mod:`dagnabbit.dag.policy`.
+PolicySampler = Callable[[Tensor], PolicySample]
+
 
 @dataclass(frozen=True)
 class GRPOConfig:
     group_size: int = 32
-    temperature: float = 1.0
-    # Entropy bonus. Training starts from a randomly initialized proposer with
-    # no supervised reference to anchor it, so the usual KL-to-reference term
-    # has nothing to point at; an entropy floor is what keeps the policy from
-    # collapsing onto one graph before the reward has taught it anything.
-    entropy_weight: float = 0.01
+    # Entropy bonus. Only bites for a policy whose spread is learnable: a
+    # fixed-sigma latent policy has constant entropy, so this contributes no
+    # gradient and exploration is governed entirely by that sigma.
+    entropy_weight: float = 0.0
     # Guards the group-std division when a group happens to score identically.
     advantage_epsilon: float = 1e-4
     # Divide advantages by the group standard deviation. Standard GRPO does;
@@ -97,17 +99,24 @@ def group_advantages(
 
 
 def grpo_step(
-    model: DagnabbitAutoEncoder,
     proposer: torch.nn.Module,
     specifications: Tensor,
+    sampler: PolicySampler,
     reward_fn: RewardFunction,
     config: GRPOConfig,
 ) -> tuple[Tensor, GRPOStats]:
     """One on-policy GRPO update's loss, plus what happened.
 
     ``specifications`` is ``[P, ...]`` -- P prompts in whatever form the
-    proposer reads. Each is repeated ``group_size`` times, so the batch that
-    reaches the decoder is ``P * G``.
+    proposer reads. The batch reaching the decoder is ``P * G``.
+
+    The proposer runs on the P *distinct* specifications and its latents are
+    repeated, rather than repeating the specifications and encoding each G
+    times. The proposer is deterministic, so both give identical latents and
+    identical gradients (autograd sums the G contributions back through the one
+    forward pass) -- but a specification here is a 2 MB truth-table image and a
+    latent is a few KB, so the difference decides whether a large group fits in
+    memory at all.
 
     Returns the loss to call ``backward`` on; the caller owns the optimizer.
 
@@ -120,17 +129,12 @@ def grpo_step(
     num_prompts = specifications.shape[0]
     group_size = config.group_size
 
-    repeated = specifications.repeat_interleave(group_size, dim=0)
     prompt_indices = torch.arange(
         num_prompts,
         device=specifications.device,
     ).repeat_interleave(group_size)
 
-    sampled = sample_graphs_from_latent(
-        model,
-        proposer(repeated),
-        temperature=config.temperature,
-    )
+    sampled = sampler(proposer(specifications).repeat_interleave(group_size, dim=0))
     rewards = reward_fn(sampled.graphs, prompt_indices).to(
         device=sampled.log_probs.device,
         dtype=sampled.log_probs.dtype,

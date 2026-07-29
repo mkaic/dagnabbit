@@ -1,65 +1,136 @@
-"""The decoder read as a stochastic policy over graphs.
+"""Stochastic policies over graphs, for policy-gradient training.
 
-:meth:`DagnabbitAutoEncoder.generate` takes argmaxes, which is what you want
-for inference and exactly what you cannot use for policy-gradient training: a
-deterministic decode gives every sample in a group the same graph and the same
-reward, and there is nothing left to learn from. This module samples those same
-choices instead, and returns the log-probability of what it sampled.
+:meth:`DagnabbitAutoEncoder.generate` is deterministic, which is what you want
+for inference and exactly what you cannot train on: every sample in a group
+comes out identical and there is nothing to learn from. Something has to be
+random. There are two places to put it, and they are not equally good.
 
-The action space is the graph itself, factorized the way the decoder already
-factorizes it:
+Latent noise (:func:`sample_from_latent_noise`) perturbs the latent and decodes
+by argmax. Decoder sampling (:func:`sample_from_decoder`) keeps one latent and
+samples the decoder's per-slot distributions.
 
-* one categorical choice of trunk type at each of ``T`` trunk positions;
-* one categorical choice of parent at each *active* input slot.
+**Latent noise is the default, and the measurement is lopsided.** Scored
+against a target its latent encodes exactly, a group of 64:
 
-Which slots are active is decided by the *sampled* types, not by the argmax
-ones -- a type's in-degree is what says how many slots it has -- so the second
-group of choices is conditioned on the first. Inactive slots contribute nothing
-to the log-probability, because they contribute nothing to the graph.
+===========================  ======  ======
+exploration                    mean     std
+===========================  ======  ======
+argmax (none)                1.0000  0.0000
+decoder sampling, T=1.0      0.9999  0.0008
+latent noise, sigma=0.03     0.9942  0.0072
+latent noise, sigma=0.1      0.8211  0.0545
+latent noise, sigma=0.3      0.5633  0.1095
+===========================  ======  ======
 
-Gradients flow back through the sampled log-probabilities to the latent and
-from there into whatever produced it. The autoencoder itself can stay frozen;
-nothing here updates it.
+Decoder sampling produces almost no spread once the latent is *meaningful*.
+Its apparent diversity early in training is an artefact of an untrained
+proposer emitting garbage latents, on which the decoder's distributions are
+flat -- so that mechanism dies precisely as the model starts working. Latent
+noise gives a monotone dial instead, all the way out to the spread of
+independent random graphs, and is indifferent to decoder confidence.
+
+The two do not combine. Under latent noise the sampled latent is detached, so
+the decoder's log-probabilities have no gradient path back to the proposer;
+adding them would contribute reward variance and no signal.
 """
 
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.description import FixedInDegreeDAGDescription
 
 
 @dataclass
-class SampledGraphs:
-    """One batch of graphs sampled from the decoder, with their log-probs."""
+class PolicySample:
+    """One batch of graphs drawn from a policy, with what it costs to score them."""
 
     graphs: list[FixedInDegreeDAGDescription]
-    # [B] summed log-probability of every choice that shaped each graph.
+    # [B] summed log-probability of the choices that produced each graph.
     log_probs: Tensor
-    # [B] summed entropy of those same choice distributions.
+    # [B] summed entropy of those choice distributions.
     entropies: Tensor
-    # Number of choices actually made per graph, for reporting entropy per
-    # action rather than per graph.
+    # [B] how many choices were made, for reporting entropy per action.
     num_actions: Tensor
 
 
-def sample_graphs_from_latent(
+def project_to_shell(latent: Tensor) -> Tensor:
+    """Rescale every latent token onto a shell of radius ``sqrt(D)``.
+
+    Encoded latents come off a LayerNorm and live on that shell, so anything
+    handed to the decoder should too.
+    """
+    scale = latent.shape[-1] ** 0.5
+    norms = latent.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return latent * (scale / norms)
+
+
+def sample_from_latent_noise(
+    model: DagnabbitAutoEncoder,
+    mean_latent: Tensor,
+    sigma: float,
+) -> PolicySample:
+    """Perturb ``[B, K, D]`` latents by Gaussian noise, then decode by argmax.
+
+    The *action* is the pre-normalization latent: noise is drawn in ambient
+    space and scored by a plain Gaussian density, while projecting back onto
+    the shell and decoding are treated as part of the environment. That keeps
+    the log-probability exact and simple, and the discarded radial component is
+    one direction out of D.
+
+    ``sigma`` reads directly as a relative step: noise of scale ``sigma`` on a
+    token of norm ``sqrt(D)`` displaces it by roughly ``sigma`` of its own
+    length. Useful range measured on this decoder is 0.03 (barely moves the
+    decoded graph) to 0.3 (as diverse as unrelated random graphs).
+
+    Sampling is deliberately not reparameterized: the reward is non
+    differentiable, so the gradient has to come through the log-probability.
+    """
+    if mean_latent.ndim != 3:
+        raise ValueError("mean_latent must have shape [B, K, D]")
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive; got {sigma}")
+
+    distribution = Normal(mean_latent, sigma)
+    latents = distribution.sample()
+    log_probs = distribution.log_prob(latents).sum(dim=(1, 2))
+    entropies = distribution.entropy().sum(dim=(1, 2))
+
+    graphs = model.generate(project_to_shell(latents))
+    num_actions = torch.full(
+        (mean_latent.shape[0],),
+        mean_latent.shape[1] * mean_latent.shape[2],
+        device=mean_latent.device,
+        dtype=log_probs.dtype,
+    )
+    return PolicySample(
+        graphs=graphs,
+        log_probs=log_probs,
+        entropies=entropies,
+        num_actions=num_actions,
+    )
+
+
+def sample_from_decoder(
     model: DagnabbitAutoEncoder,
     latent: Tensor,
     temperature: float = 1.0,
-) -> SampledGraphs:
-    """Sample ``[B, K, D]`` latents into graphs, keeping the log-probs.
+) -> PolicySample:
+    """Sample the decoder's own choices, keeping one latent per graph.
 
-    ``temperature`` scales the logits before sampling: higher explores more.
-    It deliberately affects the sampling distribution *and* the reported
-    log-probabilities together, so the returned values are the log-probs of the
-    policy actually being followed.
+    The action is the graph, factorized the way the decoder factorizes it: one
+    categorical trunk type per trunk position, and one parent per *active*
+    input slot. Which slots are active follows from the sampled types -- a
+    type's in-degree is what says how many slots it has -- so the pointer
+    choices are conditioned on the type choices, and inactive slots contribute
+    nothing because they contribute nothing to the graph.
 
-    Not decorated with ``no_grad``: the returned log-probabilities are the
-    training signal.
+    Retained as the alternative to :func:`sample_from_latent_noise`, and as the
+    thing to reach for if the latent-noise scale ever proves hard to tune. See
+    the module docstring for why it is not the default.
     """
     if latent.ndim != 3:
         raise ValueError("latent must have shape [B, K, D]")
@@ -76,20 +147,18 @@ def sample_graphs_from_latent(
         ).float()
         / temperature
     )
-    trunk_types = type_distribution.sample()  # [B, T]
-    type_log_probs = type_distribution.log_prob(trunk_types)  # [B, T]
-    type_entropies = type_distribution.entropy()  # [B, T]
+    trunk_types = type_distribution.sample()
+    type_log_probs = type_distribution.log_prob(trunk_types)
+    type_entropies = type_distribution.entropy()
 
-    # Roots have no input slots, so only the trunk and output rows are ever
-    # sampled. That also sidesteps position 0, whose candidate row is entirely
-    # -inf and would make a degenerate distribution.
+    # Roots have no input slots, so only trunk and output rows are sampled.
+    # That also sidesteps position 0, whose candidate row is entirely -inf.
     pointer_logits = model.parent_pointer_logits(reconstructed)
-    sampled_rows = pointer_logits[:, model.num_root_nodes :].float() / temperature
-    pointer_distribution = Categorical(logits=sampled_rows)
-    parent_choices = pointer_distribution.sample()  # [B, N - R, S]
+    pointer_distribution = Categorical(
+        logits=pointer_logits[:, model.num_root_nodes :].float() / temperature
+    )
+    parent_choices = pointer_distribution.sample()
 
-    # A trunk position's active slot count comes from the type just sampled;
-    # every output position has exactly one.
     in_degrees = torch.tensor(model.trunk_node_in_degrees, device=device)
     active_slots = torch.cat(
         [
@@ -107,12 +176,12 @@ def sample_graphs_from_latent(
     slot_mask = slot_index.view(1, 1, -1) < active_slots.unsqueeze(-1)
     weights = slot_mask.to(type_log_probs.dtype)
 
-    pointer_log_probs = pointer_distribution.log_prob(parent_choices) * weights
-    pointer_entropies = pointer_distribution.entropy() * weights
-
-    log_probs = type_log_probs.sum(dim=1) + pointer_log_probs.sum(dim=(1, 2))
-    entropies = type_entropies.sum(dim=1) + pointer_entropies.sum(dim=(1, 2))
-    num_actions = model.num_trunk_nodes + slot_mask.sum(dim=(1, 2))
+    log_probs = type_log_probs.sum(dim=1) + (
+        pointer_distribution.log_prob(parent_choices) * weights
+    ).sum(dim=(1, 2))
+    entropies = type_entropies.sum(dim=1) + (
+        pointer_distribution.entropy() * weights
+    ).sum(dim=(1, 2))
 
     # descriptions_from_choices indexes parents by canonical position over all
     # N nodes; pad the unsampled root rows back in so the layouts line up.
@@ -125,9 +194,9 @@ def sample_graphs_from_latent(
     )
     padded_choices[:, model.num_root_nodes :] = parent_choices
 
-    return SampledGraphs(
+    return PolicySample(
         graphs=model.descriptions_from_choices(trunk_types, padded_choices),
         log_probs=log_probs,
         entropies=entropies,
-        num_actions=num_actions,
+        num_actions=model.num_trunk_nodes + slot_mask.sum(dim=(1, 2)),
     )

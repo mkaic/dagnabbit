@@ -37,7 +37,7 @@ from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_random_graph_description,
 )
-from dagnabbit.dag.policy import sample_graphs_from_latent
+from dagnabbit.dag.policy import sample_from_decoder, sample_from_latent_noise
 from dagnabbit.scripts import config as cfg
 from dagnabbit.search.grpo import GRPOConfig, grpo_step
 from dagnabbit.tasks.logic_gates.evaluate import adder_task
@@ -77,12 +77,11 @@ def behaviours_to_images(behaviours: torch.Tensor, task, gray: bool) -> torch.Te
 
 @torch.no_grad()
 def evaluate_targets(
-    model,
     proposer,
     targets: torch.Tensor,
     task,
+    sampler,
     group_size: int,
-    temperature: float,
     gray: bool,
     device: torch.device,
 ) -> dict[str, float]:
@@ -95,15 +94,13 @@ def evaluate_targets(
     proposer.eval()
     try:
         images = behaviours_to_images(targets, task, gray).to(device)
-        repeated = images.repeat_interleave(group_size, dim=0)
         prompt_indices = torch.arange(
             targets.shape[0], device=device
         ).repeat_interleave(group_size)
 
-        sampled = sample_graphs_from_latent(
-            model, proposer(repeated), temperature=temperature
-        )
-        predicted = packed_behaviours(sampled.graphs, task)
+        # Encode once per target, then repeat the latent -- see grpo_step.
+        latents = proposer(images).repeat_interleave(group_size, dim=0)
+        predicted = packed_behaviours(sampler(latents).graphs, task)
         goals = targets.to(predicted.device)[prompt_indices.to(predicted.device)]
         rewards = behaviour_accuracy(predicted, goals, task).view(
             targets.shape[0], group_size
@@ -126,8 +123,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--prompts", type=int, default=8, help="targets per step")
     parser.add_argument("--group-size", type=int, default=32)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--entropy-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--latent-sigma",
+        type=float,
+        default=0.1,
+        help="exploration noise on the latent; measured useful band 0.03-0.3",
+    )
+    parser.add_argument(
+        "--decoder-temperature",
+        type=float,
+        default=None,
+        help="explore by sampling the decoder instead of the latent "
+        "(weaker; see dagnabbit.dag.policy)",
+    )
+    parser.add_argument("--entropy-weight", type=float, default=0.0)
     parser.add_argument("--no-normalize-advantages", action="store_true")
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=6)
@@ -172,10 +181,20 @@ def main() -> None:
 
     grpo_config = GRPOConfig(
         group_size=args.group_size,
-        temperature=args.temperature,
         entropy_weight=args.entropy_weight,
         normalize_advantages=not args.no_normalize_advantages,
     )
+    # Latent noise unless explicitly overridden: sampling the decoder stops
+    # exploring once the proposer emits meaningful latents.
+    if args.decoder_temperature is None:
+        sampler = partial(sample_from_latent_noise, model, sigma=args.latent_sigma)
+        exploration = f"latent noise sigma={args.latent_sigma}"
+    else:
+        sampler = partial(
+            sample_from_decoder, model, temperature=args.decoder_temperature
+        )
+        exploration = f"decoder sampling T={args.decoder_temperature}"
+    print(f"exploration: {exploration}")
     optimizer = torch.optim.AdamW(proposer.parameters(), lr=args.learning_rate)
     run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S-grpo")
     run_dir = Path(cfg.TENSORBOARD_LOG_DIR) / run_name
@@ -200,9 +219,9 @@ def main() -> None:
         prepared = time.perf_counter()
 
         loss, stats = grpo_step(
-            model=model,
             proposer=proposer,
             specifications=images,
+            sampler=sampler,
             reward_fn=partial(behaviour_match_reward, targets=targets, task=task),
             config=grpo_config,
         )
@@ -233,22 +252,20 @@ def main() -> None:
 
         if step % args.eval_every == 0:
             in_distribution = evaluate_targets(
-                model,
                 proposer,
                 packed_behaviours(sample_graphs(args.eval_targets), task).to(device),
                 task,
+                sampler,
                 args.eval_group_size,
-                args.temperature,
                 args.gray,
                 device,
             )
             reference = evaluate_targets(
-                model,
                 proposer,
                 reference_targets,
                 task,
+                sampler,
                 args.eval_group_size,
-                args.temperature,
                 args.gray,
                 device,
             )
