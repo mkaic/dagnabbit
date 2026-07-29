@@ -112,7 +112,15 @@ CHECKPOINT_EVERY_GRAPHS = None
 # DEVICE="cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
+# Stage-one pretraining runs: the autoencoder learning to reconstruct random
+# graphs. Checkpoints downstream stages load live here.
 TENSORBOARD_LOG_DIR = "runs"
+# Stage-two task-adaptation runs: anything trained *against* a frozen
+# stage-one checkpoint rather than producing one. Kept separate so a directory
+# listing of `runs/` stays a list of checkpoints worth loading, and so the two
+# stages' TensorBoard scalars -- which share no axes and no meaning -- never
+# land in the same board.
+ADAPTATION_LOG_DIR = "adaptations"
 
 # --- loss weights ---
 # Trunk-type classification cross-entropy over the reconstructed sequence.

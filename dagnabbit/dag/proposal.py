@@ -35,12 +35,20 @@ READOUT_DROPOUT = 0.0
 
 
 class LatentReadout(nn.Module):
-    """Context tokens ``[B, T, D]`` -> graph latent ``[B, K, D]``.
+    """Context tokens ``[B, T, C]`` -> graph latent ``[B, K, D]``.
 
     ``K`` learned queries cross-attend over however many context tokens the
     specification encoder produced, so the latent shape is decoupled from the
     specification's size: a task with 256 patch tokens and one with 40 example
     tokens both land on the same ``[K, D]``.
+
+    Attention runs at the encoder's width ``C``, and a final projection maps to
+    the autoencoder's latent width ``D``. Those two are deliberately separate.
+    How much capacity it takes to *read* a specification has nothing to do with
+    how many dimensions the autoencoder happens to need to *describe a graph*,
+    and tying them would cap the encoder's width at whatever the latent budget
+    is -- which is exactly backwards, since the point of a tight latent is that
+    it is tight.
 
     The output is projected onto a shell of radius ``sqrt(D)``. Encoded latents
     come off a ``LayerNorm`` and so live on that shell already; emitting onto it
@@ -48,24 +56,31 @@ class LatentReadout(nn.Module):
     whatever magnitude the proposer happens to settle at.
     """
 
-    def __init__(self, embedding_dim: int, num_latent_tokens: int, num_heads: int):
+    def __init__(
+        self,
+        context_dim: int,
+        latent_dim: int,
+        num_latent_tokens: int,
+        num_heads: int,
+    ):
         super().__init__()
-        self.queries = nn.Parameter(torch.empty(num_latent_tokens, embedding_dim))
+        self.queries = nn.Parameter(torch.empty(num_latent_tokens, context_dim))
         nn.init.normal_(self.queries, std=0.02)
-        self.query_norm = nn.LayerNorm(embedding_dim)
-        self.context_norm = nn.LayerNorm(embedding_dim)
+        self.query_norm = nn.LayerNorm(context_dim)
+        self.context_norm = nn.LayerNorm(context_dim)
         self.attention = nn.MultiheadAttention(
-            embedding_dim,
+            context_dim,
             num_heads,
             dropout=READOUT_DROPOUT,
             batch_first=True,
         )
-        self.output_norm = nn.LayerNorm(embedding_dim)
-        self.latent_scale = math.sqrt(embedding_dim)
+        self.output_norm = nn.LayerNorm(context_dim)
+        self.to_latent = nn.Linear(context_dim, latent_dim)
+        self.latent_scale = math.sqrt(latent_dim)
 
     def forward(self, context: Tensor) -> Tensor:
         if context.ndim != 3:
-            raise ValueError("context must have shape [B, T, D]")
+            raise ValueError("context must have shape [B, T, C]")
         batch_size = context.shape[0]
         queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
         context = self.context_norm(context)
@@ -75,7 +90,7 @@ class LatentReadout(nn.Module):
             context,
             need_weights=False,
         )
-        latent = self.output_norm(queries + attended)
+        latent = self.to_latent(self.output_norm(queries + attended))
         normalized = latent / latent.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         return normalized * self.latent_scale
 

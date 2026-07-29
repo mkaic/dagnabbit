@@ -77,6 +77,7 @@ class TruthTableProposer(nn.Module):
         image_width: int,
         patch_size: int,
         embedding_dim: int,
+        latent_dim: int,
         num_latent_tokens: int,
         num_layers: int,
         mlp_expansion_factor: float,
@@ -89,8 +90,9 @@ class TruthTableProposer(nn.Module):
             )
         if embedding_dim % PROPOSER_ATTENTION_HEAD_DIM != 0:
             raise ValueError(
-                "embedding_dim must be a multiple of the fixed "
-                f"{PROPOSER_ATTENTION_HEAD_DIM}-wide head dim; got {embedding_dim}"
+                "embedding_dim is the ViT's own width and must be a multiple of "
+                f"the fixed {PROPOSER_ATTENTION_HEAD_DIM}-wide head dim; got "
+                f"{embedding_dim}"
             )
         num_heads = embedding_dim // PROPOSER_ATTENTION_HEAD_DIM
         self.patch_size = patch_size
@@ -123,7 +125,12 @@ class TruthTableProposer(nn.Module):
             ]
         )
         self.encoder_norm = nn.LayerNorm(embedding_dim)
-        self.readout = LatentReadout(embedding_dim, num_latent_tokens, num_heads)
+        self.readout = LatentReadout(
+            context_dim=embedding_dim,
+            latent_dim=latent_dim,
+            num_latent_tokens=num_latent_tokens,
+            num_heads=num_heads,
+        )
 
     @classmethod
     def for_task(
@@ -131,13 +138,17 @@ class TruthTableProposer(nn.Module):
         task: BitpackedTask,
         model: DagnabbitAutoEncoder,
         patch_size: int,
+        embedding_dim: int,
         num_layers: int,
         mlp_expansion_factor: float,
     ) -> "TruthTableProposer":
         """Build a proposer whose shapes match a task and a frozen autoencoder.
 
         Keeps the "which dimension comes from where" wiring in one place rather
-        than in every script that wants a proposer.
+        than in every script that wants a proposer. Note what the autoencoder
+        does *not* determine: ``embedding_dim`` is the ViT's own width and is
+        the caller's to choose. Only the latent shape is dictated by the
+        checkpoint.
         """
         height, width = image_dimensions(task.root_values.shape[0])
         return cls(
@@ -145,7 +156,8 @@ class TruthTableProposer(nn.Module):
             image_height=height,
             image_width=width,
             patch_size=patch_size,
-            embedding_dim=model.node_embedding_dim,
+            embedding_dim=embedding_dim,
+            latent_dim=model.node_embedding_dim,
             num_latent_tokens=model.num_output_nodes,
             num_layers=num_layers,
             mlp_expansion_factor=mlp_expansion_factor,

@@ -72,7 +72,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=512,
+        help="ViT width; independent of the checkpoint's latent dim",
+    )
+    parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--mlp-expansion-factor", type=float, default=4.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
@@ -82,6 +88,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--eval-graphs", type=int, default=16)
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--log-dir",
+        default=cfg.ADAPTATION_LOG_DIR,
+        help="stage-two runs live apart from the stage-one checkpoints "
+        f"in {cfg.TENSORBOARD_LOG_DIR}/",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -102,6 +114,7 @@ def main() -> None:
         task=task,
         model=model,
         patch_size=args.patch_size,
+        embedding_dim=args.embedding_dim,
         num_layers=args.num_layers,
         mlp_expansion_factor=args.mlp_expansion_factor,
     ).to(device)
@@ -115,7 +128,7 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(proposer.parameters(), lr=args.learning_rate)
     run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S-proposer")
-    run_dir = Path(cfg.TENSORBOARD_LOG_DIR) / run_name
+    run_dir = Path(args.log_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(run_dir))
     print(f"run_dir={run_dir}")

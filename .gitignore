@@ -6,6 +6,7 @@ runs_archive
 outputs
 *.png
 runs/
+adaptations/
 
 profile_out*/
 profile_terminal_output*.txt
