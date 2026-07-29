@@ -6,15 +6,37 @@ objective. Scored against the adder, random circuits are pinned at 0.4996 +/-
 
 Instead, every random graph is treated as its own goal: evaluate it, call what
 it computed the target, and reward a proposal for matching *that*. Labels are
-exact, unlimited, and need no search -- hindsight relabelling. The reward then
-spreads over roughly 0.47 +/- 0.11 within a group, which is what the
-group-relative advantage needs.
+exact, unlimited, and need no search -- hindsight relabelling.
 
 The wager is that a model which learns to invert arbitrary circuit behaviours
 has learned to invert circuit behaviours in general, and that the adder is then
 one more query. Whether that transfers across the gap between random-circuit
 behaviour and *structured* behaviour is the open question; it is what the
 reference-circuit evaluation measures.
+
+Why the reward is a correlation and not an accuracy
+---------------------------------------------------
+Bit accuracy has a degenerate global optimum, and GRPO finds it. Random-circuit
+output planes are heavily biased (about a fifth are outright constant), so the
+highest-scoring *simple* policy is to read the target's per-plane majority bit
+and emit a constant matching it. That earns ``E[max(p, 1-p)]`` -- roughly 0.67
+against relabelled random targets. Measured on runs of 2026-07-28: reward_mean
+climbed 0.52 -> 0.67 while ``constant_output_fraction`` climbed 0.13 -> 0.98,
+which is that hack and nothing else.
+
+The hack pays nothing on the targets actually worth solving. Every output plane
+of the adder is exactly balanced -- for fixed ``a``, ``b`` sweeps all 256
+values, so each sum bit is 50/50 -- and so is XOR's. A constant predictor
+therefore scores exactly 0.5 there, which is what the reference evaluation
+reported to four decimal places, unmoved, for 1910 steps.
+
+:func:`behaviour_correlation` (the Matthews correlation coefficient, per output
+plane) removes the attractor at the root: its numerator is identically zero
+whenever the *prediction* is constant, whatever the target's bias, so majority
+matching earns nothing. It is also zero whenever the *target* plane is
+constant, which correctly marks those planes as carrying no learnable signal
+rather than as free reward. On a balanced target it reduces to ``2 * accuracy
+- 1``, so on the references it is the same measurement rescaled.
 """
 
 from collections.abc import Sequence
@@ -58,6 +80,99 @@ def packed_behaviours(
     )
 
 
+def behaviour_confusion(
+    predicted: Tensor,
+    targets: Tensor,
+    task: BitpackedTask,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Per-output-plane confusion counts of ``[B, C, W]`` packed behaviours.
+
+    Returns ``(true_positives, false_positives, false_negatives,
+    true_negatives)``, each ``[B, C]`` int64 on the CPU. Three popcounts carry
+    it: the intersection plus each side's own set bits determine the rest.
+
+    Counted exactly as int64 and returned on the CPU for the same reasons
+    :func:`~dagnabbit.tasks.logic_gates.evaluate.bit_accuracy` gives -- the
+    count tensor is tiny next to the evaluation, and the ratios downstream want
+    a float64 MPS does not have.
+    """
+    if predicted.shape != targets.shape:
+        raise ValueError(
+            f"predicted {tuple(predicted.shape)} and targets "
+            f"{tuple(targets.shape)} must match"
+        )
+    mask = task.valid_bit_mask
+    true_positives = popcount(predicted & targets & mask).sum(
+        dim=-1, dtype=torch.int64
+    )
+    predicted_ones = popcount(predicted & mask).sum(dim=-1, dtype=torch.int64)
+    target_ones = popcount(targets & mask).sum(dim=-1, dtype=torch.int64)
+
+    true_positives = true_positives.cpu()
+    false_positives = predicted_ones.cpu() - true_positives
+    false_negatives = target_ones.cpu() - true_positives
+    true_negatives = (
+        task.num_rows - true_positives - false_positives - false_negatives
+    )
+    return true_positives, false_positives, false_negatives, true_negatives
+
+
+def behaviour_correlation(
+    predicted: Tensor,
+    targets: Tensor,
+    task: BitpackedTask,
+) -> Tensor:
+    """Per-output-plane Matthews correlation of ``[B, C, W]`` behaviours.
+
+    Returns ``[B, C]`` in [-1, 1]: 1 for an exactly reproduced plane, 0 for a
+    plane no better than a constant, negative for an inverted one. This is the
+    training reward -- see the module docstring for why accuracy is not.
+
+    Degenerate cases fall out of the arithmetic rather than needing a branch.
+    A constant prediction has ``TP*TN - FP*FN == 0`` (one of each product's
+    factors is zero), and its denominator is zero too; a constant target
+    likewise. Counts are integers, so a non-zero denominator is at least 1, and
+    clamping there turns exactly the 0/0 cases into 0.
+    """
+    true_positives, false_positives, false_negatives, true_negatives = (
+        count.double()
+        for count in behaviour_confusion(predicted, targets, task)
+    )
+    numerator = (
+        true_positives * true_negatives - false_positives * false_negatives
+    )
+    # Paired rather than multiplied out: each pair's product stays under 2^53
+    # for tables up to 2^26 rows, so float64 carries it exactly.
+    denominator = torch.sqrt(
+        (true_positives + false_positives) * (true_positives + false_negatives)
+    ) * torch.sqrt(
+        (true_negatives + false_positives) * (true_negatives + false_negatives)
+    )
+    return numerator / denominator.clamp(min=1.0)
+
+
+def behaviour_accuracy_per_output(
+    predicted: Tensor,
+    targets: Tensor,
+    task: BitpackedTask,
+) -> Tensor:
+    """Per-output-plane bit accuracy of ``[B, C, W]`` behaviours -> ``[B, C]``.
+
+    Retained alongside :func:`behaviour_correlation` for reporting: it is the
+    statistic every run before 2026-07-28 optimized, so logging it keeps new
+    runs comparable with those curves. It is *not* a good training signal; the
+    module docstring explains what it rewards instead.
+    """
+    if predicted.shape != targets.shape:
+        raise ValueError(
+            f"predicted {tuple(predicted.shape)} and targets "
+            f"{tuple(targets.shape)} must match"
+        )
+    mismatched = (predicted ^ targets) & task.valid_bit_mask
+    mismatches = popcount(mismatched).sum(dim=-1, dtype=torch.int64).cpu()
+    return 1.0 - mismatches.double() / task.num_rows
+
+
 def behaviour_accuracy(
     predicted: Tensor,
     targets: Tensor,
@@ -67,21 +182,18 @@ def behaviour_accuracy(
 
     The per-graph counterpart of
     :func:`~dagnabbit.tasks.logic_gates.evaluate.bit_accuracy`, which scores a
-    batch against one shared target. Here every graph has its own.
-
-    Counted exactly as int64, then divided in float64 on the CPU, matching how
-    ``bit_accuracy`` keeps the score exact for tables larger than float32's
-    integer range.
+    batch against one shared target. Here every graph has its own. The plane
+    average of :func:`behaviour_accuracy_per_output`.
     """
-    if predicted.shape != targets.shape:
-        raise ValueError(
-            f"predicted {tuple(predicted.shape)} and targets "
-            f"{tuple(targets.shape)} must match"
-        )
-    mismatched = (predicted ^ targets) & task.valid_bit_mask
-    mismatches = popcount(mismatched).sum(dim=(-2, -1), dtype=torch.int64).cpu()
-    total_bits = task.num_rows * predicted.shape[1]
-    return 1.0 - mismatches.double() / total_bits
+    return behaviour_accuracy_per_output(predicted, targets, task).mean(dim=-1)
+
+
+# Selectable per-output training statistics, by ``--reward-statistic`` name.
+# Each maps ``[B, C, W]`` predictions and goals to a ``[B, C]`` reward.
+BEHAVIOUR_STATISTICS = {
+    "correlation": behaviour_correlation,
+    "accuracy": behaviour_accuracy_per_output,
+}
 
 
 def behaviour_match_reward(
@@ -90,19 +202,27 @@ def behaviour_match_reward(
     targets: Tensor,
     task: BitpackedTask,
     trunk_node_in_degrees: Sequence[int],
+    statistic: str = "correlation",
 ) -> Tensor:
     """Reward each sampled graph for matching its prompt's target behaviour.
 
     ``targets`` is ``[P, C, W]``, one goal behaviour per prompt;
     ``prompt_indices`` is ``[B]`` saying which prompt each graph was drawn for.
-    Shaped to be bound into a
-    :data:`~dagnabbit.search.grpo.RewardFunction` with ``functools.partial``.
+    Returns ``[B, C]`` -- one reward *per output plane*, left undecomposed for
+    :func:`~dagnabbit.search.grpo.grpo_step` to assign credit with. Shaped to
+    be bound into a :data:`~dagnabbit.search.grpo.RewardFunction` with
+    ``functools.partial``.
 
     Evaluation runs straight off the sample's choice tensors
     (:func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices`), never
     materializing description objects: at GRPO batch sizes that Python detour
     dominated the training step.
     """
+    if statistic not in BEHAVIOUR_STATISTICS:
+        raise ValueError(
+            f"unknown reward statistic {statistic!r}; expected one of "
+            f"{sorted(BEHAVIOUR_STATISTICS)}"
+        )
     predicted = evaluate_choices(
         sample.trunk_types,
         sample.parent_choices,
@@ -110,7 +230,7 @@ def behaviour_match_reward(
         trunk_node_in_degrees,
     )
     goals = targets.to(predicted.device)[prompt_indices.to(predicted.device)]
-    return behaviour_accuracy(predicted, goals, task)
+    return BEHAVIOUR_STATISTICS[statistic](predicted, goals, task)
 
 
 def constant_output_fraction(behaviours: Tensor, task: BitpackedTask) -> float:
@@ -119,8 +239,12 @@ def constant_output_fraction(behaviours: Tensor, task: BitpackedTask) -> float:
     A guard against the obvious reward hack. Nearly a fifth of random graphs'
     output planes are already constant, so a policy can farm real reward by
     learning to emit constants and matching those. If this climbs toward 1
-    while reward improves, the reward is being gamed rather than solved.
+    while reward improves, the reward is being gamed rather than solved. Under
+    an accuracy reward it did exactly that, reaching 0.98 -- which is what
+    :func:`behaviour_correlation` exists to prevent.
+
+    Counted on the CPU: the fraction is a float64 mean and MPS has no float64.
     """
     ones = popcount(behaviours & task.valid_bit_mask).sum(dim=-1, dtype=torch.int64)
     dead = (ones == 0) | (ones == task.num_rows)
-    return float(dead.double().mean())
+    return float(dead.cpu().double().mean())

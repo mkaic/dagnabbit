@@ -12,7 +12,8 @@ Run directly for a quick pass::
 
 import torch
 
-from dagnabbit.search.grpo import GRPOConfig, group_advantages
+from dagnabbit.dag.policy import PolicySample
+from dagnabbit.search.grpo import GRPOConfig, group_advantages, grpo_step
 
 
 def test_advantages_are_centred_within_each_group() -> None:
@@ -101,6 +102,137 @@ def test_identical_rewards_do_not_explode() -> None:
     advantages = group_advantages(rewards, GRPOConfig())
     assert torch.isfinite(advantages).all()
     assert torch.allclose(advantages, torch.zeros_like(advantages), atol=1e-6)
+
+
+def test_reward_parts_are_scored_independently() -> None:
+    """Each part of a ``[P, G, C]`` reward is centred on its own group column.
+
+    This is what per-output scoring buys: an output plane every sample finds
+    equally hard contributes nothing, instead of shifting the ranking on a
+    plane they actually differ on.
+    """
+    rewards = torch.tensor([[[0.1, 5.0], [0.2, 5.0], [0.6, 5.0]]])
+    advantages = group_advantages(rewards, GRPOConfig())
+
+    assert torch.allclose(advantages[..., 1], torch.zeros(1, 3), atol=1e-3), (
+        "a plane that is flat across the group must yield no advantage"
+    )
+    alone = group_advantages(rewards[..., :1], GRPOConfig())
+    assert torch.allclose(advantages[..., 0], alone[..., 0], atol=1e-6), (
+        "a plane's advantages must not depend on the other planes"
+    )
+
+
+def _stub_step(
+    reward: torch.Tensor,
+    config: GRPOConfig,
+    num_tokens: int = 2,
+    with_token_log_probs: bool = True,
+):
+    """Run ``grpo_step`` over a fixed reward with a differentiable stand-in.
+
+    One prompt, so the whole reward is a single group. The proposer emits one
+    learnable mean per latent token, and the sampler scores fixed stand-in
+    draws against it with the Gaussian log-density the real latent-noise policy
+    uses. That shape matters: a log-probability that ignored which sample was
+    drawn would make every group member's gradient identical, and centred
+    advantages would then cancel it to exactly zero.
+    """
+    group_size = config.group_size
+    latent = torch.nn.Parameter(torch.zeros(1, num_tokens))
+    draws = torch.arange(
+        1.0, group_size * num_tokens + 1.0
+    ).view(group_size, num_tokens)
+
+    class Proposer(torch.nn.Module):
+        def forward(self, specifications):
+            return latent
+
+    def sampler(proposed):
+        # d/d(mean) of a unit-variance Gaussian log-density is (draw - mean).
+        token_log_probs = -0.5 * (draws - proposed) ** 2
+        return PolicySample(
+            trunk_types=torch.zeros(group_size, 1, dtype=torch.long),
+            parent_choices=torch.zeros(group_size, 1, 1, dtype=torch.long),
+            log_probs=token_log_probs.sum(dim=1),
+            entropies=torch.zeros(group_size),
+            num_actions=torch.ones(group_size),
+            token_log_probs=token_log_probs if with_token_log_probs else None,
+        )
+
+    loss, stats = grpo_step(
+        proposer=Proposer(),
+        specifications=torch.zeros(1, 1),
+        sampler=sampler,
+        reward_fn=lambda sample, prompt_indices: reward,
+        config=config,
+    )
+    loss.backward()
+    return latent.grad, stats
+
+
+def test_factored_credit_pays_each_plane_to_its_own_token() -> None:
+    """Plane c's advantage must reach latent token c and no other.
+
+    Plane 0 separates the group and plane 1 does not, so token 0 must receive
+    gradient and token 1 must receive none -- the property that makes this
+    worth the bias documented on ``GRPOConfig.factored_credit``.
+    """
+    reward = torch.tensor([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    gradient, _ = _stub_step(reward, GRPOConfig(group_size=3, factored_credit=True))
+
+    assert gradient[:, 0].abs().sum() > 0.1, "the separating plane must teach"
+    assert gradient[:, 1].abs().sum() < 1e-6, (
+        "a flat plane must not push the token it was scored against"
+    )
+
+
+def test_aggregate_credit_pushes_tokens_no_plane_separated() -> None:
+    """The contrast with factored credit, on the same reward.
+
+    Averaging the planes into one scalar multiplies *every* token's
+    log-probability by it, so the token whose own plane was flat is still
+    pushed by the other plane's signal. That is the dilution factored credit
+    exists to avoid.
+    """
+    reward = torch.tensor([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    gradient, _ = _stub_step(reward, GRPOConfig(group_size=3, factored_credit=False))
+
+    assert gradient[:, 1].abs().sum() > 0.1, (
+        "aggregate credit cannot tell the flat plane's token apart"
+    )
+
+
+def test_scalar_rewards_still_work() -> None:
+    """A ``[B]`` reward is the C == 1 case and must not need special handling."""
+    reward = torch.tensor([0.0, 1.0, 2.0])
+    gradient, stats = _stub_step(
+        reward, GRPOConfig(group_size=3, factored_credit=False), num_tokens=1
+    )
+    assert gradient.abs().sum() > 0.1
+    assert stats.dead_plane_fraction == 0.0
+
+
+def test_dead_planes_are_counted() -> None:
+    """The flat-plane diagnostic reports what fraction carries no signal."""
+    reward = torch.tensor([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    _, stats = _stub_step(reward, GRPOConfig(group_size=3, factored_credit=True))
+    assert stats.dead_plane_fraction == 0.5, "one of the two planes is flat"
+
+
+def test_factored_credit_rejects_a_sampler_without_token_log_probs() -> None:
+    """Decoder sampling has no latent-token axis; that must fail loudly."""
+    reward = torch.tensor([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    try:
+        _stub_step(
+            reward,
+            GRPOConfig(group_size=3, factored_credit=True),
+            with_token_log_probs=False,
+        )
+    except ValueError as error:
+        assert "token_log_probs" in str(error)
+    else:
+        raise AssertionError("expected a ValueError naming the missing field")
 
 
 def main() -> None:

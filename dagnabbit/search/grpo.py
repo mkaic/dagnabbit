@@ -37,7 +37,8 @@ from torch import Tensor
 from dagnabbit.dag.policy import PolicySample
 
 # Given the drawn sample (graphs in choice-tensor form) and, for each row, the
-# index of the prompt it was drawn for, return a [B] float tensor of rewards.
+# index of the prompt it was drawn for, return the rewards: [B], or [B, C] to
+# score C parts of the specification separately (see GRPOConfig.factored_credit).
 RewardFunction = Callable[
     [PolicySample, Tensor],
     Tensor,
@@ -62,6 +63,22 @@ class GRPOConfig:
     # turning it off gives the unnormalized ("Dr. GRPO") variant, which drops
     # the bias that scaling by std introduces toward low-variance groups.
     normalize_advantages: bool = True
+    # Pay each part of a [B, C] reward to the latent token positionally
+    # responsible for it, instead of averaging the parts into one scalar that
+    # multiplies the whole log-probability.
+    #
+    # This is a bias-for-variance trade, and worth being explicit about. The
+    # unbiased estimator is ``(sum_c A_c) * sum_k grad log p(z_k)``; factoring
+    # keeps only the ``c == k`` terms. Those cross terms are genuinely nonzero
+    # here -- the decoder attends over the whole latent, so every output plane
+    # depends on every token -- so this is a heuristic, not an identity. What
+    # it buys is a per-plane learning signal instead of one averaged scalar,
+    # which matters most when planes differ sharply in difficulty and an
+    # improvement on a hard one is diluted by seven unchanged ones.
+    #
+    # Requires the sampler to populate ``PolicySample.token_log_probs`` with a
+    # token axis matching the reward's C.
+    factored_credit: bool = True
 
 
 @dataclass(frozen=True)
@@ -76,6 +93,11 @@ class GRPOStats:
     advantage_abs_mean: float
     entropy_per_action: float
     log_prob_mean: float
+    # Fraction of (prompt, output-plane) cells whose group is flat enough that
+    # the epsilon guard zeroes its advantages -- signal that isn't there. With
+    # a correlation reward this is expected to be substantial: a constant
+    # target plane scores 0 for every sample in the group, by construction.
+    dead_plane_fraction: float
 
     def scalars(self, prefix: str = "grpo") -> dict[str, float]:
         return {f"{prefix}/{name}": value for name, value in vars(self).items()}
@@ -85,7 +107,12 @@ def group_advantages(
     rewards: Tensor,
     config: GRPOConfig,
 ) -> Tensor:
-    """``[P, G]`` rewards -> ``[P, G]`` advantages, centred within each group.
+    """Rewards -> advantages, centred within each group.
+
+    Takes ``[P, G]``, or ``[P, G, C]`` to centre and scale each of C reward
+    parts against its own group statistics. Reducing over axis 1 either way,
+    the group axis, so the C parts never mix: a plane every sample finds hard
+    does not drag down the ranking on a plane they differ on.
 
     Split out from the step so the arithmetic can be tested against hand-worked
     numbers without a model in the way.
@@ -108,6 +135,12 @@ def grpo_step(
 
     ``specifications`` is ``[P, ...]`` -- P prompts in whatever form the
     proposer reads. The batch reaching the decoder is ``P * G``.
+
+    ``reward_fn`` may score the specification as a whole (``[B]``) or in C
+    parts (``[B, C]``). Parts are centred and scaled against their own group
+    statistics either way; ``GRPOConfig.factored_credit`` decides whether each
+    part's advantage is then paid to its own latent token or averaged into one
+    scalar for the whole log-probability.
 
     The proposer runs on the P *distinct* specifications and its latents are
     repeated, rather than repeating the specifications and encoding each G
@@ -138,27 +171,58 @@ def grpo_step(
         device=sampled.log_probs.device,
         dtype=sampled.log_probs.dtype,
     )
-    if rewards.shape != (num_prompts * group_size,):
+    batch_size = num_prompts * group_size
+    # A [B] reward is the C == 1 case; carrying one shape from here keeps the
+    # two credit-assignment modes from needing separate arithmetic.
+    if rewards.ndim == 1:
+        rewards = rewards.unsqueeze(-1)
+    if rewards.ndim != 2 or rewards.shape[0] != batch_size:
         raise ValueError(
             f"reward_fn returned {tuple(rewards.shape)}, expected "
-            f"({num_prompts * group_size},)"
+            f"({batch_size},) or ({batch_size}, C)"
         )
+    num_parts = rewards.shape[1]
 
-    grouped = rewards.view(num_prompts, group_size)
-    advantages = group_advantages(grouped, config).flatten().detach()
+    grouped = rewards.view(num_prompts, group_size, num_parts)
+    advantages = group_advantages(grouped, config).view(batch_size, num_parts).detach()
 
-    policy_loss = -(advantages * sampled.log_probs).mean()
+    if config.factored_credit:
+        token_log_probs = sampled.token_log_probs
+        if token_log_probs is None:
+            raise ValueError(
+                "factored_credit needs PolicySample.token_log_probs, which "
+                "this sampler does not provide; set factored_credit=False"
+            )
+        if token_log_probs.shape != (batch_size, num_parts):
+            raise ValueError(
+                f"token_log_probs is {tuple(token_log_probs.shape)}, but the "
+                f"reward has {num_parts} parts to pay to {batch_size} rows; "
+                "the latent must carry one token per scored part"
+            )
+        weighted = (advantages * token_log_probs).sum(dim=-1)
+    else:
+        # Averaged rather than summed so the loss keeps the scale it had when
+        # the reward was a single plane-averaged scalar.
+        weighted = advantages.mean(dim=-1) * sampled.log_probs
+
+    policy_loss = -weighted.mean()
     entropy_per_action = (sampled.entropies / sampled.num_actions).mean()
     loss = policy_loss - config.entropy_weight * entropy_per_action
 
+    # Per-sample scalars for reporting: a graph's reward is its plane average,
+    # whatever credit assignment the update itself used.
+    per_sample = grouped.mean(dim=-1)
     stats = GRPOStats(
         loss=loss.item(),
         policy_loss=policy_loss.item(),
-        reward_mean=grouped.mean().item(),
-        reward_best=grouped.max().item(),
-        reward_group_std=grouped.std(dim=1).mean().item(),
+        reward_mean=per_sample.mean().item(),
+        reward_best=per_sample.max().item(),
+        reward_group_std=per_sample.std(dim=1).mean().item(),
         advantage_abs_mean=advantages.abs().mean().item(),
         entropy_per_action=entropy_per_action.item(),
         log_prob_mean=sampled.log_probs.mean().item(),
+        dead_plane_fraction=(
+            grouped.std(dim=1) < config.advantage_epsilon
+        ).to(torch.float32).mean().item(),
     )
     return loss, stats

@@ -68,6 +68,13 @@ class PolicySample:
     entropies: Tensor
     # [B] how many choices were made, for reporting entropy per action.
     num_actions: Tensor
+    # [B, K] the same log-probability split per latent token, where the policy
+    # factorizes that way -- summing this over K reproduces ``log_probs``. The
+    # latent has one token per output node, so this is what lets a per-output
+    # reward be paid to the token positionally responsible for it (see
+    # ``GRPOConfig.factored_credit``). ``None`` when the policy's factorization
+    # has no latent-token axis, as decoder sampling's does not.
+    token_log_probs: Tensor | None = None
 
 
 def project_to_shell(latent: Tensor) -> Tensor:
@@ -109,7 +116,9 @@ def sample_from_latent_noise(
 
     distribution = Normal(mean_latent, sigma)
     latents = distribution.sample()
-    log_probs = distribution.log_prob(latents).sum(dim=(1, 2))
+    # Kept split per latent token; the [B] total is its sum over that axis.
+    token_log_probs = distribution.log_prob(latents).sum(dim=2)
+    log_probs = token_log_probs.sum(dim=1)
     entropies = distribution.entropy().sum(dim=(1, 2))
 
     trunk_types, parent_choices = model.generate_choices(project_to_shell(latents))
@@ -125,6 +134,7 @@ def sample_from_latent_noise(
         log_probs=log_probs,
         entropies=entropies,
         num_actions=num_actions,
+        token_log_probs=token_log_probs,
     )
 
 
