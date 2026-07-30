@@ -192,44 +192,76 @@ BEHAVIOUR_STATISTICS = {
 }
 
 
-def behaviour_match_score(
+@torch.no_grad()
+def behaviours_from_choices(
     trunk_types: Tensor,
     parent_choices: Tensor,
+    task: BitpackedTask,
+    trunk_node_in_degrees: Sequence[int],
+    chunk_size: int = DEFAULT_EVAL_CHUNK,
+) -> Tensor:
+    """Evaluate choice tensors in chunks -> ``[B, C, W]`` packed behaviours.
+
+    ``trunk_types`` is ``[B, T]`` and ``parent_choices`` is ``[B, N, S]``, the
+    pair :meth:`~dagnabbit.dag.autoencoder.DagnabbitAutoEncoder.generate_choices`
+    returns. Never materializes description objects: at best-of-N candidate
+    counts that Python detour dominates everything else.
+
+    The chunking is the point of this wrapper.
+    :func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices` chunks itself
+    only on MPS and otherwise sweeps the whole batch, holding a
+    ``[B, output_start, num_words]`` uint8 buffer -- about 1.2 MB per circuit for
+    the adder table. A best-of-256 set over 16 specifications is 4096 circuits,
+    so an unchunked call would ask for roughly 5 GB in one allocation. Sampling
+    4096 candidates really is nearly free; evaluating them is not, and the two
+    are easy to conflate.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive; got {chunk_size}")
+    return torch.cat(
+        [
+            evaluate_choices(
+                trunk_types[start : start + chunk_size],
+                parent_choices[start : start + chunk_size],
+                task,
+                trunk_node_in_degrees,
+            )
+            for start in range(0, trunk_types.shape[0], chunk_size)
+        ]
+    )
+
+
+def score_behaviours(
+    behaviours: Tensor,
     target_indices: Tensor,
     targets: Tensor,
     task: BitpackedTask,
-    trunk_node_in_degrees: Sequence[int],
-    statistic: str = "correlation",
-) -> Tensor:
-    """Score each candidate graph for matching its own target behaviour.
+    statistics: Sequence[str] = ("correlation", "accuracy"),
+) -> dict[str, Tensor]:
+    """Score already-evaluated behaviours several ways at once -> ``{name: [B, C]}``.
 
-    ``trunk_types`` is ``[B, T]`` and ``parent_choices`` is ``[B, N, S]`` -- the
-    choice-tensor pair
-    :meth:`~dagnabbit.dag.autoencoder.DagnabbitAutoEncoder.descriptions_from_choices`
-    consumes. ``targets`` is ``[P, C, W]``, one goal behaviour per
-    specification; ``target_indices`` is ``[B]`` saying which specification each
-    candidate was drawn for, so a best-of-N candidate set for P specifications
-    scores in one call. Returns ``[B, C]``, one score per output plane, left
-    undecomposed so callers can weight or average planes themselves.
+    Split from the evaluation deliberately. Every statistic here is a handful of
+    popcounts over ``[B, C, W]``, which is trivial next to actually running the
+    circuits, so a caller wanting both correlation and accuracy should evaluate
+    **once** and score twice. Bundling evaluation into a per-statistic helper
+    invites exactly the opposite, and did: an earlier version of the best-of-N
+    eval ran the evaluator three times over identical inputs.
 
-    Evaluation runs straight off the choice tensors
-    (:func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices`), never
-    materializing description objects: at best-of-N candidate counts that Python
-    detour dominates everything else.
+    ``targets`` is ``[P, C, W]``, one goal behaviour per specification;
+    ``target_indices`` is ``[B]`` saying which specification each candidate was
+    drawn for. Scores stay ``[B, C]`` -- one per output plane, undecomposed, so
+    callers can weight or average planes themselves.
     """
-    if statistic not in BEHAVIOUR_STATISTICS:
+    unknown = set(statistics) - set(BEHAVIOUR_STATISTICS)
+    if unknown:
         raise ValueError(
-            f"unknown behaviour statistic {statistic!r}; expected one of "
+            f"unknown behaviour statistic(s) {sorted(unknown)}; expected some of "
             f"{sorted(BEHAVIOUR_STATISTICS)}"
         )
-    predicted = evaluate_choices(
-        trunk_types,
-        parent_choices,
-        task,
-        trunk_node_in_degrees,
-    )
-    goals = targets.to(predicted.device)[target_indices.to(predicted.device)]
-    return BEHAVIOUR_STATISTICS[statistic](predicted, goals, task)
+    goals = targets.to(behaviours.device)[target_indices.to(behaviours.device)]
+    return {
+        name: BEHAVIOUR_STATISTICS[name](behaviours, goals, task) for name in statistics
+    }
 
 
 def constant_output_fraction(behaviours: Tensor, task: BitpackedTask) -> float:

@@ -15,7 +15,6 @@ from dagnabbit.dag.flow import (
     BLEND_NUM_FREQUENCIES,
     LatentNormalizer,
     LatentVelocityModel,
-    WeightAverage,
     blend_frequency_features,
     flow_matching_loss,
     interpolate_towards_data,
@@ -506,56 +505,6 @@ def test_loss_rejects_a_flat_latent() -> None:
             torch.randn(4, LATENT_DIM),
             torch.randn(4, NUM_CONTEXT_TOKENS, CONDITION_DIM),
         )
-
-
-# --- weight averaging -------------------------------------------------------
-
-
-def test_weight_average_starts_as_a_copy_and_lags_behind() -> None:
-    model = make_velocity_model(num_layers=1)
-    average = WeightAverage(model, decay=0.9)
-
-    # Not every parameter starts at zero (token_positions is randn-initialised),
-    # so the expected value is computed from the captured starting point rather
-    # than assumed.
-    initial = {name: tensor.clone() for name, tensor in average.averaged.items()}
-    for name, parameter in model.named_parameters():
-        torch.testing.assert_close(initial[name], parameter.detach())
-
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.fill_(1.0)
-    average.update(model)
-
-    # One update at decay 0.9 moves a tenth of the way towards the live value.
-    for name, averaged in average.averaged.items():
-        torch.testing.assert_close(averaged, 0.9 * initial[name] + 0.1)
-
-
-def test_weight_average_swap_and_restore_is_lossless() -> None:
-    model = make_velocity_model(num_layers=1)
-    average = WeightAverage(model, decay=0.5)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(1.0)
-
-    before = {name: p.detach().clone() for name, p in model.named_parameters()}
-    live = average.copy_into(model)
-    # The averaged weights are still the initial ones, so something changed.
-    assert any(
-        not torch.equal(before[name], p.detach())
-        for name, p in model.named_parameters()
-    )
-    average.restore(model, live)
-    for name, parameter in model.named_parameters():
-        torch.testing.assert_close(parameter.detach(), before[name])
-
-
-def test_weight_average_rejects_an_out_of_range_decay() -> None:
-    model = make_velocity_model(num_layers=1)
-    for decay in (0.0, 1.0, -0.5, 2.0):
-        with pytest.raises(ValueError, match="decay must be"):
-            WeightAverage(model, decay=decay)
 
 
 # --- end to end -------------------------------------------------------------

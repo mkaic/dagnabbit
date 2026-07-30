@@ -40,14 +40,11 @@ from dagnabbit.dag.flow import (
     sample_latents,
 )
 from dagnabbit.dag.signatures import choice_signatures, count_distinct_signatures
-from dagnabbit.tasks.logic_gates.evaluate import (
-    BitpackedTask,
-    evaluate_choices,
-    evaluate_graphs,
-)
+from dagnabbit.tasks.logic_gates.evaluate import BitpackedTask, evaluate_graphs
 from dagnabbit.tasks.logic_gates.rewards import (
-    behaviour_match_score,
+    behaviours_from_choices,
     constant_output_fraction,
+    score_behaviours,
 )
 from dagnabbit.tasks.logic_gates.truth_table_image import (
     image_dimensions,
@@ -363,24 +360,20 @@ def evaluate_flow_proposals(
         target_indices = torch.arange(
             num_specifications, device=device
         ).repeat_interleave(num_candidates)
-        scores = {
-            name: behaviour_match_score(
-                trunk_types,
-                parent_choices,
-                target_indices,
-                targets.to(device),
-                task,
-                model.trunk_node_in_degrees,
-                statistic=name,
-            )
-            .mean(dim=-1)
-            .reshape(num_specifications, num_candidates)
-            for name in ("correlation", "accuracy")
-        }
 
-        behaviours = evaluate_choices(
+        # Evaluate once, chunked, then score every way we report. Running the
+        # circuits is the dominant cost of this whole function; the statistics
+        # on top are popcounts.
+        behaviours = behaviours_from_choices(
             trunk_types, parent_choices, task, model.trunk_node_in_degrees
         )
+        scores = {
+            name: plane_scores.mean(dim=-1).reshape(num_specifications, num_candidates)
+            for name, plane_scores in score_behaviours(
+                behaviours, target_indices, targets.to(device), task
+            ).items()
+        }
+
         signatures = choice_signatures(model, trunk_types, parent_choices)
         distinct = count_distinct_signatures(signatures, num_candidates)
 

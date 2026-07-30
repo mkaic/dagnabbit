@@ -24,25 +24,38 @@ What to watch, in order
    circuits' behaviours look nothing like an adder's. If 1 and 2 look good and
    this does not, the fix is in the graph sampler, not here.
 
+Every step generates its own graphs
+-----------------------------------
+There is no dataset and there is deliberately no cache. Random graphs are
+sampled fresh each step, evaluated to see what they compute, and that behaviour
+becomes the conditioning input with the graph's own latent as the target --
+hindsight relabelling, exact labels, **unlimited supply**.
+
+That unlimited supply is the whole point and is worth protecting. A
+pregenerated corpus would reintroduce everything this task gets to skip: a
+finite sample to overfit, epochs, a train/validation split, a decision about
+corpus size, and gigabytes on disk. Instead every batch is drawn from the true
+distribution and no example is ever seen twice, so the training loss *is* the
+generalization loss and there is nothing to hold out.
+
+It is not free -- graph generation and evaluation is the dominant cost of a step
+here, not the backward pass. That is a known and accepted trade: paying it buys
+uncorrelated data forever. If it ever needs to be hidden rather than paid, the
+answer is to overlap generation with the optimizer step, not to store a dataset.
+
 The training loss is nearly uninformative on its own: it is dominated by
 irreducible noise variance and is not comparable across runs. ``loss_noisy_half``
 is the half worth watching.
 
 Usage::
 
-    # optional but recommended: pay the graph generation cost once
-    python -m dagnabbit.scripts.build_latent_cache runs/<run> \\
-        --out caches/adder-200k --num-graphs 200000
-
-    python -m dagnabbit.scripts.train_flow_proposer runs/<run> \\
-        --cache caches/adder-200k
+    python -m dagnabbit.scripts.train_flow_proposer runs/<run>
 """
 
 import argparse
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
@@ -51,9 +64,7 @@ from dagnabbit.dag.description import (
     FixedInDegreeDAGDescription,
     make_random_graph_description,
 )
-from dagnabbit.dag.flow import WeightAverage
 from dagnabbit.scripts import config as cfg
-from dagnabbit.scripts.build_latent_cache import LatentCache, open_latent_cache
 from dagnabbit.tasks.logic_gates.evaluate import adder_task
 from dagnabbit.tasks.logic_gates.proposer import (
     TruthTableFlowProposer,
@@ -78,25 +89,18 @@ def sample_graphs(model, count: int) -> list[FixedInDegreeDAGDescription]:
     ]
 
 
-def fit_normalizer_from_cache(
-    proposer: TruthTableFlowProposer,
-    cache: LatentCache,
-    num_samples: int,
-) -> None:
-    count = min(num_samples, len(cache))
-    # np.array rather than ascontiguousarray: a memmap *slice* is already
-    # contiguous, so ascontiguousarray hands back the read-only view and
-    # torch.from_numpy warns about wrapping a non-writable buffer.
-    latents = torch.from_numpy(np.array(cache.latents[:count]))
-    proposer.normalizer.fit(latents.to(proposer.normalizer.mean.device))
-
-
-def fit_normalizer_from_graphs(
+def fit_normalizer(
     proposer: TruthTableFlowProposer,
     model,
     num_samples: int,
     batch_size: int,
 ) -> None:
+    """Fit the latent statistics from a one-off sample of encoded graphs.
+
+    The only place anything is generated in bulk, and it happens once before
+    training rather than being kept. The statistics are a property of the frozen
+    autoencoder; the graphs used to measure them are thrown away.
+    """
     collected = []
     remaining = num_samples
     while remaining > 0:
@@ -109,12 +113,6 @@ def fit_normalizer_from_graphs(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", help="frozen autoencoder .ckpt or run directory")
-    parser.add_argument(
-        "--cache",
-        default=None,
-        help="latent cache directory from build_latent_cache; without it graphs "
-        "are generated in the loop, which is much slower",
-    )
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--patch-size", type=int, default=16)
@@ -144,7 +142,6 @@ def parse_arguments() -> argparse.Namespace:
         help="fraction of examples trained with the null specification; this is "
         "what makes guidance (and unconditional sampling) possible",
     )
-    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument(
         "--normalizer-samples",
         type=int,
@@ -211,23 +208,7 @@ def main() -> None:
         f"[{model.num_output_nodes}, {model.node_embedding_dim}]"
     )
 
-    cache = open_latent_cache(args.cache) if args.cache else None
-    if cache is not None:
-        if cache.manifest["latent_dim"] != model.node_embedding_dim:
-            raise SystemExit(
-                f"cache latent_dim {cache.manifest['latent_dim']} does not match "
-                f"the checkpoint's {model.node_embedding_dim}; rebuild the cache"
-            )
-        print(
-            f"cache: {len(cache)} examples from step "
-            f"{cache.manifest.get('source_step')}"
-        )
-        fit_normalizer_from_cache(proposer, cache, args.normalizer_samples)
-    else:
-        print("no cache: generating graphs in the training loop (slow)")
-        fit_normalizer_from_graphs(
-            proposer, model, args.normalizer_samples, args.batch_size
-        )
+    fit_normalizer(proposer, model, args.normalizer_samples, args.batch_size)
     print(
         "fitted latent statistics: mean |.| "
         f"{proposer.normalizer.mean.abs().mean():.4f}, std "
@@ -239,7 +220,6 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    weight_average = WeightAverage(proposer, decay=args.ema_decay)
 
     run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S-flow")
     run_dir = Path(args.log_dir) / run_name
@@ -256,63 +236,54 @@ def main() -> None:
         [circuit.task.target_values for circuit in circuits]
     )
 
-    rng = np.random.default_rng(args.seed)
-
     def evaluate(step: int) -> None:
-        """Evaluate the *averaged* weights, then put the live ones back."""
-        live = weight_average.copy_into(proposer)
-        try:
-            held_out = sample_graphs(model, args.eval_graphs)
-            held_out_images = behaviour_images(held_out, task, gray=args.gray)
-            held_out_targets = packed_behaviours(held_out, task)
+        """Evaluate the live weights. There is one set of weights and this is it."""
+        held_out = sample_graphs(model, args.eval_graphs)
+        held_out_images = behaviour_images(held_out, task, gray=args.gray)
+        held_out_targets = packed_behaviours(held_out, task)
 
-            for num_candidates in args.eval_candidates:
-                splits = {
-                    "in_distribution": evaluate_flow_proposals(
-                        model=model,
-                        proposer=proposer,
-                        images=held_out_images,
-                        targets=held_out_targets,
-                        task=task,
-                        device=device,
-                        num_candidates=num_candidates,
-                        num_steps=args.sample_steps,
-                        guidance_strength=args.guidance,
-                        source_graphs=held_out,
-                    ),
-                    "reference": evaluate_flow_proposals(
-                        model=model,
-                        proposer=proposer,
-                        images=reference_images,
-                        targets=reference_targets,
-                        task=task,
-                        device=device,
-                        num_candidates=num_candidates,
-                        num_steps=args.sample_steps,
-                        guidance_strength=args.guidance,
-                    ),
-                }
-                for split, results in splits.items():
-                    for name, value in results.items():
-                        writer.add_scalar(
-                            f"{split}/{name}_n{num_candidates}", value, step
-                        )
-                print(
-                    f"  eval @ {step} n={num_candidates}: "
-                    f"in-dist corr {splits['in_distribution']['best_of_n_correlation']:.4f} "
-                    f"distinct {splits['in_distribution']['distinct_fraction']:.2f} "
-                    f"| ref corr {splits['reference']['best_of_n_correlation']:.4f} "
-                    f"acc {splits['reference']['best_of_n_accuracy']:.4f}"
-                )
-        finally:
-            weight_average.restore(proposer, live)
+        for num_candidates in args.eval_candidates:
+            splits = {
+                "in_distribution": evaluate_flow_proposals(
+                    model=model,
+                    proposer=proposer,
+                    images=held_out_images,
+                    targets=held_out_targets,
+                    task=task,
+                    device=device,
+                    num_candidates=num_candidates,
+                    num_steps=args.sample_steps,
+                    guidance_strength=args.guidance,
+                    source_graphs=held_out,
+                ),
+                "reference": evaluate_flow_proposals(
+                    model=model,
+                    proposer=proposer,
+                    images=reference_images,
+                    targets=reference_targets,
+                    task=task,
+                    device=device,
+                    num_candidates=num_candidates,
+                    num_steps=args.sample_steps,
+                    guidance_strength=args.guidance,
+                ),
+            }
+            for split, results in splits.items():
+                for name, value in results.items():
+                    writer.add_scalar(f"{split}/{name}_n{num_candidates}", value, step)
+            print(
+                f"  eval @ {step} n={num_candidates}: "
+                f"in-dist corr {splits['in_distribution']['best_of_n_correlation']:.4f} "
+                f"distinct {splits['in_distribution']['distinct_fraction']:.2f} "
+                f"| ref corr {splits['reference']['best_of_n_correlation']:.4f} "
+                f"acc {splits['reference']['best_of_n_accuracy']:.4f}"
+            )
 
     def save(step: int, name: str) -> None:
         torch.save(
             {
                 "step": step,
                 "proposer_state_dict": proposer.state_dict(),
-                "averaged_state_dict": weight_average.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "args": vars(args),
                 "source_checkpoint_step": checkpoint.get("step"),
@@ -322,14 +293,13 @@ def main() -> None:
 
     for step in range(1, args.steps + 1):
         started = time.perf_counter()
-        if cache is not None:
-            indices = rng.integers(0, len(cache), size=args.batch_size)
-            images, clean_latent = cache.batch(indices, device, gray=args.gray)
-        else:
-            graphs = sample_graphs(model, args.batch_size)
-            images = behaviour_images(graphs, task, gray=args.gray).to(device)
-            clean_latent = model.encode_to_latent(graphs).float()
-        loaded = time.perf_counter()
+        # Every step sees graphs that have never been seen before and will never
+        # be seen again. No dataset, no epochs, no overfitting a finite sample --
+        # see the module docstring on why this is worth paying for.
+        graphs = sample_graphs(model, args.batch_size)
+        images = behaviour_images(graphs, task, gray=args.gray).to(device)
+        clean_latent = model.encode_to_latent(graphs).float()
+        generated = time.perf_counter()
 
         losses = proposer(
             images,
@@ -346,19 +316,18 @@ def main() -> None:
                 1.0, step / max(1, args.warmup_steps)
             )
         optimizer.step()
-        weight_average.update(proposer)
         finished = time.perf_counter()
 
         if step % args.log_every == 0:
             for name, value in losses.scalars("train").items():
                 writer.add_scalar(name, value, step)
-            writer.add_scalar("time/load_batch", loaded - started, step)
-            writer.add_scalar("time/optimize", finished - loaded, step)
+            writer.add_scalar("time/generate_batch", generated - started, step)
+            writer.add_scalar("time/optimize", finished - generated, step)
             print(
                 f"step {step:>7} loss {losses.loss.item():.4f} "
                 f"(noisy {losses.noisy_half_loss.item():.4f}) "
                 f"| {finished - started:.3f}s "
-                f"(load {loaded - started:.3f})"
+                f"(gen {generated - started:.3f})"
             )
 
         if step % args.eval_every == 0:
