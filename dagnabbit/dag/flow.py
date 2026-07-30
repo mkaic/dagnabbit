@@ -1,18 +1,20 @@
 """Conditional flow matching over graph latents.
 
-The generative counterpart to :mod:`dagnabbit.dag.proposal`. A deterministic
-proposer maps a specification to *one* latent; this maps it to a
-*distribution* over latents that you sample from.
+How a specification becomes a graph. The autoencoder's latent is an interchange
+format -- ``decode_latent`` turns any ``[K, D]`` tensor into a structurally valid
+DAG -- so writing a latent is the whole job, and this module models a
+*distribution* over the latents a specification admits rather than picking one.
 
-Why bother
-----------
+Why a distribution and not a regression
+---------------------------------------
 Behaviour -> graph is massively one-to-many, and worse here than usual: dead
 nodes and unselected producers mean whole families of structurally different
 graphs have bit-identical behaviour. A network trained to minimize the
 decoder's cross-entropy therefore converges on the per-slot *marginal* over
 parents consistent with the specification, and the argmax of independent
 marginals need not be a coherent graph at all. It can be perfectly calibrated
-about every wire and still emit a circuit that computes nothing.
+about every wire and still emit a circuit that computes nothing. That is why the
+deterministic regressor this replaced is gone rather than kept as a baseline.
 
 Sampling from a modelled distribution has no such failure: a draw is a
 coherent joint configuration. And because a draw is cheap, the proposer stops
@@ -50,8 +52,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from dagnabbit.dag.proposal import project_to_shell
-
 VELOCITY_ATTENTION_HEAD_DIM = 64
 VELOCITY_MLP_EXPANSION_FACTOR = 4.0
 # Width of the blend-fraction embedding that drives every block's modulation.
@@ -61,6 +61,26 @@ VELOCITY_MLP_EXPANSION_FACTOR = 4.0
 BLEND_EMBEDDING_DIM = 128
 # Sinusoidal features computed for the raw blend scalar before that embedding.
 BLEND_NUM_FREQUENCIES = 128
+
+
+def project_to_shell(latent: Tensor, radius: float | Tensor) -> Tensor:
+    """Rescale every latent token onto a shell of the given radius.
+
+    Anything handed to ``decode_latent`` should sit at the magnitude the decoder
+    was trained at -- an off-shell vector is a scale it has never seen, and
+    because ``decode_latent`` adds its position encoding *before* the first
+    normalization, a wrong magnitude quietly reweights latent against position.
+
+    ``radius`` is required rather than defaulting to ``sqrt(D)``, which is what
+    an earlier version of this codebase assumed. ``sqrt(D)`` is where encoded
+    latents would sit if the encoder's final ``LayerNorm`` had no learned gain.
+    It has one, so the true radius is a property of the trained checkpoint and is
+    measurably not ``sqrt(D)``: on the d128 checkpoint it is 11.99 against a
+    ``sqrt(D)`` of 11.31. Nobody should be guessing it, so nobody may.
+    :meth:`LatentNormalizer.fit` measures it.
+    """
+    norms = latent.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return latent * (radius / norms)
 
 
 def blend_frequency_features(blend: Tensor, num_frequencies: int) -> Tensor:

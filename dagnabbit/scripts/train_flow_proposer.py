@@ -1,22 +1,21 @@
 """Train a conditional flow-matching proposer against a frozen autoencoder.
 
-The experiment: **does modelling the distribution of graphs consistent with a
-behaviour beat regressing the mean of them?**
+The experiment: **can a proposal distribution over graphs, drawn from
+repeatedly, hit a behaviour a single guess cannot?**
 
-The deterministic proposer in :mod:`dagnabbit.scripts.train_proposer` has a
-ceiling that is not about capacity. Behaviour -> graph is massively one-to-many
-(dead nodes and unselected producers alone put whole families of structurally
-different circuits at bit-identical behaviour), so the cross-entropy minimizer
-is the per-slot marginal over consistent parents, and the argmax of independent
-marginals need not be a coherent circuit. This trains the generative
-alternative on exactly the same data and scores it on exactly the same tasks, so
-the comparison is clean.
+Behaviour -> graph is massively one-to-many (dead nodes and unselected producers
+alone put whole families of structurally different circuits at bit-identical
+behaviour), so any regression onto a single latent targets the per-slot marginal
+over consistent parents, and the argmax of independent marginals need not be a
+coherent circuit. Sampling a modelled distribution avoids that by construction,
+and turns the proposer into a search distribution: draw N, score them with the
+evaluator, keep the best.
 
 What to watch, in order
 -----------------------
-1. ``in_distribution/best_of_n_correlation`` must beat the deterministic
-   proposer's single shot, and must **rise with** ``--eval-candidates``. That is
-   the whole thesis: a proposal distribution you can draw from repeatedly.
+1. ``in_distribution/best_of_n_correlation`` must **rise with**
+   ``--eval-candidates``. That is the whole thesis; a flat curve across N means
+   the distribution has collapsed and you may as well have regressed.
 2. ``in_distribution/distinct_fraction`` is the diagnostic for when it does
    not. Collapsing toward ``1/candidates`` means every draw is the same circuit;
    suspect ``--guidance`` before anything else.

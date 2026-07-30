@@ -1,26 +1,23 @@
-"""Reading a circuit's behaviour and proposing a latent that reproduces it.
+"""Reading a circuit's behaviour and proposing latents that reproduce it.
 
 This is the logic-gates half of the proposal setup: everything that knows a
-specification is a *truth table*. The task-agnostic halves live in
-:mod:`dagnabbit.dag.proposal` (the readout and the reconstruction loss) and
-:mod:`dagnabbit.dag.flow` (the velocity model and the sampler).
+specification is a *truth table*. The task-agnostic half -- the velocity model,
+the sampler, and the latent statistics -- lives in :mod:`dagnabbit.dag.flow`.
 
-The encoder is deliberately dull. A truth-table image (see
+:class:`BehaviourEncoder` is deliberately dull. A truth-table image (see
 :mod:`.truth_table_image`) is patchified, given a learned position embedding,
 and run through plain transformer blocks. Position in the image *is* the input,
 so no separate addressing scheme is needed.
+:class:`TruthTableFlowProposer` then cross-attends into those context tokens
+once per Euler step.
 
-Two proposers are built on that shared :class:`BehaviourEncoder`:
-
-* :class:`TruthTableProposer` -- deterministic. Pools the context tokens into
-  one latent and is trained with the frozen decoder's own cross-entropy. The
-  baseline.
-* :class:`TruthTableFlowProposer` -- generative. Cross-attends into the same
-  context tokens once per Euler step, and models the whole *distribution* of
-  latents consistent with a behaviour. This exists because the deterministic
-  one has a ceiling that is not about capacity: behaviour -> graph is
-  one-to-many, so the cross-entropy minimizer is a per-slot marginal whose
-  argmax need not be a coherent circuit.
+Proposing is generative here, and only generative. A deterministic
+truth-table -> latent regressor used to live in this module and was removed: the
+mapping is massively one-to-many, so its cross-entropy minimizer is the per-slot
+marginal over consistent parents, and the argmax of independent marginals need
+not be a coherent circuit at all. It could be perfectly calibrated about every
+wire and still emit something that computes nothing. Sampling from a modelled
+distribution has no such failure mode, and makes best-of-N possible on top.
 
 What makes any of this task-specific is only that behaviour happens to be
 renderable as a 2D grid. A task whose specification is a set of I/O examples
@@ -42,16 +39,9 @@ from dagnabbit.dag.flow import (
     flow_matching_loss,
     sample_latents,
 )
-from dagnabbit.dag.proposal import (
-    LatentReadout,
-    canonical_targets,
-    choice_signatures,
-    count_distinct_signatures,
-    reconstruction_losses,
-)
+from dagnabbit.dag.signatures import choice_signatures, count_distinct_signatures
 from dagnabbit.tasks.logic_gates.evaluate import (
     BitpackedTask,
-    bit_accuracy,
     evaluate_choices,
     evaluate_graphs,
 )
@@ -89,12 +79,10 @@ def behaviour_images(
 class BehaviourEncoder(nn.Module):
     """Truth-table image ``[B, C, H, W]`` -> context tokens ``[B, T, E]``.
 
-    The plain ViT trunk, stopping short of any readout. Two consumers want
-    exactly this and disagree about what comes next: the deterministic
-    :class:`TruthTableProposer` pools the tokens into a single latent, while the
-    flow-matching proposer cross-attends into them once per Euler step. Keeping
-    the trunk separate is what lets the second reuse the first's architecture
-    (and, if wanted, its weights) unchanged.
+    The plain ViT trunk, stopping short of any readout, and the larger of the
+    two models in play. It runs *once* per specification while the velocity model
+    runs once per Euler step, which is why it is kept separable: its output is
+    computed up front and reused across every step of a sample.
 
     ``patch_size`` must divide both image axes. With the 256x256 adder table
     and the default 16, that is 256 patch tokens -- an ordinary ViT sequence.
@@ -184,83 +172,6 @@ class BehaviourEncoder(nn.Module):
         for block in self.blocks:
             tokens = block(tokens, None)
         return self.encoder_norm(tokens)
-
-
-class TruthTableProposer(nn.Module):
-    """Truth-table image ``[B, C, H, W]`` -> graph latent ``[B, K, D]``.
-
-    The deterministic baseline, kept as the thing a generative proposer has to
-    beat. Its ceiling is not capacity: behaviour -> graph is one-to-many, so the
-    cross-entropy minimizer here is a per-slot marginal whose argmax need not be
-    a coherent circuit. See :mod:`dagnabbit.dag.flow`.
-    """
-
-    def __init__(
-        self,
-        num_output_bits: int,
-        image_height: int,
-        image_width: int,
-        patch_size: int,
-        embedding_dim: int,
-        latent_dim: int,
-        num_latent_tokens: int,
-        num_layers: int,
-        mlp_expansion_factor: float,
-    ):
-        super().__init__()
-        self.encoder = BehaviourEncoder(
-            num_output_bits=num_output_bits,
-            image_height=image_height,
-            image_width=image_width,
-            patch_size=patch_size,
-            embedding_dim=embedding_dim,
-            num_layers=num_layers,
-            mlp_expansion_factor=mlp_expansion_factor,
-        )
-        self.readout = LatentReadout(
-            context_dim=embedding_dim,
-            latent_dim=latent_dim,
-            num_latent_tokens=num_latent_tokens,
-            num_heads=self.encoder.num_heads,
-        )
-
-    @property
-    def num_patches(self) -> int:
-        return self.encoder.num_patches
-
-    @classmethod
-    def for_task(
-        cls,
-        task: BitpackedTask,
-        model: DagnabbitAutoEncoder,
-        patch_size: int,
-        embedding_dim: int,
-        num_layers: int,
-        mlp_expansion_factor: float,
-    ) -> "TruthTableProposer":
-        """Build a proposer whose shapes match a task and a frozen autoencoder.
-
-        Keeps the "which dimension comes from where" wiring in one place rather
-        than in every script that wants a proposer. Note what the autoencoder
-        does *not* determine: ``embedding_dim`` is the ViT's own width and is
-        the caller's to choose. Only the latent shape is dictated by the
-        checkpoint.
-        """
-        height, width = image_dimensions(task.root_values.shape[0])
-        return cls(
-            num_output_bits=task.target_values.shape[0],
-            image_height=height,
-            image_width=width,
-            patch_size=patch_size,
-            embedding_dim=embedding_dim,
-            latent_dim=model.node_embedding_dim,
-            num_latent_tokens=model.num_output_nodes,
-            num_layers=num_layers,
-            mlp_expansion_factor=mlp_expansion_factor,
-        )
-
-    def forward(self, images: Tensor) -> Tensor:
-        return self.readout(self.encoder(images))
 
 
 class TruthTableFlowProposer(nn.Module):
@@ -500,53 +411,3 @@ def evaluate_flow_proposals(
             proposer.train()
 
     return results
-
-
-@torch.no_grad()
-def evaluate_proposals(
-    model: DagnabbitAutoEncoder,
-    proposer: TruthTableProposer,
-    graphs: Sequence[FixedInDegreeDAGDescription],
-    tasks: Sequence[BitpackedTask],
-    images: Tensor,
-    device: torch.device,
-) -> dict[str, float]:
-    """Propose from behaviour, decode, and score against the true circuits.
-
-    ``tasks[i]`` is the task ``graphs[i]``'s behaviour came from, so the fitness
-    reported answers "does the proposed circuit compute the function it was
-    asked for" rather than fitness against some unrelated objective.
-
-    Structural metrics (type/pointer accuracy) say whether the right *graph*
-    came back; fitness says whether the right *function* did. Those come apart
-    badly -- most wires reproduced can still score at chance -- which is why
-    both are reported.
-    """
-    graphs = list(graphs)
-    was_training = proposer.training
-    proposer.eval()
-    try:
-        latent = proposer(images.to(device))
-        metrics = reconstruction_losses(
-            model, latent, canonical_targets(graphs, device)
-        )
-        rebuilt = model.generate(latent)
-        fitnesses = []
-        exact = 0
-        for index, (graph, task) in enumerate(zip(graphs, tasks)):
-            score, _ = bit_accuracy(evaluate_graphs([rebuilt[index]], task), task)
-            fitnesses.append(float(score[0]))
-            exact += int(graphs_match(graph, rebuilt[index]))
-    finally:
-        if was_training:
-            proposer.train()
-
-    return {
-        "type_loss": float(metrics.type_loss),
-        "pointer_loss": float(metrics.pointer_loss),
-        "type_accuracy": float(metrics.type_accuracy),
-        "pointer_accuracy": float(metrics.pointer_accuracy),
-        "fitness_mean": sum(fitnesses) / len(fitnesses),
-        "fitness_best": max(fitnesses),
-        "exact_match": exact / len(graphs),
-    }

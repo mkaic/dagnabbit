@@ -23,7 +23,7 @@ from dagnabbit.dag.flow import (
     sample_latents,
     sample_latents_unconditional,
 )
-from dagnabbit.dag.proposal import project_to_shell
+from dagnabbit.dag.flow import project_to_shell
 
 LATENT_DIM = 32
 NUM_LATENT_TOKENS = 4

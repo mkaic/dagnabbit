@@ -41,7 +41,7 @@ from torch import Tensor
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.checkpoint import load_model, pick_device
 from dagnabbit.dag.description import make_random_graph_description
-from dagnabbit.dag.proposal import choice_signatures
+from dagnabbit.dag.signatures import choice_signatures
 from dagnabbit.tasks.logic_gates.evaluate import (
     BitpackedTask,
     adder_task,
