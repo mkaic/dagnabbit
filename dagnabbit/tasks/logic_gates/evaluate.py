@@ -32,7 +32,10 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
+from dagnabbit.dag.description import (
+    FixedInDegreeDAGDescription,
+    collate_rank_partitions,
+)
 from dagnabbit.tasks.logic_gates.bitarrays import get_8bit_adder_truth_table
 from dagnabbit.tasks.logic_gates.operators import GATE_OPERATORS, GateOperator
 
@@ -147,44 +150,19 @@ def _build_batched_ranks(
     graphs: Sequence[FixedInDegreeDAGDescription],
     device: torch.device,
 ) -> list[_BatchedBitRank]:
-    """Concatenate every graph's precomputed rank metadata, rank by rank.
+    """Regroup every graph's precomputed rank partition by rank, on ``device``.
 
-    Reuses ``graph.rank_batches`` (built once when the description is created)
-    rather than recomputing topology here, and transfers each rank's tensors to
-    the device in one concatenated copy per field.
+    Reuses ``graph.rank_partition`` (built once when the description is created)
+    rather than recomputing topology here, and leaves the batch-side regrouping
+    and the host-to-device transfer to :func:`collate_rank_partitions`.
     """
-    max_ranks = max(len(graph.rank_batches) for graph in graphs)
+    collated = collate_rank_partitions(graphs, device)
+    maximum_indegree = graphs[0].maximum_indegree
+
     ranks: list[_BatchedBitRank] = []
-    # Async host-to-device copies are only requested on CUDA. On MPS a
-    # non-blocking copy of an index tensor can be read by the subsequent gather
-    # before it lands, which silently yields out-of-range garbage indices
-    # rather than an error; from unpinned host memory CUDA's non_blocking is
-    # synchronous anyway, so nothing is lost by gating it.
-    non_blocking = device.type == "cuda"
-
-    for rank in range(max_ranks):
-        batch_indices: list[Tensor] = []
-        node_indices: list[Tensor] = []
-        parent_indices: list[Tensor] = []
-        valid_parent_masks: list[Tensor] = []
-        subtypes: list[Tensor] = []
-
-        for batch_index, graph in enumerate(graphs):
-            if rank >= len(graph.rank_batches):
-                continue
-            rank_batch = graph.rank_batches[rank]
-            num_rows = rank_batch.node_indices.shape[0]
-            if num_rows == 0:
-                continue
-            batch_indices.append(torch.full((num_rows,), batch_index, dtype=torch.long))
-            node_indices.append(rank_batch.node_indices)
-            parent_indices.append(rank_batch.parent_indices)
-            valid_parent_masks.append(rank_batch.valid_parent_mask)
-            subtypes.append(rank_batch.subtypes)
-
-        if not node_indices:
+    for rank in range(collated.num_ranks):
+        if not collated.counts[rank]:
             empty = torch.empty(0, dtype=torch.long, device=device)
-            maximum_indegree = graphs[0].maximum_indegree
             ranks.append(
                 _BatchedBitRank(
                     batch_indices=empty,
@@ -200,21 +178,14 @@ def _build_batched_ranks(
             )
             continue
 
+        rows = collated.rank_slice(rank)
         ranks.append(
             _BatchedBitRank(
-                batch_indices=torch.cat(batch_indices).to(
-                    device, non_blocking=non_blocking
-                ),
-                node_indices=torch.cat(node_indices).to(
-                    device, non_blocking=non_blocking
-                ),
-                parent_indices=torch.cat(parent_indices).to(
-                    device, non_blocking=non_blocking
-                ),
-                valid_parent_mask=torch.cat(valid_parent_masks).to(
-                    device, non_blocking=non_blocking
-                ),
-                subtypes=torch.cat(subtypes).to(device, non_blocking=non_blocking),
+                batch_indices=collated.batch_indices[rows],
+                node_indices=collated.node_indices[rows],
+                parent_indices=collated.parent_indices[rows],
+                valid_parent_mask=collated.valid_parent_mask[rows],
+                subtypes=collated.subtypes[rows],
             )
         )
 
@@ -459,9 +430,7 @@ def evaluate_choices(
         outputs.append(
             buffer.gather(
                 1,
-                output_indices.unsqueeze(-1).expand(
-                    rows, num_output_nodes, num_words
-                ),
+                output_indices.unsqueeze(-1).expand(rows, num_output_nodes, num_words),
             )
         )
 

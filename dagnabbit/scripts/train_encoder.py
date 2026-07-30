@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
 from dagnabbit.dag.description import NodeSupertype
-from dagnabbit.dag.loader import GraphBatchLoader, GraphGeometry
+from dagnabbit.dag.geometry import GraphGeometry
 from dagnabbit.optimizers import AutoMuon, build_optimizer
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
@@ -405,18 +405,10 @@ def main() -> None:
             f"(wait={wait}, warmup={warmup}, active={args.profile_steps})"
         )
 
-    # Graph generation is the dominant cost of a step here, not the backward
-    # pass, and it is serial Python so only another process can hide it. Zero
-    # workers keeps it inline (the historical behaviour and the control
-    # condition); see dagnabbit.scripts.profile_batch_loader for what to set.
-    loader = GraphBatchLoader(
-        geometry=GraphGeometry.from_config(cfg),
-        batch_size=cfg.GRAPH_BATCH_SIZE,
-        num_workers=cfg.GRAPH_LOADER_WORKERS,
-        prefetch_batches=cfg.GRAPH_LOADER_PREFETCH_BATCHES,
-        seed=cfg.SEED,
-    )
-    print(loader.describe())
+    # Generated inline. Background worker processes used to do this and were
+    # removed: making generation itself faster left them nothing worth hiding.
+    # See the module docstring of dagnabbit.dag.geometry.
+    geometry = GraphGeometry.from_config(cfg)
 
     try:
         optimizer.zero_grad()
@@ -441,7 +433,7 @@ def main() -> None:
             # TensorBoard's Step axis is the historical per-graph training
             # coordinate, not the optimizer/update index.
             tensorboard_step = step * cfg.GRAPH_BATCH_SIZE
-            graphs = loader.next_batch()
+            graphs = geometry.sample_batch(cfg.GRAPH_BATCH_SIZE)
 
             # Only the forward pass is autocast; backward inherits each op's
             # recorded precision and must run outside the region.
@@ -610,9 +602,6 @@ def main() -> None:
                 if step + 1 >= total_profile_steps:
                     break
     finally:
-        # Before anything else: leaked workers keep generating graphs nobody
-        # will ever read.
-        loader.close()
         if prof is not None:
             prof.stop()
             dump_profile(prof, Path(args.profile_output_dir), device)

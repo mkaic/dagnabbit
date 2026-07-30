@@ -12,6 +12,9 @@ dependencies = [
     "torchvision>=0.27",
     "tqdm",
     "numpy>=2.1",
+    # Compiles the random-graph generator, which is the training loop's inner
+    # loop; see dagnabbit/dag/generate.py.
+    "numba>=0.61",
     "snakeviz==2.2",
     "matplotlib",
     "ruff",

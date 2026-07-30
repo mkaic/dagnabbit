@@ -60,7 +60,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from dagnabbit.dag.checkpoint import load_model, pick_device
-from dagnabbit.dag.loader import GraphBatchLoader, GraphGeometry
+from dagnabbit.dag.geometry import GraphGeometry
 from dagnabbit.scripts import config as cfg
 from dagnabbit.tasks.logic_gates.evaluate import adder_task
 from dagnabbit.tasks.logic_gates.proposer import (
@@ -99,15 +99,6 @@ def fit_normalizer(
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", help="frozen autoencoder .ckpt or run directory")
-    parser.add_argument(
-        "--loader-workers",
-        type=int,
-        default=0,
-        help="background processes generating graph batches. 0 generates inline "
-        "(historical behaviour, and the control condition). Whether workers pay "
-        "is machine-specific; run profile_batch_loader to find out",
-    )
-    parser.add_argument("--loader-prefetch", type=int, default=2)
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--patch-size", type=int, default=16)
@@ -290,21 +281,12 @@ def main() -> None:
             run_dir / name,
         )
 
-    loader = GraphBatchLoader(
-        geometry=geometry,
-        batch_size=args.batch_size,
-        num_workers=args.loader_workers,
-        prefetch_batches=args.loader_prefetch,
-        seed=args.seed,
-    )
-    print(loader.describe())
-
     try:
         train(
             args=args,
             model=model,
             proposer=proposer,
-            loader=loader,
+            geometry=geometry,
             task=task,
             device=device,
             optimizer=optimizer,
@@ -313,8 +295,6 @@ def main() -> None:
             save=save,
         )
     finally:
-        # Leaked workers keep generating graphs nobody will ever read.
-        loader.close()
         writer.close()
 
 
@@ -323,7 +303,7 @@ def train(
     args,
     model,
     proposer,
-    loader: GraphBatchLoader,
+    geometry: GraphGeometry,
     task,
     device,
     optimizer,
@@ -337,7 +317,7 @@ def train(
         # Every step sees graphs that have never been seen before and will never
         # be seen again. No dataset, no epochs, no overfitting a finite sample --
         # see the module docstring on why this is worth paying for.
-        graphs = loader.next_batch()
+        graphs = geometry.sample_batch(args.batch_size)
         images = behaviour_images(graphs, task, gray=args.gray).to(device)
         clean_latent = model.encode_to_latent(graphs).float()
         generated = time.perf_counter()

@@ -1,9 +1,11 @@
 import functools
 import heapq
-import random
+import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+import numpy as np
 import torch
 
 
@@ -92,7 +94,67 @@ class PreparedRankBatch:
     has_valid_parents: bool = False
 
 
+@dataclass
+class RankPartition:
+    """One graph's whole rank partition, flat.
+
+    Rows are ordered rank-major, ascending by node index within each rank, so
+    rank ``r`` occupies a contiguous slice whose length is ``counts[r]``.
+
+    Held flat rather than as a tensor per rank because *every* consumer
+    immediately concatenates across the batch: splitting the partition into ~4
+    views per rank per graph, only for the model to re-join them, cost more than
+    building the partition in the first place. :func:`collate_rank_partitions`
+    is the batch-side counterpart. :attr:`FixedInDegreeDAGDescription.rank_batches`
+    still offers the per-rank view for code that reads one graph at a time.
+
+    A pleasant side effect: flat contiguous tensors pickle by value at their true
+    size, so shipping a description to a worker process needs no special handling
+    (a *slice* would drag its whole base storage along, once per rank).
+    """
+
+    # [N] long: node index of each row, within its own graph.
+    node_indices: torch.Tensor
+    # [N, maximum_indegree] long, zero-padded past each node's in-degree.
+    parent_indices: torch.Tensor
+    # [N, maximum_indegree] bool: which parent slots are real.
+    valid_parent_mask: torch.Tensor
+    # [N] long: raw node_type index of each row.
+    subtypes: torch.Tensor
+    # [N] long: which rank each row belongs to. Redundant with ``counts``, but it
+    # is what lets a batch of graphs be regrouped by rank in one stable argsort.
+    rank_of_row: torch.Tensor
+    # Rows per rank, indexed by rank.
+    counts: tuple[int, ...]
+    # Whether any node at that rank has at least one parent, indexed by rank.
+    has_valid_parents: tuple[bool, ...]
+
+    @property
+    def num_ranks(self) -> int:
+        return len(self.counts)
+
+
 class FixedInDegreeDAGDescription:
+    """A fixed-in-degree DAG, plus the overlays the model reads.
+
+    Two construction paths, which must produce indistinguishable objects:
+
+    * :meth:`__init__`, from ragged Python lists -- what hand-built reference
+      circuits, blind decode and most tests use.
+    * :meth:`from_arrays`, from the padded arrays the compiled generator in
+      :mod:`dagnabbit.dag.generate` emits -- what the training loop uses.
+
+    Numpy arrays are the source of truth for everything on the hot path, and the
+    ragged Python views of them (``node_inputs_indices``, ``node_types``,
+    ``node_ranks``, ``canonical_order``, ``canonical_positions``,
+    ``leaf_node_indices``) are ``cached_property``, so the array path never pays
+    to materialize what nothing on that path reads. That matters more than it
+    sounds: building ``node_inputs_indices`` alone costs ~54us per graph, about
+    five times the compiled generator that produced the arrays in the first
+    place. Assigning one of those names in ``__init__`` shadows its property,
+    which is exactly how the list path avoids deriving its own inputs.
+    """
+
     def __init__(
         self,
         num_root_nodes: int,
@@ -103,14 +165,75 @@ class FixedInDegreeDAGDescription:
         node_inputs_indices: list[list[int]],
         node_types: list[int],
     ):
+        self._init_layout(
+            num_root_nodes,
+            num_trunk_nodes,
+            num_output_nodes,
+            num_trunk_node_types,
+            trunk_node_in_degrees,
+        )
+        # Given, not derived: these shadow the cached_property views below.
+        self.node_inputs_indices = node_inputs_indices
+        self.node_types = node_types
+        self._validate_against_layout()
+        self._build_overlays()
+
+    @classmethod
+    def from_arrays(
+        cls,
+        *,
+        num_root_nodes: int,
+        num_trunk_nodes: int,
+        num_output_nodes: int,
+        num_trunk_node_types: int,
+        trunk_node_in_degrees: int | list[int],
+        node_types_array: np.ndarray,
+        padded_parents: np.ndarray,
+        parent_slot_mask: np.ndarray,
+        ranks_array: np.ndarray,
+        canonical_order_array: np.ndarray,
+    ) -> "FixedInDegreeDAGDescription":
+        """Build from precomputed arrays instead of deriving them.
+
+        Every argument is a per-graph slice of the batch-wide arrays the compiled
+        generator fills, so this does no topology work at all -- the ranks and the
+        canonical order arrive already computed, bit-identical to what
+        :meth:`compute_node_ranks` and :meth:`compute_canonical_order` produce
+        (there is a differential test pinning that).
+
+        The arrays are adopted, not copied. They are slices of batch-wide arrays
+        and are never written to after construction.
+        """
+        self = cls.__new__(cls)
+        self._init_layout(
+            num_root_nodes,
+            num_trunk_nodes,
+            num_output_nodes,
+            num_trunk_node_types,
+            trunk_node_in_degrees,
+        )
+        # Shadow the derivations; each of these is what a cached_property here
+        # would otherwise have to compute.
+        self.node_types_array = node_types_array
+        self.parent_arrays = (padded_parents, parent_slot_mask)
+        self.ranks_array = ranks_array
+        self.canonical_order_array = canonical_order_array
+        self._build_overlays()
+        return self
+
+    def _init_layout(
+        self,
+        num_root_nodes: int,
+        num_trunk_nodes: int,
+        num_output_nodes: int,
+        num_trunk_node_types: int,
+        trunk_node_in_degrees: int | list[int],
+    ) -> None:
         if isinstance(trunk_node_in_degrees, int):
             trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
 
         assert len(trunk_node_in_degrees) == num_trunk_node_types
 
-        self.node_inputs_indices = node_inputs_indices
-        self.node_types = node_types
-        self.node_types_tensor = torch.tensor(self.node_types, dtype=torch.long)
         self.num_trunk_nodes = num_trunk_nodes
         self.num_root_nodes = num_root_nodes
         self.num_output_nodes = num_output_nodes
@@ -129,51 +252,55 @@ class FixedInDegreeDAGDescription:
         self.output_node_types_start = num_trunk_node_types + num_root_nodes
         self.num_node_types = num_trunk_node_types + num_root_nodes + 1
 
+    def _validate_against_layout(self) -> None:
+        """Check the given lists against the declared geometry.
+
+        Only the list path runs this. :meth:`from_arrays` skips it deliberately:
+        its inputs come from the compiled generator, which constructs the same
+        invariants by hand, and re-checking them per node would cost more than
+        generating the graph did.
+        """
         assert len(self.node_types) == self.num_nodes
 
-        for i in range(num_root_nodes):
+        for i in range(self.num_root_nodes):
             assert len(self.node_inputs_indices[i]) == 0
             assert self.node_types[i] == self.root_node_types_start + i
 
-        for i in range(num_trunk_nodes):
-            node_idx = num_root_nodes + i
+        for i in range(self.num_trunk_nodes):
+            node_idx = self.num_root_nodes + i
             trunk_type = self.node_types[node_idx]
-            assert 0 <= trunk_type < num_trunk_node_types
+            assert 0 <= trunk_type < self.num_trunk_node_types
             expected = self.trunk_node_in_degrees[trunk_type]
             assert len(self.node_inputs_indices[node_idx]) == expected
 
-        for i in range(num_output_nodes):
-            node_idx = num_root_nodes + num_trunk_nodes + i
+        for i in range(self.num_output_nodes):
+            node_idx = self.num_root_nodes + self.num_trunk_nodes + i
             assert len(self.node_inputs_indices[node_idx]) == 1
             assert self.node_types[node_idx] == self.output_node_types_start
 
-        self.leaf_node_indices = self.identify_leaf_nodes()
-        self.leaf_node_indices_tensor = torch.tensor(
-            self.leaf_node_indices,
-            dtype=torch.long,
-        )
+    def _build_overlays(self) -> None:
+        """Build the eagerly-needed tensors. Shared by both construction paths.
 
-        # Batch overlay over the (unchanged) flat arrays: longest-path rank per
-        # node, and the per-rank padded tensors iterated over during grouped
-        # evaluation. ``rank_groups`` is the semantic (supertype/subtype) view of
-        # the same partition; nothing on the hot path reads it, so it is built
-        # lazily on first access rather than for every generated graph.
-        self.node_ranks = self.compute_node_ranks()
-        self.rank_batches = self.build_rank_batches()
+        Everything here reads the ``*_array`` properties rather than the Python
+        lists, so which path built the object makes no difference to the result.
+        """
+        self.node_types_tensor = torch.from_numpy(self.node_types_array)
+
+        # Batch overlay over the flat arrays: longest-path rank per node, and the
+        # padded rank partition iterated over during grouped evaluation.
+        # ``rank_groups`` is the semantic (supertype/subtype) view of the same
+        # partition; nothing on the hot path reads it, so it is built lazily.
+        self.rank_partition = self.build_rank_partition()
 
         # Canonical sequence overlay: structure-derived topological order with
         # roots pinned first and outputs pinned last, plus padded per-position
         # parent tensors consumed by the sequence compressor/decoder.
-        self.canonical_order = self.compute_canonical_order()
-        self.canonical_positions = [0] * self.num_nodes
-        for position, node_idx in enumerate(self.canonical_order):
-            self.canonical_positions[node_idx] = position
-        # Node-storage-index -> canonical position, as a tensor: the recursive
-        # encoder gathers through it to give every node's context tokens the
-        # absolute graph positions the pointer head predicts into.
-        self.canonical_positions_tensor = torch.tensor(
-            self.canonical_positions,
-            dtype=torch.long,
+        #
+        # Node-storage-index -> canonical position: the recursive encoder gathers
+        # through it to give every node's context tokens the absolute graph
+        # positions the pointer head predicts into.
+        self.canonical_positions_tensor = torch.from_numpy(
+            self.canonical_positions_array
         )
         (
             self.canonical_order_tensor,
@@ -182,19 +309,113 @@ class FixedInDegreeDAGDescription:
             self.canonical_parent_slot_mask,
         ) = self.build_canonical_tensors()
 
-    def identify_leaf_nodes(self) -> list[int]:
-        """
-        Identify all leaf nodes in the DAG.
+    # ---- array primitives, and the Python views of them ----
+    #
+    # In each pair the array is the primitive and the list is a lazy view, so
+    # that a description built from arrays never materializes a list nothing
+    # reads, and one built from lists still exposes every array the hot path
+    # wants. Whichever path ran, assigning the primitive in the constructor
+    # shadows the property that would otherwise compute it.
 
-        A leaf node is a node whose output is not referenced as an input to any
-        other node. Output nodes are guaranteed to be leaves. Returns array
-        indices of all leaf nodes as a sorted list of integers.
+    @functools.cached_property
+    def node_types_array(self) -> np.ndarray:
+        """``node_types`` as ``[N]`` int64, the gather source for type tensors."""
+        return np.fromiter(self.node_types, np.int64, self.num_nodes)
+
+    @functools.cached_property
+    def node_types(self) -> list[int]:
+        return self.node_types_array.tolist()
+
+    @functools.cached_property
+    def node_inputs_indices(self) -> list[list[int]]:
+        """Per-node parent lists, ragged.
+
+        Read only by things that walk a single graph -- rendering, canonical
+        hashing, diagnostics -- never by the batched model paths, which is why it
+        is worth deriving on demand rather than always building. One ``tolist``
+        for the whole padded block, then a slice per node, is the cheapest route.
         """
-        referenced = [False] * self.num_nodes
-        for inputs in self.node_inputs_indices:
-            for parent in inputs:
-                referenced[parent] = True
-        return [n for n, is_referenced in enumerate(referenced) if not is_referenced]
+        padded_parents, slot_mask = self.parent_arrays
+        rows = padded_parents.tolist()
+        degrees = slot_mask.sum(axis=1).tolist()
+        return [row[:degree] for row, degree in zip(rows, degrees)]
+
+    @functools.cached_property
+    def ranks_array(self) -> np.ndarray:
+        return np.fromiter(self.compute_node_ranks(), np.int64, self.num_nodes)
+
+    @functools.cached_property
+    def node_ranks(self) -> list[int]:
+        return self.ranks_array.tolist()
+
+    @functools.cached_property
+    def canonical_order_array(self) -> np.ndarray:
+        return np.fromiter(self.compute_canonical_order(), np.int64, self.num_nodes)
+
+    @functools.cached_property
+    def canonical_order(self) -> list[int]:
+        return self.canonical_order_array.tolist()
+
+    @functools.cached_property
+    def canonical_positions_array(self) -> np.ndarray:
+        """The inverse permutation of :attr:`canonical_order_array`."""
+        positions = np.empty(self.num_nodes, dtype=np.int64)
+        positions[self.canonical_order_array] = np.arange(self.num_nodes)
+        return positions
+
+    @functools.cached_property
+    def canonical_positions(self) -> list[int]:
+        return self.canonical_positions_array.tolist()
+
+    @functools.cached_property
+    def leaf_node_indices_array(self) -> np.ndarray:
+        """Nodes nobody references as an input. Outputs are always among them.
+
+        Lazy, along with the two views below: only rendering reads any of them,
+        and finding them cost ~8us per graph against a ~11us compiled generator.
+        """
+        padded_parents, slot_mask = self.parent_arrays
+        referenced = np.zeros(self.num_nodes, dtype=bool)
+        referenced[padded_parents[slot_mask]] = True
+        return np.flatnonzero(~referenced)
+
+    @functools.cached_property
+    def leaf_node_indices(self) -> list[int]:
+        return self.leaf_node_indices_array.tolist()
+
+    @functools.cached_property
+    def leaf_node_indices_tensor(self) -> torch.Tensor:
+        return torch.from_numpy(self.leaf_node_indices_array)
+
+    @functools.cached_property
+    def parent_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(padded_parents, slot_mask)``, both ``[N, maximum_indegree]``.
+
+        The one numpy view of the ragged ``node_inputs_indices``, from which
+        every derived overlay below (leaves, rank batches, canonical tensors) is
+        a vectorized gather rather than a Python loop over nodes. Marshalling
+        that derived data, not the random sampling, is the bulk of the cost of
+        generating a graph, and it happens once per graph in the training loop.
+
+        Cached rather than stored: it is pure IPC weight when a description
+        crosses a process boundary, so :meth:`__getstate__` drops it and the
+        rare consumer that needs it after a round trip rebuilds it here.
+        """
+        pad = self.maximum_indegree
+        in_degrees = np.fromiter(
+            map(len, self.node_inputs_indices), np.int64, self.num_nodes
+        )
+        largest = int(in_degrees.max(initial=0))
+        if largest > pad:
+            raise ValueError(f"node in-degree {largest} is above maximum {pad}")
+        slot_mask = np.arange(pad) < in_degrees[:, None]
+        padded = np.zeros((self.num_nodes, pad), dtype=np.int64)
+        padded[slot_mask] = np.fromiter(
+            itertools.chain.from_iterable(self.node_inputs_indices),
+            np.int64,
+            int(in_degrees.sum()),
+        )
+        return padded, slot_mask
 
     def compute_node_ranks(self) -> list[int]:
         """Longest-path depth of each node (roots are rank 0).
@@ -203,69 +424,95 @@ class FixedInDegreeDAGDescription:
         in topological order (roots first, every trunk/output node only
         references earlier indices), so a single forward sweep suffices.
         """
+        inputs = self.node_inputs_indices
         ranks = [0] * self.num_nodes
         for node_idx in range(self.num_root_nodes, self.num_nodes):
-            parent_rank = 0
-            for parent in self.node_inputs_indices[node_idx]:
-                parent_rank = max(parent_rank, ranks[parent])
-            ranks[node_idx] = parent_rank + 1
+            # One max() over the slot list rather than one per parent; every
+            # non-root node has at least one parent, so the list is never empty.
+            ranks[node_idx] = 1 + max([ranks[parent] for parent in inputs[node_idx]])
         return ranks
+
+    @functools.cached_property
+    def rank_batches(self) -> list[PreparedRankBatch]:
+        """The rank partition split per rank, for one-graph-at-a-time consumers.
+
+        Batched code paths should read :attr:`rank_partition` instead and stay
+        flat: materializing these views was ~12% of the cost of generating a
+        graph, and both batch collators used to undo them immediately. Kept as a
+        lazily built convenience for rendering, tests and diagnostics.
+        """
+        partition = self.rank_partition
+        batches: list[PreparedRankBatch] = []
+        offset = 0
+        for count, has_valid_parents in zip(
+            partition.counts, partition.has_valid_parents
+        ):
+            start = offset
+            offset += count
+            end = offset
+            batches.append(
+                PreparedRankBatch(
+                    node_indices=partition.node_indices[start:end],
+                    parent_indices=partition.parent_indices[start:end],
+                    valid_parent_mask=partition.valid_parent_mask[start:end],
+                    subtypes=partition.subtypes[start:end],
+                    has_valid_parents=has_valid_parents,
+                )
+            )
+        return batches
 
     # ---- pickling ----
     #
-    # Only relevant when descriptions cross a process boundary, which is what
-    # dagnabbit.dag.loader does to keep graph generation off the training
-    # critical path. Normal in-process use never touches these.
+    # Nothing in the training loop pickles a description any more -- graph
+    # batches used to be generated in worker processes and are not now. Kept
+    # because it is eight lines and makes descriptions cheap to copy or persist
+    # should anything want to.
+
+    # The array primitives are what travel. ``_build_overlays`` reads all six of
+    # them, so whichever constructor ran they are present in ``__dict__`` by the
+    # time an object exists -- which is what makes it safe to drop every ragged
+    # Python view below unconditionally and let each rebuild on demand. Dropping
+    # an *array* instead would be a bug: for an object built by
+    # :meth:`from_arrays` the ragged views derive from the arrays, so losing an
+    # array leaves the pair mutually recursive.
+    _PICKLED_ARRAYS = (
+        "node_types_array",
+        "parent_arrays",
+        "ranks_array",
+        "canonical_order_array",
+        "canonical_positions_array",
+    )
+    _DROPPED_ON_PICKLE = (
+        # Views of rank_partition, and the reason it is stored flat: these are
+        # *slices*, and pickling a slice serializes its entire base storage, so
+        # shipping them wrote each base once per rank -- 28.5 MB for a batch of
+        # 256 against the ~2.5 MB the data occupies, and 418 ms to load. That was
+        # worse than regenerating the batch outright.
+        "rank_batches",
+        "rank_groups",
+        # Ragged Python views of the arrays above. node_inputs_indices alone is
+        # 152 small lists at the training geometry.
+        "node_inputs_indices",
+        "node_types",
+        "node_ranks",
+        "canonical_order",
+        "canonical_positions",
+        "leaf_node_indices",
+        "leaf_node_indices_array",
+        "leaf_node_indices_tensor",
+    )
 
     def __getstate__(self) -> dict:
-        """Drop the per-rank slices; ship the four base tensors instead.
-
-        ``build_rank_batches`` builds four flat tensors and hands each rank a
-        *slice* of them. Pickling a slice serializes its entire underlying
-        storage, so the naive pickle of one graph writes each base tensor once
-        per rank -- measured at 28.5 MB for a batch of 256 against the ~2.5 MB
-        the data actually occupies, and 418 ms to load, which is worse than
-        simply regenerating the batch.
-
-        Concatenating back to contiguous bases costs the *sending* process a
-        little (it is off the critical path there, which is the whole point) and
-        lets :meth:`__setstate__` rebuild every rank as a free view.
-        """
+        """Ship the arrays; drop every view derivable from them."""
         state = self.__dict__.copy()
-        rank_batches = state.pop("rank_batches")
-        state["_pickled_ranks"] = (
-            torch.cat([rank.node_indices for rank in rank_batches]),
-            torch.cat([rank.subtypes for rank in rank_batches]),
-            torch.cat([rank.parent_indices for rank in rank_batches]),
-            torch.cat([rank.valid_parent_mask for rank in rank_batches]),
-            [rank.node_indices.shape[0] for rank in rank_batches],
-            [rank.has_valid_parents for rank in rank_batches],
+        for cached in self._DROPPED_ON_PICKLE:
+            state.pop(cached, None)
+        missing = [name for name in self._PICKLED_ARRAYS if name not in state]
+        assert not missing, (
+            f"array primitives missing from pickled state: {missing}; the views "
+            "dropped above derive from them and would recurse"
         )
-        # A cached_property's stored value is another whole set of objects to
-        # ship, and nothing on the hot path reads it.
-        state.pop("rank_groups", None)
         return state
-
-    def __setstate__(self, state: dict) -> None:
-        nodes, subtypes, parents, mask, lengths, has_valid = state.pop("_pickled_ranks")
-        self.__dict__.update(state)
-
-        rank_batches: list[PreparedRankBatch] = []
-        offset = 0
-        for length, valid in zip(lengths, has_valid):
-            start = offset
-            offset += length
-            end = offset
-            rank_batches.append(
-                PreparedRankBatch(
-                    node_indices=nodes[start:end],
-                    parent_indices=parents[start:end],
-                    valid_parent_mask=mask[start:end],
-                    subtypes=subtypes[start:end],
-                    has_valid_parents=valid,
-                )
-            )
-        self.rank_batches = rank_batches
 
     @functools.cached_property
     def rank_groups(self) -> list[list[RankGroup]]:
@@ -342,73 +589,43 @@ class FixedInDegreeDAGDescription:
 
         return rank_groups
 
-    def build_rank_batches(self) -> list[PreparedRankBatch]:
-        """Precompute padded CPU rank tensors used by the model hot path.
+    def build_rank_partition(self) -> RankPartition:
+        """Precompute the padded CPU rank partition used by the model hot path.
 
         The training loop needs a node-sorted padded view of each rank every
         encode/decode pass, so build that once when the graph is created instead
         of rebuilding it on the compute device.
 
-        This runs once per generated graph in the training loop, so it builds
-        the padded rows for *every* rank as flat Python lists, converts them in
-        four ``torch.tensor`` calls total, and hands each rank a slice. Per-rank
-        (or per-:class:`RankGroup`) tensor construction costs tens of
-        microseconds of allocator/dispatch overhead each and dominated graph
-        generation when done that way.
+        This runs once per generated graph in the training loop, so the whole
+        partition is one stable argsort of the node ranks plus one gather per
+        tensor through it -- five torch objects for the graph, not four per rank.
+        Building the padded rows node by node in Python, or making a tensor per
+        rank (or per :class:`RankGroup`), each cost tens of microseconds of
+        interpreter and allocator overhead and dominated graph generation.
         """
-        max_rank = max(self.node_ranks, default=0)
-        nodes_by_rank: list[list[int]] = [[] for _ in range(max_rank + 1)]
-        for node_idx, rank in enumerate(self.node_ranks):
-            nodes_by_rank[rank].append(node_idx)
+        padded_parents, slot_mask = self.parent_arrays
+        ranks = self.ranks_array
+        num_ranks = int(ranks.max(initial=-1)) + 1
 
-        pad = self.maximum_indegree
-        flat_nodes: list[int] = []
-        flat_subtypes: list[int] = []
-        flat_parents: list[list[int]] = []
-        flat_mask: list[list[bool]] = []
-        rank_has_valid_parents: list[bool] = []
+        # A stable sort by rank groups the nodes by rank while leaving each
+        # rank's slice in ascending node order, which is what the hot path
+        # indexes by. Empty ranks cannot occur (a node at rank r has a parent at
+        # r-1), but bincount tolerates them, unlike a reduceat over boundaries.
+        order = np.argsort(ranks, kind="stable")
+        counts = np.bincount(ranks, minlength=num_ranks)
+        has_valid_parents = np.bincount(
+            ranks, weights=slot_mask.any(axis=1), minlength=num_ranks
+        ).astype(bool)
 
-        # Nodes are visited in ascending index order above, so each rank's slice
-        # is already node-sorted -- what the old build did with an argsort.
-        for node_list in nodes_by_rank:
-            has_valid_parents = False
-            for node_idx in node_list:
-                parents = self.node_inputs_indices[node_idx]
-                in_degree = len(parents)
-                if in_degree > pad:
-                    raise ValueError(
-                        f"rank contains in-degree {in_degree}, above maximum {pad}"
-                    )
-                has_valid_parents = has_valid_parents or in_degree > 0
-                flat_nodes.append(node_idx)
-                flat_subtypes.append(self.node_types[node_idx])
-                flat_parents.append([*parents, *(0,) * (pad - in_degree)])
-                flat_mask.append([*(True,) * in_degree, *(False,) * (pad - in_degree)])
-            rank_has_valid_parents.append(has_valid_parents)
-
-        total = len(flat_nodes)
-        all_nodes = torch.tensor(flat_nodes, dtype=torch.long)
-        all_subtypes = torch.tensor(flat_subtypes, dtype=torch.long)
-        all_parents = torch.tensor(flat_parents, dtype=torch.long).reshape(total, pad)
-        all_mask = torch.tensor(flat_mask, dtype=torch.bool).reshape(total, pad)
-
-        rank_batches: list[PreparedRankBatch] = []
-        offset = 0
-        for node_list, has_valid_parents in zip(nodes_by_rank, rank_has_valid_parents):
-            start = offset
-            offset += len(node_list)
-            end = offset
-            rank_batches.append(
-                PreparedRankBatch(
-                    node_indices=all_nodes[start:end],
-                    parent_indices=all_parents[start:end],
-                    valid_parent_mask=all_mask[start:end],
-                    subtypes=all_subtypes[start:end],
-                    has_valid_parents=has_valid_parents,
-                )
-            )
-
-        return rank_batches
+        return RankPartition(
+            node_indices=torch.from_numpy(order),
+            parent_indices=torch.from_numpy(padded_parents[order]),
+            valid_parent_mask=torch.from_numpy(slot_mask[order]),
+            subtypes=torch.from_numpy(self.node_types_array[order]),
+            rank_of_row=torch.from_numpy(ranks[order]),
+            counts=tuple(counts.tolist()),
+            has_valid_parents=tuple(has_valid_parents.tolist()),
+        )
 
     def compute_canonical_order(self) -> list[int]:
         """Structure-canonical topological order of the graph's nodes.
@@ -430,35 +647,44 @@ class FixedInDegreeDAGDescription:
         can see its parent-position tuple swap under relabeling; this is
         accepted rather than paying for full graph canonization.
         """
-        output_start = self.num_root_nodes + self.num_trunk_nodes
+        num_root_nodes = self.num_root_nodes
+        output_start = num_root_nodes + self.num_trunk_nodes
+        # Hoisted to locals: this is the one part of graph construction that
+        # stays a sequential interpreted loop (a heap-ordered Kahn sweep has no
+        # vectorized form), so attribute lookups in it are a real cost.
+        inputs = self.node_inputs_indices
+        node_types = self.node_types
+
         positions: list[int | None] = [None] * self.num_nodes
-        for root_idx in range(self.num_root_nodes):
+        for root_idx in range(num_root_nodes):
             positions[root_idx] = root_idx
 
         children: list[list[int]] = [[] for _ in range(output_start)]
         blocking_parents = [0] * output_start
-        for node_idx in range(self.num_root_nodes, output_start):
-            for parent in self.node_inputs_indices[node_idx]:
-                if parent >= self.num_root_nodes:
+        for node_idx in range(num_root_nodes, output_start):
+            for parent in inputs[node_idx]:
+                if parent >= num_root_nodes:
                     blocking_parents[node_idx] += 1
                     children[parent].append(node_idx)
 
-        def ready_key(node_idx: int) -> tuple:
-            # All parents are guaranteed placed by the time a node enters the
-            # heap (roots are pre-placed; trunk parents gate readiness).
-            parent_positions = tuple(
-                positions[parent] for parent in self.node_inputs_indices[node_idx]
-            )
-            return (parent_positions, self.node_types[node_idx], node_idx)
-
+        # The ready key is ``(parent positions in slot order, node type, index)``,
+        # built inline at both sites below rather than in a helper: it is
+        # evaluated once per trunk node and a call plus a generator expression
+        # cost more than the heap operation it feeds. All parents are guaranteed
+        # placed by the time a node enters the heap (roots are pre-placed; trunk
+        # parents gate readiness), so no position is still None.
         heap = [
-            ready_key(node_idx)
-            for node_idx in range(self.num_root_nodes, output_start)
+            (
+                tuple([positions[parent] for parent in inputs[node_idx]]),
+                node_types[node_idx],
+                node_idx,
+            )
+            for node_idx in range(num_root_nodes, output_start)
             if blocking_parents[node_idx] == 0
         ]
         heapq.heapify(heap)
 
-        order = list(range(self.num_root_nodes))
+        order = list(range(num_root_nodes))
         while heap:
             node_idx = heapq.heappop(heap)[-1]
             positions[node_idx] = len(order)
@@ -466,7 +692,14 @@ class FixedInDegreeDAGDescription:
             for child in children[node_idx]:
                 blocking_parents[child] -= 1
                 if blocking_parents[child] == 0:
-                    heapq.heappush(heap, ready_key(child))
+                    heapq.heappush(
+                        heap,
+                        (
+                            tuple([positions[parent] for parent in inputs[child]]),
+                            node_types[child],
+                            child,
+                        ),
+                    )
 
         assert len(order) == output_start, "canonical sort left unplaced trunk nodes"
         order.extend(range(output_start, self.num_nodes))
@@ -486,35 +719,127 @@ class FixedInDegreeDAGDescription:
         position is strictly less than its consumer's position and strictly
         less than the first output position (outputs are leaves).
         """
-        pad = self.maximum_indegree
-        canonical_positions = self.canonical_positions
-        node_types_list: list[int] = []
-        position_rows: list[list[int]] = []
-        mask_rows: list[list[bool]] = []
-        # Build the padded rows in Python and convert once. Writing each slot
-        # through tensor ``__setitem__`` costs a dispatch per element and was one
-        # of the largest single costs in graph generation.
-        for node_idx in self.canonical_order:
-            node_types_list.append(self.node_types[node_idx])
-            parents = self.node_inputs_indices[node_idx]
-            in_degree = len(parents)
-            position_rows.append(
-                [
-                    *(canonical_positions[parent] for parent in parents),
-                    *(0,) * (pad - in_degree),
-                ]
-            )
-            mask_rows.append([*(True,) * in_degree, *(False,) * (pad - in_degree)])
+        padded_parents, slot_mask = self.parent_arrays
+        order = self.canonical_order_array
+        positions = self.canonical_positions_array
+        # One gather per tensor rather than a padded row built per node: writing
+        # slots through Python lists (or worse, tensor ``__setitem__``) was one of
+        # the largest single costs in graph generation. Invalid slots are held at
+        # 0 explicitly; the mask is what marks them, but consumers still read the
+        # value, so it must not be a stale parent position.
+        parent_positions = np.where(slot_mask, positions[padded_parents], 0)[order]
+        return (
+            torch.from_numpy(order),
+            torch.from_numpy(self.node_types_array[order]),
+            torch.from_numpy(parent_positions),
+            torch.from_numpy(slot_mask[order]),
+        )
 
-        order = torch.tensor(self.canonical_order, dtype=torch.long)
-        node_types = torch.tensor(node_types_list, dtype=torch.long)
-        parent_positions = torch.tensor(position_rows, dtype=torch.long).reshape(
-            self.num_nodes, pad
-        )
-        parent_slot_mask = torch.tensor(mask_rows, dtype=torch.bool).reshape(
-            self.num_nodes, pad
-        )
-        return order, node_types, parent_positions, parent_slot_mask
+
+@dataclass
+class CollatedRanks:
+    """A batch of graphs' rank partitions, regrouped by rank across the batch.
+
+    All row tensors are ``[total_rows]`` (or ``[total_rows, maximum_indegree]``)
+    and share one ordering: rank-major, then by position in ``graphs``, then by
+    node index. Rank ``r`` is therefore the contiguous slice of length
+    ``counts[r]`` starting at ``offsets[r]``, which is what lets a rank-by-rank
+    evaluation loop take slices instead of gathering.
+
+    ``batch_indices`` says which graph each row came from, so a consumer can
+    index a ``[batch, nodes]`` buffer with ``(batch_indices, node_indices)``.
+    """
+
+    batch_indices: torch.Tensor
+    node_indices: torch.Tensor
+    parent_indices: torch.Tensor
+    valid_parent_mask: torch.Tensor
+    subtypes: torch.Tensor
+    counts: tuple[int, ...]
+    offsets: tuple[int, ...]
+    has_valid_parents: tuple[bool, ...]
+
+    @property
+    def num_ranks(self) -> int:
+        return len(self.counts)
+
+    def rank_slice(self, rank: int) -> slice:
+        start = self.offsets[rank]
+        return slice(start, start + self.counts[rank])
+
+
+def collate_rank_partitions(
+    graphs: Sequence["FixedInDegreeDAGDescription"],
+    device: torch.device,
+) -> CollatedRanks:
+    """Regroup a batch of graphs' rank partitions by rank, on ``device``.
+
+    Every rank-by-rank evaluation over a batch needs, for each rank, the rows of
+    that rank from every graph. Each graph already stores its rows rank-major, so
+    the batch ordering is one *stable* argsort of the concatenated rank labels:
+    stability is what keeps graph order within a rank, and node order within a
+    graph, without a second sort key.
+
+    This replaced a nested loop that concatenated one tensor per graph per rank --
+    five ``torch.cat`` calls over 256 slices, once per rank, every training step.
+    At the training geometry that was 5.7 ms per batch of 256; the work here is a
+    fixed handful of ops regardless of rank count.
+    """
+    if not graphs:
+        raise ValueError("cannot collate an empty batch of graphs")
+
+    partitions = [graph.rank_partition for graph in graphs]
+    num_ranks = max(partition.num_ranks for partition in partitions)
+
+    rank_of_row = torch.cat([partition.rank_of_row for partition in partitions])
+    # Stable, so rows stay ordered by (rank, graph, node) after the permutation.
+    order = torch.argsort(rank_of_row, stable=True)
+
+    row_counts = [partition.node_indices.shape[0] for partition in partitions]
+    batch_indices = torch.repeat_interleave(
+        torch.arange(len(graphs), dtype=torch.long),
+        torch.tensor(row_counts, dtype=torch.long),
+    )
+
+    counts = torch.bincount(rank_of_row, minlength=num_ranks).tolist()
+    offsets = [0]
+    for count in counts[:-1]:
+        offsets.append(offsets[-1] + count)
+
+    # A rank has valid parents if it does in any graph that reaches that rank.
+    has_valid_parents = [False] * num_ranks
+    for partition in partitions:
+        for rank, valid in enumerate(partition.has_valid_parents):
+            has_valid_parents[rank] = has_valid_parents[rank] or valid
+
+    # Async host-to-device copies are only requested on CUDA. On MPS a
+    # non-blocking copy of an index tensor can be read by a subsequent gather
+    # before it lands, which silently yields out-of-range garbage rather than an
+    # error; from unpinned host memory CUDA's non_blocking is synchronous anyway,
+    # so nothing is lost by gating it.
+    non_blocking = device.type == "cuda"
+
+    def send(rows: torch.Tensor, permutation: torch.Tensor) -> torch.Tensor:
+        return rows[permutation].to(device, non_blocking=non_blocking)
+
+    return CollatedRanks(
+        batch_indices=send(batch_indices, order),
+        node_indices=send(
+            torch.cat([partition.node_indices for partition in partitions]), order
+        ),
+        parent_indices=send(
+            torch.cat([partition.parent_indices for partition in partitions]), order
+        ),
+        valid_parent_mask=send(
+            torch.cat([partition.valid_parent_mask for partition in partitions]), order
+        ),
+        subtypes=send(
+            torch.cat([partition.subtypes for partition in partitions]), order
+        ),
+        counts=tuple(counts),
+        offsets=tuple(offsets),
+        has_valid_parents=tuple(has_valid_parents),
+    )
 
 
 def make_random_graph_description(
@@ -524,180 +849,26 @@ def make_random_graph_description(
     trunk_node_in_degrees: int | list[int],
     num_trunk_node_types: int,
 ) -> FixedInDegreeDAGDescription:
-    """Generate a random fixed-in-degree DAG via two-pass construction (Algorithm A).
+    """One freshly sampled random DAG.
 
-    1. Lay nodes out in topological order: ``num_root_nodes`` roots (in-degree
-       0), then ``num_trunk_nodes`` trunk nodes each with a random type (its
-       type fixes its in-degree), then ``num_output_nodes`` outputs (in-degree
-       1). A consumer's input slots may only point at strictly earlier nodes, so
-       the graph is acyclic by construction.
-    2. **Coverage pass** (producers walked latest-first): every root and trunk
-       must end up with at least one child. Each still-childless producer is
-       wired into one open input slot of a randomly chosen *later* consumer.
-       Walking latest-first claims the scarce late slots before the plentiful
-       early ones.
-    3. **Fill pass**: every still-open input slot is filled with a random
-       *earlier* producer, distinct from that consumer's existing parents.
-
-    Because the only sinks are outputs, "every trunk is an ancestor of some
-    output" is equivalent to "every trunk has a child", which the coverage pass
-    enforces locally. Full coverage of *all* producers (roots included) is
-    guaranteed for any random type assignment as long as there are enough
-    downstream slots::
-
-        num_root_nodes <= num_trunk_nodes * (min_in_degree - 1) + num_output_nodes
-
-    (the worst case is every trunk taking the smallest in-degree). Since a
-    producer can only be consumed by strictly-later nodes, the producer->slot
-    neighbourhoods are nested, so the latest-first greedy assignment saturates
-    whenever that inequality holds; it is asserted up front. The resulting
-    distribution is the natural generative model (not uniform over all such
-    DAGs), but it is O(edges) and respects every count / in-degree / coverage
-    constraint exactly.
+    A convenience wrapper over
+    :func:`~dagnabbit.dag.generate.sample_graph_batch`, which is where the
+    algorithm and its guarantees are documented. Anything generating more than
+    one graph should call that directly: the compiled generator is entered once
+    per call, so a batch of 256 costs one crossing rather than 256.
     """
-    if isinstance(trunk_node_in_degrees, int):
-        trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
-    else:
-        trunk_node_in_degrees = list(trunk_node_in_degrees)
+    # Imported here rather than at module scope: dagnabbit.dag.generate needs
+    # FixedInDegreeDAGDescription, so a top-level import would be circular.
+    from dagnabbit.dag.generate import sample_graph_batch
 
-    assert len(trunk_node_in_degrees) == num_trunk_node_types
-    assert all(in_degree >= 1 for in_degree in trunk_node_in_degrees)
-    assert num_root_nodes >= 1
-    assert num_output_nodes >= 1
-    assert num_trunk_node_types >= 1
-    if num_trunk_nodes > 0:
-        # The earliest trunk can draw distinct inputs only from the roots, so
-        # there must be at least max-in-degree of them for every gate to be
-        # given distinct parents.
-        assert num_root_nodes >= max(trunk_node_in_degrees), (
-            "num_root_nodes must be >= the largest trunk in-degree so every "
-            "gate can be given distinct inputs"
-        )
-
-    # Coverage feasibility: with every trunk at the smallest possible in-degree,
-    # the downstream input slots must still outnumber the producers enough to
-    # give each root (and trunk) a child. See the docstring for the derivation.
-    min_in_degree = min(trunk_node_in_degrees)
-    max_coverable_roots = num_trunk_nodes * (min_in_degree - 1) + num_output_nodes
-    assert num_root_nodes <= max_coverable_roots, (
-        f"to guarantee every root is used, need num_root_nodes "
-        f"({num_root_nodes}) <= num_trunk_nodes * (min_in_degree - 1) + "
-        f"num_output_nodes ({num_trunk_nodes} * {min_in_degree - 1} + "
-        f"{num_output_nodes} = {max_coverable_roots}); add trunk nodes "
-        "(ideally with in-degree > 1) or output nodes"
-    )
-
-    seed = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
-    rng = random.Random(seed)
-
-    num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
-    output_start = num_root_nodes + num_trunk_nodes
-
-    # Node types and per-node input-slot count (the node's in-degree).
-    node_types = [0] * num_nodes
-    in_degrees = [0] * num_nodes
-    for root_idx in range(num_root_nodes):
-        # root_node_types_start (== num_trunk_node_types) + slot.
-        node_types[root_idx] = num_trunk_node_types + root_idx
-    for trunk_offset in range(num_trunk_nodes):
-        node_idx = num_root_nodes + trunk_offset
-        trunk_type = rng.randrange(num_trunk_node_types)
-        node_types[node_idx] = trunk_type
-        in_degrees[node_idx] = trunk_node_in_degrees[trunk_type]
-    for output_offset in range(num_output_nodes):
-        node_idx = output_start + output_offset
-        # All outputs share the single output type (output_node_types_start).
-        node_types[node_idx] = num_trunk_node_types + num_root_nodes
-        in_degrees[node_idx] = 1
-
-    # Filled input slots per node, appended to as the two passes run. Slot order
-    # here is an artifact of the passes and is shuffled away at the end, so both
-    # passes can simply append rather than hunt for the first open slot.
-    parents: list[list[int]] = [[] for _ in range(num_nodes)]
-    # A producer (root or trunk) is "used" once some consumer slot points at it.
-    has_child = [False] * num_nodes
-
-    # Pass 1 -- coverage. Producers (roots + trunks) processed latest-first.
-    #
-    # ``coverable`` holds exactly the consumers eligible for the producer being
-    # processed: strictly later than it, and still holding an open slot. It is
-    # maintained incrementally instead of rescanning every later node per
-    # producer, which made this pass quadratic in the node count. Walking
-    # producers latest-first is what makes the incremental maintenance possible:
-    # the "strictly later" set only ever grows, one node per step. ``slot_of``
-    # tracks each consumer's index in ``coverable`` so a consumer whose slots
-    # just filled can be swap-removed in constant time.
-    #
-    # A producer is chosen at most once here and has never been assigned before
-    # its own turn, so a consumer can never already point at it: no duplicate
-    # check is needed, and every producer gets covered exactly once.
-    coverable: list[int] = []
-    slot_of = [-1] * num_nodes
-
-    def mark_coverable(consumer: int) -> None:
-        if in_degrees[consumer]:
-            slot_of[consumer] = len(coverable)
-            coverable.append(consumer)
-
-    def drop_coverable(consumer: int) -> None:
-        index = slot_of[consumer]
-        moved = coverable.pop()
-        if moved != consumer:
-            coverable[index] = moved
-            slot_of[moved] = index
-        slot_of[consumer] = -1
-
-    for consumer in range(output_start, num_nodes):
-        mark_coverable(consumer)
-
-    for producer in range(output_start - 1, -1, -1):
-        # The feasibility precondition guarantees a later open slot always
-        # exists here; this is a defensive safety net.
-        assert coverable, f"coverage failed for producer {producer} (internal bug)"
-        consumer = coverable[rng.randrange(len(coverable))]
-        parents[consumer].append(producer)
-        if len(parents[consumer]) == in_degrees[consumer]:
-            drop_coverable(consumer)
-        has_child[producer] = True
-        # The next producer is earlier, so this one becomes a legal consumer.
-        mark_coverable(producer)
-
-    # Pass 2 -- fill every remaining slot with a random earlier producer.
-    # Every node before ``output_start`` is a producer, and a consumer may only
-    # reference strictly earlier nodes, so the eligible range is a contiguous
-    # ``[0, candidate_range)``. Rejection-sample from it rather than materializing
-    # the filtered pool per slot: ``existing`` holds at most in_degree - 1
-    # entries and the range is at least ``num_root_nodes >= max in-degree`` wide,
-    # so a draw is accepted with probability > 0 and in practice on the first try.
-    for consumer in range(num_root_nodes, num_nodes):
-        filled = parents[consumer]
-        existing = set(filled)
-        candidate_range = min(consumer, output_start)
-        while len(filled) < in_degrees[consumer]:
-            chosen = rng.randrange(candidate_range)
-            while chosen in existing:
-                chosen = rng.randrange(candidate_range)
-            filled.append(chosen)
-            existing.add(chosen)
-            has_child[chosen] = True
-
-    assert all(has_child[p] for p in range(output_start)), "uncovered producer remains"
-
-    # Shuffle each consumer's parent order to erase the slot-position artifact
-    # left by the two passes, then hand the flat arrays to the representation.
-    node_inputs_indices = parents
-    for node_idx in range(num_root_nodes, num_nodes):
-        rng.shuffle(node_inputs_indices[node_idx])
-
-    return FixedInDegreeDAGDescription(
+    return sample_graph_batch(
+        1,
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         num_trunk_node_types=num_trunk_node_types,
         trunk_node_in_degrees=trunk_node_in_degrees,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
-    )
+    )[0]
 
 
 def canonicalize(graph: FixedInDegreeDAGDescription) -> list[tuple]:
