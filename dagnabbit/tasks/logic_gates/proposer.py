@@ -330,11 +330,13 @@ def evaluate_flow_proposals(
 
     What to read:
 
-    * ``best_of_n_correlation`` is the headline. It must beat the deterministic
-      proposer and it must *rise with* ``num_candidates``.
-    * ``distinct_fraction`` is why. If it collapses toward ``1/num_candidates``
-      the sampler is not exploring and best-of-N is buying nothing; suspect the
-      guidance strength before anything else.
+    * ``best_of_n_correlation`` is the headline, and what matters is that it
+      *rises with* ``num_candidates``. A flat curve across N means the
+      distribution has collapsed to a point and nothing was gained by modelling
+      one.
+    * ``distinct_fraction`` says whether a flat curve is collapse or saturation.
+      Near ``1/num_candidates`` the sampler is emitting the same circuit every
+      time; suspect the guidance strength before anything else.
     * ``mean_correlation`` next to the best says whether the whole distribution
       is good or whether one lucky draw is carrying it.
     * ``constant_output_fraction`` guards the degenerate answer. If it climbs
