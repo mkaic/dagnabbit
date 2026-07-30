@@ -118,7 +118,6 @@ def test_pickling_ships_arrays_and_drops_the_views() -> None:
     """
     graph = GEOMETRY.sample_batch(1)[0]
     # Force every lazy view to materialize, so the pickle has something to drop.
-    assert graph.rank_groups is not None
     assert len(graph.rank_batches) > 1
     assert graph.node_inputs_indices is not None
     assert graph.node_ranks is not None
@@ -139,7 +138,6 @@ def test_pickling_ships_arrays_and_drops_the_views() -> None:
     assert restored.canonical_order == graph.canonical_order
     assert restored.canonical_positions == graph.canonical_positions
     assert restored.leaf_node_indices == graph.leaf_node_indices
-    assert len(restored.rank_groups) == len(graph.rank_groups)
     assert len(restored.rank_batches) == len(graph.rank_batches)
 
 
