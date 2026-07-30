@@ -7,12 +7,18 @@ Run this on the CUDA machine. It dumps a single human-readable SUMMARY.txt
 What it measures, and why:
 
   * Per-phase HOST vs GPU time. Each training step is split into four phases:
-    graph-gen (pure-Python CPU), forward (encode + decode), backward, optimizer.
-    For each we record both wall-clock host time (CPU + kernel-launch overhead)
-    and actual GPU-timeline time (CUDA events). The gap between "sum of host
-    phase times" and "GPU busy time" is the tell: if GPU busy fraction is low,
-    the loop is launch-bound / CPU-bound, not compute-bound, and the win is
-    fusing/batching Python-driven kernel launches rather than a bigger GPU.
+    graph-gen (CPU), forward (encode + decode), backward, optimizer. For each we
+    record both wall-clock host time (CPU + kernel-launch overhead) and actual
+    GPU-timeline time (CUDA events). The gap between "sum of host phase times"
+    and "GPU busy time" is the tell: if GPU busy fraction is low, the loop is
+    launch-bound / CPU-bound, not compute-bound, and the win is fusing/batching
+    Python-driven kernel launches rather than a bigger GPU.
+
+    Note on the gen phase: it used to dominate at 70-90% of a step and no longer
+    does -- generation is compiled now (~35 us/graph, ~9 ms per batch of 256), so
+    expect it to be a rounding error and read the other phases accordingly. It is
+    still measured because it is still on the critical path, synchronously and
+    deliberately; see the module docstring of dagnabbit.dag.geometry.
 
   * Encode vs compress vs decode split. The encoder is the remaining sequential
     path -- a Python loop over topological ranks, one shared-transformer
@@ -42,7 +48,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.geometry import GraphGeometry
 from dagnabbit.optimizers import build_optimizer
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.train_encoder import combine_losses
@@ -206,17 +212,14 @@ def main() -> None:
     model.compress = timed_compress
     model.decode_latent = timed_decode
 
+    # Exactly what train_encoder.py does. Must go through sample_batch rather
+    # than a loop of single-graph calls: the generator is compiled and entered
+    # once per batch, so per-graph calls would measure a cost the training loop
+    # never pays.
+    geometry = GraphGeometry.from_config(cfg)
+
     def make_graphs():
-        return [
-            make_random_graph_description(
-                num_root_nodes=cfg.NUM_ROOT_NODES,
-                num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-                num_output_nodes=cfg.NUM_OUTPUT_NODES,
-                trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-                num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-            )
-            for _ in range(cfg.GRAPH_BATCH_SIZE)
-        ]
+        return geometry.sample_batch(cfg.GRAPH_BATCH_SIZE)
 
     amp_choice = args.amp
     if amp_choice is None:
