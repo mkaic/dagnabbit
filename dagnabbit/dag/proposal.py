@@ -7,11 +7,20 @@ I/O examples, a target trajectory. What the specification looks like, and how
 it is read, is the task's business. What happens *after* the latent exists is
 not, and that is what lives here:
 
-* :class:`LatentReadout` -- the final stage every proposer shares, turning a
-  variable number of context tokens into the fixed ``[K, D]`` latent shape.
+* :func:`project_to_shell` -- the scaling every latent must pass through before
+  the decoder sees it.
+* :class:`LatentReadout` -- the final stage a *deterministic* proposer shares,
+  turning a variable number of context tokens into the fixed ``[K, D]`` latent
+  shape.
 * :func:`reconstruction_losses` -- scoring a proposed latent against the graph
   it was supposed to describe, reusing the autoencoder's own type and pointer
   cross-entropy.
+
+A deterministic proposer is only one of the two ways to write a latent, and it
+is the weaker one: behaviour -> graph is massively one-to-many, so the
+cross-entropy minimizer is a per-slot marginal whose argmax need not be a
+coherent graph. :mod:`dagnabbit.dag.flow` is the generative alternative, and it
+reuses :func:`project_to_shell` from here rather than the readout.
 
 Neither knows what a circuit is, and nothing in this module may import from
 :mod:`dagnabbit.tasks`. A new task supplies its own specification encoder, ends
@@ -19,7 +28,6 @@ it with :class:`LatentReadout`, and trains it with
 :func:`reconstruction_losses`.
 """
 
-import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -32,6 +40,28 @@ from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.description import FixedInDegreeDAGDescription
 
 READOUT_DROPOUT = 0.0
+
+
+def project_to_shell(latent: Tensor, radius: float | Tensor | None = None) -> Tensor:
+    """Rescale every latent token onto a shell of the given radius.
+
+    Anything handed to ``decode_latent`` should sit at the magnitude the decoder
+    was trained at -- an off-shell vector is a scale it has never seen, and
+    because ``decode_latent`` adds its position encoding *before* the first
+    normalization, a wrong magnitude quietly reweights latent against position.
+
+    ``radius`` defaults to ``sqrt(D)``, which is where encoded latents would sit
+    if the encoder's final ``LayerNorm`` had no learned gain. It does have one,
+    so the true radius is a property of the trained checkpoint and is measurably
+    not ``sqrt(D)`` -- on the d128 checkpoint it is 11.99 against a ``sqrt(D)``
+    of 11.31. Pass the measured value when you have it;
+    :class:`~dagnabbit.dag.flow.LatentNormalizer` fits it alongside its
+    per-dimension statistics for exactly this reason.
+    """
+    if radius is None:
+        radius = latent.shape[-1] ** 0.5
+    norms = latent.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return latent * (radius / norms)
 
 
 class LatentReadout(nn.Module):
@@ -76,7 +106,6 @@ class LatentReadout(nn.Module):
         )
         self.output_norm = nn.LayerNorm(context_dim)
         self.to_latent = nn.Linear(context_dim, latent_dim)
-        self.latent_scale = math.sqrt(latent_dim)
 
     def forward(self, context: Tensor) -> Tensor:
         if context.ndim != 3:
@@ -90,9 +119,63 @@ class LatentReadout(nn.Module):
             context,
             need_weights=False,
         )
-        latent = self.to_latent(self.output_norm(queries + attended))
-        normalized = latent / latent.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        return normalized * self.latent_scale
+        return project_to_shell(self.to_latent(self.output_norm(queries + attended)))
+
+
+def choice_signatures(
+    model: DagnabbitAutoEncoder,
+    trunk_types: Tensor,
+    parent_choices: Tensor,
+) -> Tensor:
+    """Decoded graphs as comparable integer rows: ``[B, T + N * S]``.
+
+    Two graphs are the same graph iff their signatures match. Slots beyond a
+    position's in-degree are set to -1 before comparison, because a slot that
+    does not exist in the decoded circuit cannot be a difference between two
+    circuits -- comparing them raw would report structural diversity that is
+    pure padding noise.
+
+    Kept in tensor form on purpose. The alternatives are
+    :func:`~dagnabbit.dag.description.graphs_match`, which is exact but costs a
+    Python pass per *pair*, and nothing -- and counting distinct samples among a
+    few hundred candidates is precisely a place where a per-pair Python loop is
+    the whole cost of the measurement.
+    """
+    in_degrees = torch.tensor(model.trunk_node_in_degrees, device=trunk_types.device)
+    active = torch.zeros(
+        trunk_types.shape[0],
+        model.num_nodes,
+        dtype=torch.long,
+        device=trunk_types.device,
+    )
+    active[:, model.num_root_nodes : model.output_start] = in_degrees[trunk_types]
+    active[:, model.output_start :] = 1
+
+    slot_index = torch.arange(model.maximum_indegree, device=trunk_types.device)
+    slot_mask = slot_index.view(1, 1, -1) < active.unsqueeze(-1)
+    masked_parents = parent_choices.masked_fill(~slot_mask, -1)
+    return torch.cat([trunk_types, masked_parents.flatten(start_dim=1)], dim=1)
+
+
+def count_distinct_signatures(signatures: Tensor, group_size: int) -> Tensor:
+    """Distinct graphs per group of ``group_size`` consecutive rows -> ``[P]``.
+
+    ``signatures`` is ``[P * group_size, L]`` laid out group-major, matching what
+    ``repeat_interleave`` on the conditioning produces. Reported as a fraction of
+    ``group_size`` by callers: near 1 means the sampler is exploring, near
+    1/group_size means every draw collapsed to the same circuit and best-of-N is
+    buying nothing.
+    """
+    if signatures.shape[0] % group_size != 0:
+        raise ValueError(
+            f"{signatures.shape[0]} signatures do not divide into groups of "
+            f"{group_size}"
+        )
+    grouped = signatures.reshape(-1, group_size, signatures.shape[-1]).cpu()
+    return torch.tensor(
+        [len({tuple(row.tolist()) for row in group}) for group in grouped],
+        dtype=torch.long,
+    )
 
 
 @dataclass(frozen=True)

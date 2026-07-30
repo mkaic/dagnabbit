@@ -41,6 +41,7 @@ from torch import Tensor
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
 from dagnabbit.dag.checkpoint import load_model, pick_device
 from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.proposal import choice_signatures
 from dagnabbit.tasks.logic_gates.evaluate import (
     BitpackedTask,
     adder_task,
@@ -106,36 +107,10 @@ def decode_tokens(model: DagnabbitAutoEncoder, latent: Tensor) -> Tensor:
 
     Mirrors the argmaxes :meth:`DagnabbitAutoEncoder.generate` takes, but keeps
     the result as integers so two decodes can be compared by Hamming distance
-    without building descriptions. Pointer slots beyond a position's in-degree
-    are masked to -1: they do not exist in the decoded graph, so a change there
-    is not a change to the circuit.
+    without building descriptions.
     """
-    reconstructed = model.decode_latent(latent)
-    trunk_types = model.node_type_predictor(
-        reconstructed[:, model.num_root_nodes : model.output_start]
-    ).argmax(dim=-1)
-    parents = model.parent_pointer_logits(reconstructed).argmax(dim=-1)
-
-    in_degrees = torch.tensor(
-        model.trunk_node_in_degrees,
-        device=latent.device,
-    )
-    # Active slot count per position: 0 for roots, the type's in-degree for
-    # trunks, 1 for outputs.
-    active = torch.zeros(
-        latent.shape[0],
-        model.num_nodes,
-        dtype=torch.long,
-        device=latent.device,
-    )
-    active[:, model.num_root_nodes : model.output_start] = in_degrees[trunk_types]
-    active[:, model.output_start :] = 1
-
-    slot_index = torch.arange(model.maximum_indegree, device=latent.device)
-    slot_mask = slot_index.view(1, 1, -1) < active.unsqueeze(-1)
-    parents = parents.masked_fill(~slot_mask, -1)
-
-    return torch.cat([trunk_types, parents.flatten(start_dim=1)], dim=1)
+    trunk_types, parent_choices = model.generate_choices(latent)
+    return choice_signatures(model, trunk_types, parent_choices)
 
 
 @torch.no_grad()
