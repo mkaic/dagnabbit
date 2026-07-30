@@ -62,6 +62,21 @@ AMP_DTYPE = torch.bfloat16
 # --- training ---
 NUM_STEPS = 10_000_000
 GRAPH_BATCH_SIZE = 256
+
+# Background processes generating graph batches, hiding generation behind the
+# optimizer step. Graph generation is serial Python and has measured at 70-90%
+# of a step, so this is the largest remaining structural win -- but it is not
+# free: a batch has to be pickled across a process boundary, and that unpickling
+# lands on the critical path in place of the generation it replaced.
+#
+# Whether it pays is machine-specific, so the default is 0 (inline generation,
+# the historical behaviour). Run dagnabbit.scripts.profile_batch_loader on the
+# target machine and set this to whatever it says. Measured on a 16-core M-series
+# Mac at batch 256: 4 workers gave 1.19x, 2 workers gave 0.95x (a regression).
+GRAPH_LOADER_WORKERS = 0
+# Batches each worker may run ahead. Bounds memory and provides backpressure;
+# the queue holds at most WORKERS * PREFETCH batches.
+GRAPH_LOADER_PREFETCH_BATCHES = 2
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 1e-4
 

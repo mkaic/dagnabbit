@@ -12,7 +12,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder, TrainingStepLossReturnType
-from dagnabbit.dag.description import NodeSupertype, make_random_graph_description
+from dagnabbit.dag.description import NodeSupertype
+from dagnabbit.dag.loader import GraphBatchLoader, GraphGeometry
 from dagnabbit.optimizers import AutoMuon, build_optimizer
 from dagnabbit.scripts import config as cfg
 from dagnabbit.scripts.logging_utils import (
@@ -34,10 +35,7 @@ def combine_losses(
     slot_mask = losses.parent_pointer_slot_mask
     pointer_mean = losses.parent_pointer_losses.sum() / slot_mask.sum().clamp(min=1)
 
-    total = (
-        cfg.W_TYPE_CLASSIFICATION * type_mean
-        + cfg.W_PARENT_POINTER * pointer_mean
-    )
+    total = cfg.W_TYPE_CLASSIFICATION * type_mean + cfg.W_PARENT_POINTER * pointer_mean
 
     # Keep components as tensors; materialize to floats (a GPU sync) only on the
     # steps that actually log them, rather than every step. The classification
@@ -291,7 +289,9 @@ def main() -> None:
             # Prefer latest.ckpt (saved every CHECK_BEST_EVERY steps) so a resume
             # skips the dry spell since the last best; fall back to best.ckpt.
             latest = resume_arg / "latest.ckpt"
-            resume_checkpoint_path = latest if latest.exists() else resume_arg / "best.ckpt"
+            resume_checkpoint_path = (
+                latest if latest.exists() else resume_arg / "best.ckpt"
+            )
         else:
             resume_checkpoint_path = resume_arg
         if not resume_checkpoint_path.exists():
@@ -405,6 +405,19 @@ def main() -> None:
             f"(wait={wait}, warmup={warmup}, active={args.profile_steps})"
         )
 
+    # Graph generation is the dominant cost of a step here, not the backward
+    # pass, and it is serial Python so only another process can hide it. Zero
+    # workers keeps it inline (the historical behaviour and the control
+    # condition); see dagnabbit.scripts.profile_batch_loader for what to set.
+    loader = GraphBatchLoader(
+        geometry=GraphGeometry.from_config(cfg),
+        batch_size=cfg.GRAPH_BATCH_SIZE,
+        num_workers=cfg.GRAPH_LOADER_WORKERS,
+        prefetch_batches=cfg.GRAPH_LOADER_PREFETCH_BATCHES,
+        seed=cfg.SEED,
+    )
+    print(loader.describe())
+
     try:
         optimizer.zero_grad()
         window_preds: list[np.ndarray] = []
@@ -428,16 +441,7 @@ def main() -> None:
             # TensorBoard's Step axis is the historical per-graph training
             # coordinate, not the optimizer/update index.
             tensorboard_step = step * cfg.GRAPH_BATCH_SIZE
-            graphs = [
-                make_random_graph_description(
-                    num_root_nodes=cfg.NUM_ROOT_NODES,
-                    num_trunk_nodes=cfg.NUM_TRUNK_NODES,
-                    num_output_nodes=cfg.NUM_OUTPUT_NODES,
-                    trunk_node_in_degrees=cfg.TRUNK_NODE_TYPE_IN_DEGREES,
-                    num_trunk_node_types=cfg.NUM_TRUNK_NODE_TYPES,
-                )
-                for _ in range(cfg.GRAPH_BATCH_SIZE)
-            ]
+            graphs = loader.next_batch()
 
             # Only the forward pass is autocast; backward inherits each op's
             # recorded precision and must run outside the region.
@@ -476,14 +480,12 @@ def main() -> None:
                 window_preds.append(step_preds)
                 window_truth.append(step_truth)
 
-                step_correct, step_is_output, step_is_root_parent = (
-                    step_pointer_stats(
-                        losses.parent_pointer_logits,
-                        losses.parent_pointer_true_positions,
-                        losses.parent_pointer_slot_mask,
-                        output_start=model.output_start,
-                        num_root_nodes=model.num_root_nodes,
-                    )
+                step_correct, step_is_output, step_is_root_parent = step_pointer_stats(
+                    losses.parent_pointer_logits,
+                    losses.parent_pointer_true_positions,
+                    losses.parent_pointer_slot_mask,
+                    output_start=model.output_start,
+                    num_root_nodes=model.num_root_nodes,
                 )
                 pointer_window_correct.append(step_correct)
                 pointer_window_is_output.append(step_is_output)
@@ -608,6 +610,9 @@ def main() -> None:
                 if step + 1 >= total_profile_steps:
                     break
     finally:
+        # Before anything else: leaked workers keep generating graphs nobody
+        # will ever read.
+        loader.close()
         if prof is not None:
             prof.stop()
             dump_profile(prof, Path(args.profile_output_dir), device)

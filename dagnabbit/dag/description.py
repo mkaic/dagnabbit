@@ -211,6 +211,62 @@ class FixedInDegreeDAGDescription:
             ranks[node_idx] = parent_rank + 1
         return ranks
 
+    # ---- pickling ----
+    #
+    # Only relevant when descriptions cross a process boundary, which is what
+    # dagnabbit.dag.loader does to keep graph generation off the training
+    # critical path. Normal in-process use never touches these.
+
+    def __getstate__(self) -> dict:
+        """Drop the per-rank slices; ship the four base tensors instead.
+
+        ``build_rank_batches`` builds four flat tensors and hands each rank a
+        *slice* of them. Pickling a slice serializes its entire underlying
+        storage, so the naive pickle of one graph writes each base tensor once
+        per rank -- measured at 28.5 MB for a batch of 256 against the ~2.5 MB
+        the data actually occupies, and 418 ms to load, which is worse than
+        simply regenerating the batch.
+
+        Concatenating back to contiguous bases costs the *sending* process a
+        little (it is off the critical path there, which is the whole point) and
+        lets :meth:`__setstate__` rebuild every rank as a free view.
+        """
+        state = self.__dict__.copy()
+        rank_batches = state.pop("rank_batches")
+        state["_pickled_ranks"] = (
+            torch.cat([rank.node_indices for rank in rank_batches]),
+            torch.cat([rank.subtypes for rank in rank_batches]),
+            torch.cat([rank.parent_indices for rank in rank_batches]),
+            torch.cat([rank.valid_parent_mask for rank in rank_batches]),
+            [rank.node_indices.shape[0] for rank in rank_batches],
+            [rank.has_valid_parents for rank in rank_batches],
+        )
+        # A cached_property's stored value is another whole set of objects to
+        # ship, and nothing on the hot path reads it.
+        state.pop("rank_groups", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        nodes, subtypes, parents, mask, lengths, has_valid = state.pop("_pickled_ranks")
+        self.__dict__.update(state)
+
+        rank_batches: list[PreparedRankBatch] = []
+        offset = 0
+        for length, valid in zip(lengths, has_valid):
+            start = offset
+            offset += length
+            end = offset
+            rank_batches.append(
+                PreparedRankBatch(
+                    node_indices=nodes[start:end],
+                    parent_indices=parents[start:end],
+                    valid_parent_mask=mask[start:end],
+                    subtypes=subtypes[start:end],
+                    has_valid_parents=valid,
+                )
+            )
+        self.rank_batches = rank_batches
+
     @functools.cached_property
     def rank_groups(self) -> list[list[RankGroup]]:
         """Semantic per-rank grouping, materialized on first access."""
