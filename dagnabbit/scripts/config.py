@@ -84,7 +84,7 @@ MODEL = SimulatorConfig(
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRAPH_BATCH_SIZE = 512
+GRAPH_BATCH_SIZE = 1024
 # Patches scored per step, out of MODEL.num_patches. The full table is 524288
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
