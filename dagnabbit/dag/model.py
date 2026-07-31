@@ -177,6 +177,15 @@ class NodeTokens(nn.Module):
     table is public because Phase 1 reads them directly: a soft distribution
     over choices times a table is the expectation of the embedding, which is
     what makes the straight-through path exact in the forward direction.
+
+    An unused trunk position is a node like any other: its type is
+    ``geometry.mask_type`` and its in-degree is 0, so its token is the learned
+    ``<MASK>`` type vector plus its position and the null-parent vectors. It is
+    deliberately *not* one flat constant across positions -- the sequence has to
+    keep identifying "which index is this", and a masked position is exactly a
+    node index that currently holds nothing. Keeping ``<MASK>`` inside the same
+    categorical type space is also what would let a Phase 1 generator emit it,
+    and so choose to spend fewer gates.
     """
 
     def __init__(self, geometry: Geometry, config: SimulatorConfig):

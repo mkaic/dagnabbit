@@ -14,6 +14,11 @@ by eye:
   third of duplicate-parent gates actually invert.
 * a **diamond** is a node nothing reads. The coverage pass is supposed to make
   these impossible, so any diamond outside the output block is a bug.
+``<MASK>`` trunk positions -- sequence slots the graph did not spend a gate on
+-- are collapsed into a single dashed summary box rather than drawn one by one.
+They have no edges and sit on no path, so an individual box would be placed at
+a rank it does not have, and at a low trunk draw ninety of them bury the
+circuit. Nothing reads them, so they are never counted as dead either.
 
 Needs the Graphviz system package for the ``dot`` binary (``brew install
 graphviz``); the Python wrapper alone is not enough.
@@ -34,6 +39,8 @@ GATE_PALETTE = ["#59a14f", "#f28e2b", "#b07aa1", "#4e79a7", "#edc948", "#9c755f"
 ROOT_COLOR = "#d3d3d3"
 ROOT_FONT_COLOR = "#333333"
 DEAD_COLOR = "#2ecc71"
+MASK_COLOR = "#f0f0f0"
+MASK_FONT_COLOR = "#999999"
 OUTPUT_COLOR = "#e74c3c"
 EDGE_COLOR = "#888888"
 BG_COLOR = "#ffffff"
@@ -106,8 +113,34 @@ def render_dag(
                 fontcolor=ROOT_FONT_COLOR,
             )
 
+    masked = [
+        geometry.num_root_nodes + i
+        for i in range(geometry.num_trunk_nodes)
+        if node_types[geometry.num_root_nodes + i] == geometry.mask_type
+    ]
+    if masked:
+        # One summary box, not one box per position. Masked positions have no
+        # edges, so drawing them individually lets the layout engine strew them
+        # through the picture at ranks they do not have -- they sit on no path
+        # at all -- and at a low trunk draw they swamp the circuit that is
+        # actually the point. They are also interchangeable, so the count and
+        # the span say everything an individual box would.
+        dot.node(
+            "masked_block",
+            label=f"{len(masked)} x <MASK>\\npositions {masked[0]}-{masked[-1]}",
+            shape="box",
+            style="filled,dashed",
+            fillcolor=MASK_COLOR,
+            fontcolor=MASK_FONT_COLOR,
+            fixedsize="false",
+            width="1.4",
+            height="0.5",
+        )
+
     for i in range(geometry.num_trunk_nodes):
         node = geometry.num_root_nodes + i
+        if node_types[node] == geometry.mask_type:
+            continue
         if node not in referenced:
             # The coverage pass forbids this; drawn loudly rather than hidden.
             dot.node(
@@ -161,13 +194,17 @@ def describe(graphs: GraphBatch, index: int = 0) -> str:
     )
     inverters = int((repeated & (types == INVERTING_GATE)).sum())
     constants = int((repeated & (types != INVERTING_GATE)).sum())
+    masked = int((types == geometry.mask_type).sum())
     referenced = set(parents[mask].tolist())
-    dead = geometry.output_start - len(referenced)
+    # Masked positions are producers only in the indexing sense; nothing may
+    # read them, so leaving them out is what keeps "dead" meaning a bug.
+    dead = geometry.output_start - masked - len(referenced)
     gates = types.tolist()
     histogram = "  ".join(
         f"{name} {gates.count(gate_type)}" for gate_type, name in enumerate(GATE_NAMES)
     )
     return (
         f"ranks 0..{int(graphs.ranks[index].max())}  {histogram}  "
-        f"inverters {inverters}  repeat-constants {constants}  dead {dead}"
+        f"masked {masked}  inverters {inverters}  repeat-constants {constants}  "
+        f"dead {dead}"
     )

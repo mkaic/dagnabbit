@@ -135,9 +135,12 @@ def random_circuit(seed: int, geometry: Geometry = RANDOM_GEOMETRY):
     node_types, in_degrees, parents, _ = generate_arrays(
         1,
         geometry.num_root_nodes,
+        geometry.num_trunk_nodes,  # minimum == maximum: every position a gate
         geometry.num_trunk_nodes,
         geometry.num_output_nodes,
         geometry.num_trunk_node_types,
+        0.0,  # uniform gate mixture, so these circuits stay reproducible
+        geometry.mask_type,
         np.asarray(geometry.trunk_node_in_degrees, dtype=np.int64),
         geometry.maximum_indegree,
         seed,
@@ -557,6 +560,50 @@ def test_random_circuits_score_near_half():
         evaluate_graphs(graphs, task.root_values, OPERATORS), task
     )
     assert 0.2 < overall.mean().item() < 0.8
+
+
+def test_masked_trunk_positions_cannot_affect_the_result():
+    """A ``<MASK>`` position is swept over but nothing reads it.
+
+    The evaluator has no notion of masking: it runs *every* trunk position,
+    including the ones holding no gate, and those compute whatever their
+    all-zero parent slots imply. That is only safe because no live node or
+    output references them, which the sampler guarantees. Scribbling arbitrary
+    types and wiring into the masked block and getting bit-identical outputs is
+    the direct test of that claim -- if it ever fails, masked positions are
+    leaking into the circuit.
+    """
+    from dagnabbit.dag.graphs import SamplingConfig, sample
+
+    geometry = Geometry(8, 32, 4, 2, (2, 2))
+    torch.manual_seed(0)
+    graphs = sample(16, geometry, sampling=SamplingConfig(minimum_trunk_nodes=8))
+    assert bool(graphs.trunk_is_masked.any()), "nothing was masked"
+
+    roots = exhaustive_root_values(geometry.num_root_nodes)
+    expected = evaluate_graphs(graphs, roots, OPERATORS)
+
+    masked = graphs.trunk_is_masked
+    types = graphs.trunk_types.clone()
+    positions = graphs.parent_indices.clone()
+    trunk = slice(geometry.num_root_nodes, geometry.output_start)
+    types[masked] = NOR
+    # Any strictly-earlier index is legal wiring; roots carry real values, so
+    # these gates now compute something rather than nothing.
+    scribble = torch.randint(0, geometry.num_root_nodes, positions[:, trunk].shape)
+    positions[:, trunk] = torch.where(
+        masked.unsqueeze(-1), scribble, positions[:, trunk]
+    )
+
+    perturbed = evaluate_choices(
+        types,
+        positions,
+        roots,
+        geometry.num_output_nodes,
+        geometry.trunk_node_in_degrees,
+        OPERATORS,
+    )
+    assert torch.equal(perturbed, expected)
 
 
 # --------------------------------------------------------------------------

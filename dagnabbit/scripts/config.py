@@ -2,19 +2,41 @@
 
 import torch
 
-from dagnabbit.dag.graphs import Geometry
+from dagnabbit.dag.graphs import Geometry, SamplingConfig
 from dagnabbit.dag.model import SimulatorConfig
 from dagnabbit.optimizers import AutoMuon
 
 # --- graph geometry ---
-# 16 roots + 128 NAND/XOR/XNOR gates + 8 outputs = a 152-token sequence, and
-# a 2^16-row truth table.
+# 16 roots + 128 NAND/XOR/XNOR trunk positions + 8 outputs = a 152-token
+# sequence, and a 2^16-row truth table. num_trunk_nodes is the number of trunk
+# *positions*; how many carry a gate is SAMPLING's business.
 GEOMETRY = Geometry(
     num_root_nodes=16,
     num_trunk_nodes=128,
     num_output_nodes=8,
     num_trunk_node_types=3,
     trunk_node_in_degrees=(2, 2, 2),
+)
+
+# --- what the training distribution looks like inside that geometry ---
+# Both knobs exist for the same reason: the hand-built adders sit far out in the
+# tail of a fixed-size, uniform-mixture sampler, and a simulator that has never
+# seen anything like them has no reason to be accurate there.
+#
+# minimum_trunk_nodes makes GEOMETRY.num_trunk_nodes a maximum; each graph draws
+# its live gate count uniformly in [32, 128] and masks the rest. 32 is under both
+# reference cores (35 gates with XOR, 67 all-NAND), so a circuit of that size is
+# something the model sees constantly rather than only as 128 gates of which
+# half are buffer padding. It also halves the expected live gate count, which
+# shifts output depth down -- worth watching in the rank ladder.
+#
+# trunk_type_concentration is a symmetric Dirichlet over the gate mixture, drawn
+# per graph. At 1.0 the mixture is uniform over the simplex: even splits,
+# 90/5/5 splits, and everything between, with the batch-wide marginal unchanged.
+# The all-NAND adder is a 100/0/0 circuit and was previously ~unreachable.
+SAMPLING = SamplingConfig(
+    minimum_trunk_nodes=32,
+    trunk_type_concentration=1.0,
 )
 
 # --- model ---
@@ -34,7 +56,7 @@ MODEL = SimulatorConfig(
     embedding_dim=384,
     attention_head_dim=64,
     mlp_expansion_factor=4.0,
-    num_simulator_layers=24,
+    num_simulator_layers=16,
     num_register_tokens=16,
     num_decoder_layers=2,
     num_patches=256,

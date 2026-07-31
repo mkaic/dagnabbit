@@ -51,7 +51,7 @@ def main() -> None:
         trunk_node_in_degrees=(2,) * num_types,
     )
     if args.circuit == "random":
-        graphs = sample(1, geometry)
+        graphs = sample(1, geometry, sampling=cfg.SAMPLING)
     elif args.circuit == "nand":
         graphs = nand_ripple_carry_adder(geometry)
     else:

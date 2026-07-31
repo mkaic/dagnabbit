@@ -102,7 +102,7 @@ def main() -> None:
         return list(outputs_to_image(evaluate_graphs(graphs, roots), height, width))
 
     # Every image shares one coordinate system: the exhaustive input enumeration.
-    images = planes(sample(args.num_random, geometry))
+    images = planes(sample(args.num_random, geometry, sampling=cfg.SAMPLING))
     labels = [f"random {index}" for index in range(len(images))]
     for name, build in (
         ("NAND adder", nand_ripple_carry_adder),

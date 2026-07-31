@@ -59,7 +59,7 @@ from dagnabbit.tasks.logic_gates.evaluate import (
 
 def make_batch(batch_size: int, root_values: torch.Tensor, device: torch.device):
     """Fresh graphs plus their exact packed truth tables."""
-    graphs = sample_graphs(batch_size, cfg.GEOMETRY, device)
+    graphs = sample_graphs(batch_size, cfg.GEOMETRY, device, sampling=cfg.SAMPLING)
     return graphs, evaluate_graphs(graphs, root_values)
 
 
@@ -87,6 +87,10 @@ class EvalResult:
     bit_accuracy: float
     mcc: float
     constant_target_fraction: float
+    # Mean gates per graph, out of GEOMETRY.num_trunk_nodes positions. Fixed
+    # unless SAMPLING.minimum_trunk_nodes is set; logged so a change to the
+    # sampling prior is visible in the same place as its effect on the ladder.
+    mean_live_trunk_nodes: float
     accuracy_by_rank: dict[int, float]
     mcc_by_rank: dict[int, float]
     outputs_by_rank: dict[int, int]
@@ -128,6 +132,7 @@ def evaluate(
         if defined_count
         else 0.0,
         constant_target_fraction=1.0 - defined_count / defined.numel(),
+        mean_live_trunk_nodes=float(graphs.num_live_trunk_nodes.double().mean()),
         accuracy_by_rank=accuracy_by_rank,
         mcc_by_rank=mcc_by_rank,
         outputs_by_rank=outputs_by_rank,
@@ -299,6 +304,9 @@ def main() -> None:
             writer.add_scalar(
                 "eval/constant_target_fraction", result.constant_target_fraction, step
             )
+            writer.add_scalar(
+                "eval/live_trunk_nodes", result.mean_live_trunk_nodes, step
+            )
             for rank, value in result.accuracy_by_rank.items():
                 writer.add_scalar(f"eval/accuracy_by_rank/{rank:02d}", value, step)
                 writer.add_scalar(
@@ -327,7 +335,8 @@ def main() -> None:
                     for name, (acc, mcc) in probes.items()
                 )
                 + "  "
-                f"const {result.constant_target_fraction:.1%}",
+                f"const {result.constant_target_fraction:.1%}  "
+                f"gates {result.mean_live_trunk_nodes:.1f}",
                 f"  cells: rank, accuracy, mcc, outputs -- past "
                 f"r{cfg.MODEL.num_simulator_layers} exceeds the simulator's depth",
                 *format_rank_ladder(result),
