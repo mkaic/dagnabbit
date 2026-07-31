@@ -9,18 +9,13 @@ description = "A NumPy/PyTorch port of dagnabbit-nim"
 requires-python = ">=3.12.0,<3.13.0"
 dependencies = [
     "torch>=2.12.0",
-    "torchvision>=0.27",
-    "tqdm",
     "numpy>=2.1",
-    # Compiles the random-graph generator, which is the training loop's inner
-    # loop; see dagnabbit/dag/generate.py.
+    # Compiles the random-graph generator, which feeds the training loop; see
+    # dagnabbit/dag/generate.py.
     "numba>=0.61",
-    "snakeviz==2.2",
-    "matplotlib",
-    "ruff",
-    "graphviz==0.21",
-    "scikit-learn>=1.8.0",
     "tensorboard>=2.18.0",
+    "pytest>=8.0",
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]

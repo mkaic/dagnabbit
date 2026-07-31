@@ -1,28 +1,28 @@
-"""Bitpacked evaluation of :class:`FixedInDegreeDAGDescription` circuits.
+"""Bitpacked evaluation of canonical circuits.
 
-A circuit is scored against a truth table by pushing every row of that table
-through the DAG at once: each node's value is a packed bit vector with one bit
-per truth-table row, so one ``uint8`` word carries 8 rows and the full 2^16-row
-8-bit adder table fits in 8192 bytes per node.
+A circuit is run by pushing every row of its truth table through the DAG at
+once: each node's value is a packed bit vector with one bit per row, so one
+``uint8`` word carries 8 rows and a full 2^16-row table fits in 8192 bytes per
+node.
 
-Evaluation is batched two ways at once, mirroring
-:meth:`DagnabbitAutoEncoder.evaluate_graph_batch`:
-
-* **across nodes**, by topological rank -- every node at the same rank is
-  evaluated in one vectorized step, since none of them can depend on another;
-* **across graphs**, by concatenating each graph's rank metadata into flat
-  index tensors, so a batch of B circuits costs one pass over ranks rather
-  than B passes.
+Row ordering
+------------
+Row ``r`` *is* the integer ``r``, with root node 0 holding the most significant
+input bit. So for the 16-input geometry, row ``r`` has ``a = r >> 8`` on roots
+0-7 and ``b = r & 255`` on roots 8-15, and folding the rows into a 256x256 grid
+gives ``a`` down one axis and ``b`` along the other. One enumeration is used
+everywhere -- random graphs during training, the reference adder at probe time --
+because the model's truth-table patch queries are learned per row block and
+would otherwise mean different things in the two settings.
 
 Padding bits
 ------------
-When ``num_rows`` is not a multiple of 8, the final word holds padding bits
-past the end of the truth table. These are *deliberately left to rot*: every
-operation here (AND, OR, NOT) is bitwise-elementwise, so output bit i depends
-only on input bit i of its parents. Padding bits therefore evolve entirely
-independently of real rows and can never contaminate them, no matter how deep
-the circuit. Masking once at scoring time is sufficient, and is what
-:func:`bit_accuracy` does -- there is no need to re-mask after all 128 gates.
+When ``num_rows`` is not a multiple of 8, the final word holds padding bits past
+the end of the table. These are *deliberately left to rot*: every operation here
+is bitwise-elementwise, so output bit i depends only on input bit i of its
+parents. Padding bits therefore evolve independently of real rows and can never
+contaminate them, no matter how deep the circuit. Masking once at scoring time
+is sufficient, and is what :func:`bit_accuracy` does.
 """
 
 from collections.abc import Sequence
@@ -32,22 +32,16 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from dagnabbit.dag.description import (
-    FixedInDegreeDAGDescription,
-    collate_rank_partitions,
-)
-from dagnabbit.tasks.logic_gates.bitarrays import get_8bit_adder_truth_table
 from dagnabbit.tasks.logic_gates.operators import GATE_OPERATORS, GateOperator
 
 BITS_PER_WORD = 8
 
 
 def make_valid_bit_mask(num_rows: int, num_words: int) -> Tensor:
-    """A [num_words] uint8 mask whose set bits are exactly the real rows.
+    """A ``[num_words]`` uint8 mask whose set bits are exactly the real rows.
 
-    Uses ``np.packbits``' default big-endian bit order, matching how the truth
-    tables in :mod:`.bitarrays` are packed, so bit i of word w corresponds to
-    row ``w * 8 + i`` in both.
+    Uses ``np.packbits``' default big-endian bit order, matching how everything
+    here is packed, so bit i of word w corresponds to row ``w * 8 + i``.
     """
     if num_rows > num_words * BITS_PER_WORD:
         raise ValueError(
@@ -59,14 +53,45 @@ def make_valid_bit_mask(num_rows: int, num_words: int) -> Tensor:
     return torch.from_numpy(np.packbits(bits))
 
 
+def unpack_bits(words: Tensor) -> Tensor:
+    """``[..., W]`` uint8 -> ``[..., W * 8]`` uint8 of 0/1, big-endian.
+
+    Matches ``np.packbits``' default bit order. Done with shifts rather than a
+    numpy round trip so this stays on whatever device the batch already lives on.
+    """
+    if words.dtype != torch.uint8:
+        raise TypeError(f"expected uint8, got {words.dtype}")
+    shifts = torch.arange(
+        BITS_PER_WORD - 1, -1, -1, dtype=torch.uint8, device=words.device
+    )
+    return ((words.unsqueeze(-1) >> shifts) & 1).flatten(start_dim=-2)
+
+
+def exhaustive_root_values(num_root_nodes: int) -> Tensor:
+    """Every input combination, packed: ``[R, num_words]`` uint8.
+
+    Root ``i`` carries bit ``R - 1 - i`` of the row index, so row ``r`` presents
+    the integer ``r`` with root 0 as the most significant bit.
+    """
+    num_rows = 1 << num_root_nodes
+    rows = np.arange(num_rows, dtype=np.uint32)
+    shifts = np.arange(num_root_nodes - 1, -1, -1, dtype=np.uint32)
+    bits = ((rows[None, :] >> shifts[:, None]) & 1).astype(np.uint8)
+    return torch.from_numpy(np.packbits(bits, axis=-1))
+
+
 @dataclass(frozen=True)
 class BitpackedTask:
-    """A truth table in packed form, resident on one device.
+    """A *target* behaviour in packed form, resident on one device.
 
-    ``root_values[i]`` is the input column driving root node ``i``, and
+    ``root_values[i]`` is the input column driving root node ``i`` and
     ``target_values[j]`` is the desired output of output node ``j``. Both index
-    by node slot, matching the description's fixed layout: roots occupy node
-    indices ``[0, R)`` and outputs the final ``num_output_nodes`` indices.
+    by node slot, matching the canonical layout: roots occupy positions
+    ``[0, R)`` and outputs the final ``num_output_nodes`` positions.
+
+    Only Phase-1 inverse design and the reference probes need a task. Simulator
+    training runs circuits against :func:`exhaustive_root_values` and takes
+    whatever they compute as the label, so it never builds one.
     """
 
     root_values: Tensor  # [num_root_nodes, num_words] uint8
@@ -118,248 +143,66 @@ def adder_task(device: torch.device | str = "cpu") -> BitpackedTask:
 
     Roots 0-7 carry the bits of ``a`` (most significant first), roots 8-15 the
     bits of ``b``, and output j the corresponding bit of ``(a + b) mod 256``.
+    Derived from the row index rather than a meshgrid so it lands on the same
+    enumeration as :func:`exhaustive_root_values`.
     """
-    packed_inputs, packed_sums = get_8bit_adder_truth_table()
-    num_words = packed_inputs.shape[1]
-    num_rows = 256 * 256  # every (a, b) pair, exhaustively
-    if num_rows != num_words * BITS_PER_WORD:
-        raise ValueError(
-            f"adder table packs {num_words} words for {num_rows} rows; "
-            "the truth table generator changed shape"
-        )
+    num_root_nodes = 16
+    root_values = exhaustive_root_values(num_root_nodes)
+    num_rows = 1 << num_root_nodes
+
+    rows = np.arange(num_rows, dtype=np.uint32)
+    # uint8 addition wraps, which is the mod 256 the task wants.
+    sums = (rows >> 8).astype(np.uint8) + (rows & 0xFF).astype(np.uint8)
+    shifts = np.arange(7, -1, -1, dtype=np.uint8)
+    target_bits = ((sums[None, :] >> shifts[:, None]) & 1).astype(np.uint8)
+
     return BitpackedTask(
-        root_values=torch.from_numpy(packed_inputs.copy()),
-        target_values=torch.from_numpy(packed_sums.copy()),
+        root_values=root_values,
+        target_values=torch.from_numpy(np.packbits(target_bits, axis=-1)),
         num_rows=num_rows,
-        valid_bit_mask=make_valid_bit_mask(num_rows, num_words),
+        valid_bit_mask=make_valid_bit_mask(num_rows, root_values.shape[1]),
     ).to(device)
-
-
-@dataclass
-class _BatchedBitRank:
-    """One topological rank, flattened across every graph in the batch."""
-
-    batch_indices: Tensor  # [rows] which graph each node belongs to
-    node_indices: Tensor  # [rows] node index within that graph
-    parent_indices: Tensor  # [rows, maximum_indegree]
-    valid_parent_mask: Tensor  # [rows, maximum_indegree]
-    subtypes: Tensor  # [rows] raw node_type index
-
-
-def _build_batched_ranks(
-    graphs: Sequence[FixedInDegreeDAGDescription],
-    device: torch.device,
-) -> list[_BatchedBitRank]:
-    """Regroup every graph's precomputed rank partition by rank, on ``device``.
-
-    Reuses ``graph.rank_partition`` (built once when the description is created)
-    rather than recomputing topology here, and leaves the batch-side regrouping
-    and the host-to-device transfer to :func:`collate_rank_partitions`.
-    """
-    collated = collate_rank_partitions(graphs, device)
-    maximum_indegree = graphs[0].maximum_indegree
-
-    ranks: list[_BatchedBitRank] = []
-    for rank in range(collated.num_ranks):
-        if not collated.counts[rank]:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            ranks.append(
-                _BatchedBitRank(
-                    batch_indices=empty,
-                    node_indices=empty,
-                    parent_indices=torch.empty(
-                        0, maximum_indegree, dtype=torch.long, device=device
-                    ),
-                    valid_parent_mask=torch.empty(
-                        0, maximum_indegree, dtype=torch.bool, device=device
-                    ),
-                    subtypes=empty,
-                )
-            )
-            continue
-
-        rows = collated.rank_slice(rank)
-        ranks.append(
-            _BatchedBitRank(
-                batch_indices=collated.batch_indices[rows],
-                node_indices=collated.node_indices[rows],
-                parent_indices=collated.parent_indices[rows],
-                valid_parent_mask=collated.valid_parent_mask[rows],
-                subtypes=collated.subtypes[rows],
-            )
-        )
-
-    return ranks
-
-
-def _validate_batch(
-    graphs: Sequence[FixedInDegreeDAGDescription],
-    task: BitpackedTask,
-    gate_operators: Sequence[GateOperator],
-) -> FixedInDegreeDAGDescription:
-    """Check that the batch is homogeneous and matches the task, return graph 0."""
-    if not graphs:
-        raise ValueError("cannot evaluate an empty batch of graphs")
-    reference = graphs[0]
-    layout = (
-        reference.num_root_nodes,
-        reference.num_trunk_nodes,
-        reference.num_output_nodes,
-        reference.num_trunk_node_types,
-        reference.maximum_indegree,
-    )
-    for index, graph in enumerate(graphs[1:], start=1):
-        other = (
-            graph.num_root_nodes,
-            graph.num_trunk_nodes,
-            graph.num_output_nodes,
-            graph.num_trunk_node_types,
-            graph.maximum_indegree,
-        )
-        if other != layout:
-            raise ValueError(
-                f"graph {index} has layout {other}, but graph 0 has {layout}; "
-                "batched evaluation requires a homogeneous batch"
-            )
-    if reference.num_root_nodes != task.num_root_nodes:
-        raise ValueError(
-            f"graphs have {reference.num_root_nodes} roots but the task "
-            f"supplies {task.num_root_nodes} input columns"
-        )
-    if reference.num_output_nodes != task.num_output_nodes:
-        raise ValueError(
-            f"graphs have {reference.num_output_nodes} outputs but the task "
-            f"supplies {task.num_output_nodes} target columns"
-        )
-    if len(gate_operators) < reference.num_trunk_node_types:
-        raise ValueError(
-            f"{len(gate_operators)} gate operators for "
-            f"{reference.num_trunk_node_types} trunk node types"
-        )
-    return reference
-
-
-@torch.no_grad()
-def evaluate_graphs(
-    graphs: Sequence[FixedInDegreeDAGDescription],
-    task: BitpackedTask,
-    gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
-) -> Tensor:
-    """Evaluate a batch of circuits against a task's inputs.
-
-    Returns the packed output values, ``[B, num_output_nodes, num_words]``
-    uint8, in output-slot order. Bits past ``task.num_rows`` are unspecified;
-    see the module docstring.
-    """
-    reference = _validate_batch(graphs, task, gate_operators)
-    device = task.root_values.device
-    num_trunk_node_types = reference.num_trunk_node_types
-    output_type = reference.output_node_types_start
-    output_start = reference.num_root_nodes + reference.num_trunk_nodes
-
-    buffer = torch.zeros(
-        (len(graphs), reference.num_nodes, task.num_words),
-        dtype=torch.uint8,
-        device=device,
-    )
-    buffer[:, : reference.num_root_nodes] = task.root_values
-
-    ranks = _build_batched_ranks(graphs, device)
-    # Rank 0 is exactly the roots, which are already seeded; compute_node_ranks
-    # gives every non-root node a rank of 1 + max(parent ranks) >= 1.
-    for rank in ranks[1:]:
-        if rank.node_indices.numel() == 0:
-            continue
-
-        # [rows, maximum_indegree, num_words]: every parent of every node at
-        # this rank, gathered in one shot.
-        parent_values = buffer[rank.batch_indices[:, None], rank.parent_indices]
-
-        # Nodes at one rank can differ in type, and each type has its own gate
-        # and in-degree, so dispatch per type over the rows of that type. With
-        # two trunk types this is a handful of large vectorized ops per rank.
-        for subtype in rank.subtypes.unique().tolist():
-            rows = rank.subtypes == subtype
-            selected = parent_values[rows]
-
-            if subtype < num_trunk_node_types:
-                in_degree = reference.trunk_node_in_degrees[subtype]
-                operator = gate_operators[subtype]
-            elif subtype == output_type:
-                # Output nodes are pass-throughs with in-degree 1.
-                in_degree = 1
-                operator = None
-            else:
-                raise ValueError(
-                    f"node type {subtype} appears at rank > 0; roots are "
-                    "rank 0 and cannot be recomputed"
-                )
-
-            # The padded slots beyond a type's in-degree hold index 0, which is
-            # a real (root) node -- reading them would silently produce wrong
-            # values rather than an error, so confirm the slots we do read are
-            # the ones the description marked valid.
-            if not bool(rank.valid_parent_mask[rows][:, :in_degree].all()):
-                raise ValueError(
-                    f"node type {subtype} claims in-degree {in_degree}, but the "
-                    "graph's parent slot mask disagrees"
-                )
-
-            values = selected[:, :in_degree]
-            value = values[:, 0] if operator is None else operator(values)
-            buffer[rank.batch_indices[rows], rank.node_indices[rows]] = value
-
-    return buffer[:, output_start:]
 
 
 @torch.no_grad()
 def evaluate_choices(
     trunk_types: Tensor,
-    parent_choices: Tensor,
-    task: BitpackedTask,
+    parent_positions: Tensor,
+    root_values: Tensor,
+    num_output_nodes: int,
     trunk_node_in_degrees: Sequence[int],
     gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
 ) -> Tensor:
-    """Evaluate circuits straight from decoder choice tensors, on-device.
+    """Run a batch of circuits, on-device, straight from canonical tensors.
 
-    ``trunk_types`` is ``[B, T]`` trunk class ids and ``parent_choices`` is
-    ``[B, N, S]`` parent canonical positions, exactly what
-    :meth:`DagnabbitAutoEncoder.generate_choices` returns: node index ==
-    canonical position, roots first, outputs last, and every choice already
-    restricted to strictly-earlier non-output positions. Returns the packed
-    outputs ``[B, num_output_nodes, num_words]`` uint8, matching
-    :func:`evaluate_graphs` bit for bit.
+    ``trunk_types`` is ``[B, T]`` trunk class ids and ``parent_positions`` is
+    ``[B, N, S]`` canonical parent positions -- exactly what
+    :class:`~dagnabbit.dag.canonical.CanonicalGraphs` holds, and exactly what a
+    generator's straight-through argmax produces. Returns packed outputs
+    ``[B, num_output_nodes, num_words]`` uint8, in output-slot order.
 
-    This is the hot path for policy-gradient training, where thousands of
-    sampled graphs are scored per step. Routing them through
-    :class:`~dagnabbit.dag.description.FixedInDegreeDAGDescription` costs
-    ~0.5 ms of pure Python per graph (device sync, ``.tolist()``, object
-    build, then re-flattening the metadata back into tensors) -- seconds per
-    step with the GPU idle throughout. Here the choices never leave the
-    device: one sequential sweep over trunk positions, each a batched gather
-    + gate over all B circuits. Positions cannot be batched by rank without
-    the per-graph topology this path exists to avoid, but a position step is
-    ~5 kernels over ``[B, num_words]``, so the sweep is launch-cheap and
-    bandwidth-bound.
+    One sequential sweep over trunk positions, each a batched gather plus gate
+    over all B circuits. Positions cannot be batched by rank without per-graph
+    topology, but a position step is a handful of kernels over ``[B, num_words]``,
+    so the sweep is launch-cheap and bandwidth-bound. Routing through per-graph
+    Python objects instead cost ~0.5 ms per graph with the device idle throughout.
     """
-    if trunk_types.ndim != 2 or parent_choices.ndim != 3:
+    if trunk_types.ndim != 2 or parent_positions.ndim != 3:
         raise ValueError(
-            f"expected [B, T] types and [B, N, S] choices; got "
-            f"{tuple(trunk_types.shape)} and {tuple(parent_choices.shape)}"
+            f"expected [B, T] types and [B, N, S] positions; got "
+            f"{tuple(trunk_types.shape)} and {tuple(parent_positions.shape)}"
         )
-    device = task.root_values.device
+    device = root_values.device
     trunk_types = trunk_types.to(device)
-    parent_choices = parent_choices.to(device)
+    parent_positions = parent_positions.to(device)
 
     batch_size, num_trunk_nodes = trunk_types.shape
-    num_root_nodes = task.num_root_nodes
-    num_output_nodes = task.num_output_nodes
+    num_root_nodes, num_words = root_values.shape
     output_start = num_root_nodes + num_trunk_nodes
     num_nodes = output_start + num_output_nodes
-    num_words = task.num_words
-    if parent_choices.shape[:2] != (batch_size, num_nodes):
+    if parent_positions.shape[:2] != (batch_size, num_nodes):
         raise ValueError(
-            f"parent_choices is {tuple(parent_choices.shape)}, expected "
+            f"parent_positions is {tuple(parent_positions.shape)}, expected "
             f"[{batch_size}, {num_nodes}, S]"
         )
     if len(gate_operators) < len(trunk_node_in_degrees):
@@ -368,17 +211,17 @@ def evaluate_choices(
             f"{len(trunk_node_in_degrees)} trunk node types"
         )
     max_in_degree = max(trunk_node_in_degrees)
-    if parent_choices.shape[2] < max_in_degree:
+    if parent_positions.shape[2] < max_in_degree:
         raise ValueError(
-            f"parent_choices has {parent_choices.shape[2]} slots, but the "
+            f"parent_positions has {parent_positions.shape[2]} slots, but the "
             f"widest trunk type needs {max_in_degree}"
         )
 
-    # The legality the description constructor would have asserted, checked
-    # once and vectorized: every read slot points strictly earlier and never
-    # at an output. Garbage indices would otherwise silently alias real nodes.
+    # Legality, checked once and vectorized: every slot read below points
+    # strictly earlier and never at an output. A garbage index would otherwise
+    # silently alias a real node rather than raising.
     positions = torch.arange(num_nodes, device=device)
-    read_slots = parent_choices[:, num_root_nodes:, :max_in_degree]
+    read_slots = parent_positions[:, num_root_nodes:, :max_in_degree]
     if not bool(
         (
             (read_slots < positions[num_root_nodes:, None])
@@ -386,32 +229,29 @@ def evaluate_choices(
         ).all()
     ):
         raise ValueError(
-            "parent_choices contains an index at or after its consumer "
+            "parent_positions contains an index at or after its consumer "
             "(or pointing into the output block)"
         )
 
     # MPS rejects gather sources above 2^31 elements; chunk the batch there.
-    # CUDA and CPU take the whole batch in one sweep.
     chunk = batch_size
     if device.type == "mps":
-        limit = 2**31 - 1
-        chunk = max(1, limit // (output_start * num_words))
+        chunk = max(1, (2**31 - 1) // (output_start * num_words))
 
     outputs = []
     for start in range(0, batch_size, chunk):
         chunk_types = trunk_types[start : start + chunk]
-        chunk_choices = parent_choices[start : start + chunk]
+        chunk_positions = parent_positions[start : start + chunk]
         rows = chunk_types.shape[0]
 
-        # Producer values only: outputs are leaves, never gathered from.
+        # Producer values only: outputs are leaves and are never gathered from.
         buffer = torch.empty(
             rows, output_start, num_words, dtype=torch.uint8, device=device
         )
-        buffer[:, :num_root_nodes] = task.root_values
+        buffer[:, :num_root_nodes] = root_values
 
         for position in range(num_root_nodes, output_start):
-            trunk_offset = position - num_root_nodes
-            slot_indices = chunk_choices[:, position, :max_in_degree]
+            slot_indices = chunk_positions[:, position, :max_in_degree]
             parents = buffer.gather(
                 1, slot_indices.unsqueeze(-1).expand(rows, max_in_degree, num_words)
             )
@@ -421,12 +261,12 @@ def evaluate_choices(
                 if value is None:
                     value = candidate
                 else:
-                    is_type = chunk_types[:, trunk_offset] == node_type
+                    is_type = chunk_types[:, position - num_root_nodes] == node_type
                     value = torch.where(is_type[:, None], candidate, value)
             buffer[:, position] = value
 
         # Output nodes are in-degree-1 pass-throughs of their slot-0 parent.
-        output_indices = chunk_choices[:, output_start:, 0]
+        output_indices = chunk_positions[:, output_start:, 0]
         outputs.append(
             buffer.gather(
                 1,
@@ -437,13 +277,24 @@ def evaluate_choices(
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
+def evaluate_graphs(graphs, root_values: Tensor) -> Tensor:
+    """:func:`evaluate_choices` for a :class:`CanonicalGraphs` batch."""
+    geometry = graphs.geometry
+    return evaluate_choices(
+        graphs.trunk_types,
+        graphs.parent_positions,
+        root_values,
+        geometry.num_output_nodes,
+        geometry.trunk_node_in_degrees,
+    )
+
+
 def popcount(words: Tensor) -> Tensor:
     """Per-byte set-bit count of a uint8 tensor, returned as uint8 (0-8).
 
     SWAR rather than a lookup table: a table index would widen the tensor to
     int64 first, which for a full-truth-table batch is gigabytes of temporary.
-    Every intermediate here stays uint8. Exhaustively tested over all 256 byte
-    values in the test suite.
+    Every intermediate here stays uint8.
     """
     if words.dtype != torch.uint8:
         raise TypeError(f"popcount expects uint8, got {words.dtype}")
@@ -452,24 +303,18 @@ def popcount(words: Tensor) -> Tensor:
     return (counts + (counts >> 4)) & 0x0F
 
 
-def bit_accuracy(
-    predicted: Tensor,
-    task: BitpackedTask,
-) -> tuple[Tensor, Tensor]:
+def bit_accuracy(predicted: Tensor, task: BitpackedTask) -> tuple[Tensor, Tensor]:
     """Score packed outputs against a task's targets.
 
     Returns ``(overall, per_output)``: overall fitness per graph as ``[B]`` in
     [0, 1], and per-output-bit accuracy as ``[B, num_output_nodes]``. Only the
-    first ``task.num_rows`` bits are counted, so the padding described in the
-    module docstring cannot influence the score.
+    first ``task.num_rows`` bits are counted, so padding cannot influence it.
 
     Mismatches are counted exactly, as int64, on whatever device the outputs
     live on. The ratio is then taken in float64 on the CPU: the count tensor is
     only ``[B, num_output_nodes]``, so the transfer is free next to the
-    evaluation, and it keeps the score exact for truth tables larger than
-    float32's 2^24 integer range while sidestepping MPS, which has no float64
-    at all. Move the result back to the device if you want to select on it
-    there.
+    evaluation, and it keeps the score exact for tables larger than float32's
+    2^24 integer range while sidestepping MPS, which has no float64 at all.
     """
     if predicted.dtype != torch.uint8:
         raise TypeError(f"predicted must be uint8, got {predicted.dtype}")
@@ -487,12 +332,3 @@ def bit_accuracy(
         task.num_rows * task.num_output_nodes
     )
     return overall, per_output
-
-
-def evaluate_and_score(
-    graphs: Sequence[FixedInDegreeDAGDescription],
-    task: BitpackedTask,
-    gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
-) -> tuple[Tensor, Tensor]:
-    """Evaluate then score in one call. Returns ``(overall, per_output)``."""
-    return bit_accuracy(evaluate_graphs(graphs, task, gate_operators), task)

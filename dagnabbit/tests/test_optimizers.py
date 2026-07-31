@@ -11,36 +11,35 @@ Run directly::
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from dagnabbit.dag.autoencoder import DagnabbitAutoEncoder
-from dagnabbit.dag.description import make_random_graph_description
+from dagnabbit.dag.canonical import Geometry, sample
+from dagnabbit.dag.model import (
+    GraphSimulator,
+    SimulatorConfig,
+    patch_targets,
+    sample_patch_indices,
+)
 from dagnabbit.optimizers import AutoMuon, build_optimizer
+from dagnabbit.tasks.logic_gates.evaluate import evaluate_graphs, exhaustive_root_values
 
-EMBEDDING_DIM = 64
-NUM_ROOTS = 8
-NUM_TRUNKS = 24
-NUM_OUTPUTS = 4
-NUM_TRUNK_TYPES = 2
-IN_DEGREES = 2
+GEOMETRY = Geometry(8, 24, 4, 2, (2, 2))
+MODEL_CONFIG = SimulatorConfig(
+    embedding_dim=64,
+    attention_head_dim=32,
+    mlp_expansion_factor=2.0,
+    num_simulator_layers=2,
+    num_decoder_layers=2,
+    num_patches=8,
+)
 
 
-def build_small_model() -> DagnabbitAutoEncoder:
-    return DagnabbitAutoEncoder(
-        node_embedding_dim=EMBEDDING_DIM,
-        trunk_node_type_in_degrees=IN_DEGREES,
-        num_trunk_node_types=NUM_TRUNK_TYPES,
-        num_root_nodes=NUM_ROOTS,
-        num_trunk_nodes=NUM_TRUNKS,
-        num_output_nodes=NUM_OUTPUTS,
-        mlp_expansion_factor=2.0,
-        encoder_num_layers=1,
-        compressor_num_layers=2,
-        decoder_num_layers=2,
-    )
+def build_small_model() -> GraphSimulator:
+    return GraphSimulator(GEOMETRY, MODEL_CONFIG)
 
 
 def build_optimizer_for(model: nn.Module, **kwargs) -> AutoMuon:
-    kwargs.setdefault("adam_module_names", ("node_type_predictor",))
+    kwargs.setdefault("adam_module_names", ("decoder.head",))
     return AutoMuon(model, **kwargs)
 
 
@@ -72,28 +71,26 @@ def test_muon_takes_transformer_matrices_and_nothing_else():
     muon_names, adam_names = routed_names(optimizer)
 
     # Attention projections and MLP weights inside every transformer stack.
-    assert "compressor.blocks.0.attn.in_proj_weight" in muon_names
-    assert "compressor.blocks.0.attn.out_proj.weight" in muon_names
-    assert "compressor.blocks.0.ff.0.weight" in muon_names
-    assert "decoder.blocks.1.attn.in_proj_weight" in muon_names
-    assert "node_encoder.sequence_transformer.blocks.0.ff.0.weight" in muon_names
-    # Square hidden-space pointer projections are ordinary weight matrices.
-    assert "pointer_key_proj.weight" in muon_names
-    assert "pointer_slot_query_projs.0.weight" in muon_names
+    assert "simulator.blocks.0.attention.qkv.weight" in muon_names
+    assert "simulator.blocks.0.attention.projection.weight" in muon_names
+    assert "simulator.blocks.0.mlp.0.weight" in muon_names
+    assert "decoder.blocks.1.attention.to_key_value.weight" in muon_names
+    # The node embedder's role projections are ordinary hidden-space matrices.
+    assert "node_tokens.self_projection.weight" in muon_names
+    assert "node_tokens.parent_projections.0.weight" in muon_names
 
     # Lookup tables, 2-D learned token banks, norms, biases and the named
     # output head all belong to AdamW. The token banks are the cases a plain
     # ``p.ndim == 2`` split would get wrong.
-    assert "root_node_embeddings.weight" in adam_names
-    assert "node_encoder.sequence_transformer.node_type_embeddings.weight" in adam_names
-    assert "node_encoder.sequence_transformer.position_embeddings" in adam_names
-    assert "node_encoder.sequence_transformer.register_tokens" in adam_names
-    assert "mask_token" in adam_names
-    assert "node_type_predictor.weight" in adam_names
-    assert "node_type_predictor.bias" in adam_names
-    assert "compressor.blocks.0.attn_norm.weight" in adam_names
-    assert "compressor.blocks.0.attn.in_proj_bias" in adam_names
-    assert "compressor.blocks.0.ff.0.bias" in adam_names
+    assert "node_tokens.type_embeddings.weight" in adam_names
+    assert "node_tokens.position_embeddings" in adam_names
+    assert "node_tokens.null_parent" in adam_names
+    assert "decoder.patch_queries" in adam_names
+    assert "decoder.head.weight" in adam_names
+    assert "decoder.head.bias" in adam_names
+    assert "simulator.blocks.0.norm_attention.weight" in adam_names
+    assert "simulator.output_norm.bias" in adam_names
+    assert "simulator.blocks.0.mlp.0.bias" in adam_names
 
 
 def test_every_muon_parameter_is_a_2d_weight():
@@ -107,17 +104,21 @@ def test_every_muon_parameter_is_a_2d_weight():
 
 def test_adam_module_names_match_paths_prefixes_and_patterns():
     model = build_small_model()
-    exact = routed_names(AutoMuon(model, adam_module_names=("pointer_key_proj.weight",)))
-    assert "pointer_key_proj.weight" in exact[1]
-    assert "pointer_slot_query_projs.0.weight" in exact[0]
+    exact = routed_names(
+        AutoMuon(model, adam_module_names=("node_tokens.self_projection.weight",))
+    )
+    assert "node_tokens.self_projection.weight" in exact[1]
+    assert "node_tokens.parent_projections.0.weight" in exact[0]
 
-    subtree = routed_names(AutoMuon(model, adam_module_names=("pointer_slot_query_projs",)))
-    assert "pointer_slot_query_projs.0.weight" in subtree[1]
-    assert "pointer_key_proj.weight" in subtree[0]
+    subtree = routed_names(
+        AutoMuon(model, adam_module_names=("node_tokens.parent_projections",))
+    )
+    assert "node_tokens.parent_projections.0.weight" in subtree[1]
+    assert "node_tokens.self_projection.weight" in subtree[0]
 
-    pattern = routed_names(AutoMuon(model, adam_module_names=("*.in_proj_weight",)))
-    assert "compressor.blocks.0.attn.in_proj_weight" in pattern[1]
-    assert "compressor.blocks.0.attn.out_proj.weight" in pattern[0]
+    pattern = routed_names(AutoMuon(model, adam_module_names=("*.qkv.weight",)))
+    assert "simulator.blocks.0.attention.qkv.weight" in pattern[1]
+    assert "simulator.blocks.0.attention.projection.weight" in pattern[0]
 
 
 def test_lr_scheduler_drives_both_child_optimizers():
@@ -141,31 +142,22 @@ def test_step_updates_both_rules_and_survives_a_state_dict_roundtrip():
     torch.manual_seed(0)
     model = build_small_model()
     optimizer = build_optimizer_for(model, muon_lr=0.01, adam_lr=1e-3)
-    graphs = [
-        make_random_graph_description(
-            num_root_nodes=NUM_ROOTS,
-            num_trunk_nodes=NUM_TRUNKS,
-            num_output_nodes=NUM_OUTPUTS,
-            num_trunk_node_types=NUM_TRUNK_TYPES,
-            trunk_node_in_degrees=IN_DEGREES,
-        )
-        for _ in range(2)
-    ]
+    graphs = sample(4, GEOMETRY)
+    root_values = exhaustive_root_values(GEOMETRY.num_root_nodes)
+    packed = evaluate_graphs(graphs, root_values)
+    patch_indices = sample_patch_indices(MODEL_CONFIG.num_patches, 4, "cpu")
+    targets = patch_targets(packed, patch_indices, model.decoder.rows_per_patch)
 
     def training_step() -> float:
-        losses = model.training_forward_batch(graphs)
-        loss = (
-            losses.node_classification_losses.mean()
-            + losses.parent_pointer_losses.sum()
-            / losses.parent_pointer_slot_mask.sum().clamp(min=1)
-        )
+        logits = model.forward_graphs(graphs, patch_indices)
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         return loss.item()
 
-    muon_probe = model.compressor.blocks[0].ff[0].weight
-    adam_probe = model.root_node_embeddings.weight
+    muon_probe = model.simulator.blocks[0].mlp[0].weight
+    adam_probe = model.node_tokens.type_embeddings.weight
     muon_before = muon_probe.detach().clone()
     adam_before = adam_probe.detach().clone()
 
@@ -174,7 +166,7 @@ def test_step_updates_both_rules_and_survives_a_state_dict_roundtrip():
     assert not torch.allclose(adam_probe, adam_before), "AdamW params did not move"
     assert torch.isfinite(muon_probe).all() and torch.isfinite(adam_probe).all()
 
-    for _ in range(4):
+    for _ in range(8):
         last_loss = training_step()
     assert last_loss < first_loss
 

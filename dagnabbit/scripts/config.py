@@ -1,83 +1,63 @@
+"""Phase 0 configuration: training the graph -> truth-table simulator."""
+
 import torch
 
+from dagnabbit.dag.canonical import Geometry
+from dagnabbit.dag.model import SimulatorConfig
 from dagnabbit.optimizers import AutoMuon
 
+# --- graph geometry ---
+# 16 roots + 128 NAND/NOR gates + 8 outputs = a 152-token sequence, and a
+# 2^16-row truth table.
+GEOMETRY = Geometry(
+    num_root_nodes=16,
+    num_trunk_nodes=128,
+    num_output_nodes=8,
+    num_trunk_node_types=2,
+    trunk_node_in_degrees=(2, 2),
+)
+
 # --- model ---
-NODE_EMBEDDING_DIM = 128
-TRUNK_NODE_TYPE_IN_DEGREES = 2
-NUM_TRUNK_NODE_TYPES = 2
-NUM_ROOT_NODES = 16
-NUM_OUTPUT_NODES = 8
-NUM_TRUNK_NODES = 128
-
-# Hidden-layer width as a multiplicative expansion factor of each transformer
-# feed-forward input dim.
-MLP_EXPANSION_FACTOR = 4.0
-# Layer counts for the dense sequence-space transformers that replace the old
-# recursive decode: the Compressor squeezes the canonical node sequence into
-# the output-position latent; the Decoder reconstructs the full sequence from
-# that latent plus mask tokens.
-# Set COMPRESSOR_NUM_LAYERS to None (or 0) to drop the Compressor entirely and
-# feed the encoder's own output-node embeddings straight into the Decoder as
-# the latent.
-COMPRESSOR_NUM_LAYERS = 6
-DECODER_NUM_LAYERS = 6
-# Layer count for the recursive structural encoder's shared per-node
-# transformer. The remaining block geometry (MLP depth, register tokens,
-# dropout) is fixed in dagnabbit/dag/autoencoder.py.
-ENCODER_NUM_LAYERS = 2
-
-# Width of a single attention head, shared by every transformer in the model
-# (encoder, compressor, decoder). Head *count* is derived per module as
-# NODE_EMBEDDING_DIM // ATTENTION_HEAD_DIM, so NODE_EMBEDDING_DIM must be a
-# multiple of this; construction raises otherwise.
-ATTENTION_HEAD_DIM = 32
-
-# Compile the repeated encoder/decoder tensor kernels during CUDA training.
-# This intentionally does not compile the whole graph-shaped training step,
-# whose Python DAG traversal changes every iteration.
-TORCH_COMPILE = True
-TORCH_COMPILE_MODE = "reduce-overhead"
-TORCH_COMPILE_DYNAMIC = True
-# The training step invokes compiled encoder/decoder kernels many times before
-# one backward pass. CUDA graph replay is fragile for that pattern, so keep
-# Inductor's CUDA graph fast path disabled unless explicitly testing it.
-TORCH_COMPILE_CUDAGRAPHS = False
-
-
-# --- mixed precision ---
-# Run the training forward pass under torch.autocast. The matmul-heavy ops
-# (attention, MLPs, the pointer einsum) then execute in AMP_DTYPE while master
-# weights, the optimizer, and the reductions autocast keeps in fp32
-# (cross-entropy, LayerNorm, softmax) stay full precision. Backward runs
-# outside the autocast region and produces fp32 grads, so nothing downstream --
-# clipping, Muon, checkpoints -- changes.
-#
-# bfloat16 only: it shares fp32's exponent range, so no loss scaling is needed.
-# float16 would require a GradScaler, which is deliberately not wired up.
-AMP_ENABLED = True
-AMP_DTYPE = torch.bfloat16
-
+# num_simulator_layers is the one knob the depth analysis actually pins down.
+# Under pure value propagation a layer buys one hop, and output nodes in this
+# sampling distribution sit at median depth 11 (p95 15, max 23) -- so 8 layers
+# would leave three quarters of outputs out of reach and 16 covers p95. If
+# accuracy stratified by output rank falls off a cliff at the layer count, that
+# bound is binding and this is the number to raise; if it degrades smoothly
+# past it, the model found something cheaper than message passing.
+MODEL = SimulatorConfig(
+    embedding_dim=128,
+    attention_head_dim=32,
+    mlp_expansion_factor=4.0,
+    num_simulator_layers=16,
+    num_decoder_layers=2,
+    num_patches=256,
+    dropout=0.0,
+)
 
 # --- training ---
-NUM_STEPS = 10_000_000
+NUM_STEPS = 1_000_000
 GRAPH_BATCH_SIZE = 256
+# Patches scored per step, out of MODEL.num_patches. The full table is 524288
+# bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
+# ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
+# it trades directly against GRAPH_BATCH_SIZE.
+PATCHES_PER_STEP = 32
 
+LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 1e-4
+GRADIENT_CLIP_MAX_NORM = 1.0
+LR_WARMUP_OPTIMIZER_STEPS = 200
 
-# AutoMuon runs torch.optim.Muon on the transformer blocks' attention/MLP
-# weight matrices and torch.optim.AdamW on everything Muon is not meant for
-# (biases, LayerNorm gains, embedding tables, learned position/register/mask
-# tokens). "match_rms_adamw" rescales Muon's orthogonal update to AdamW's RMS,
-# which is what lets both rules share one tuned LEARNING_RATE; the alternative
-# is adjust_lr_fn=None ("original"), where Muon wants its own much larger LR
-# (~0.02). LR warmup scales both groups.
+# AutoMuon runs torch.optim.Muon on the transformer blocks' attention/MLP weight
+# matrices and AdamW on everything Muon is not meant for (biases, LayerNorm
+# gains, embedding tables, learned position/query tokens). "match_rms_adamw"
+# rescales Muon's orthogonal update to AdamW's RMS, which is what lets both
+# rules share one tuned LEARNING_RATE.
 #
-# ``adam_module_names`` names the output heads: module type alone cannot tell a
-# classifier apart from a hidden layer, and the type predictor's output axis
-# indexes classes, not a hidden space. The pointer projections are ordinary
-# square hidden-space maps and stay on Muon.
+# ``adam_module_names`` names the output head: its output axis indexes truth
+# table bits, not a hidden space, and module type alone cannot tell that apart
+# from a hidden layer.
 OPTIMIZER_CLASS = AutoMuon
 OPTIMIZER_KWARGS = {
     "muon_lr": LEARNING_RATE,
@@ -85,53 +65,34 @@ OPTIMIZER_KWARGS = {
     "adjust_lr_fn": "match_rms_adamw",
     "momentum": 0.95,
     "adam_betas": (0.9, 0.999),
-    # No weight decay, matching the plain-Adam setup this replaced.
     "muon_weight_decay": 0.0,
     "adam_weight_decay": 0.0,
-    "adam_module_names": ("node_type_predictor",),
+    "adam_module_names": ("decoder.head",),
 }
-# Number of optimizer updates used to linearly ramp from 1/warmup to full LR.
-LR_WARMUP_OPTIMIZER_STEPS = 100
 
-# Max L2 norm of gradients across all parameters before each optimizer step.
-# Set to None to disable clipping.
-GRADIENT_CLIP_MAX_NORM = 4.0
+# --- mixed precision ---
+# bfloat16 only: it shares fp32's exponent range, so no loss scaling is needed
+# and no GradScaler is wired up.
+AMP_ENABLED = True
+AMP_DTYPE = torch.bfloat16
 
-LOG_EVERY = GRADIENT_ACCUMULATION_STEPS
-CHECK_BEST_EVERY = 1000
-# Steps between encode->decode probes of the known-good reference circuits
-# (dagnabbit/tasks/logic_gates/roundtrip_probe.py). Purely diagnostic: the
-# result is logged and never enters the loss, and the probe restores both the
-# model's train/eval mode and the RNG state so it cannot perturb training.
-# Costs one batch-of-one forward pass plus a truth-table evaluation. Set to
-# None to disable.
-ROUNDTRIP_PROBE_EVERY = 100
-# Save an immutable training snapshot after this many completed graphs. The
-# interval must land on both a graph-batch and optimizer-update boundary so a
-# checkpoint represents a complete training state. Set to None to disable.
-CHECKPOINT_EVERY_GRAPHS = None
-# DEVICE="cpu"
+# The model is a fixed-shape dense stack now -- no per-graph Python traversal --
+# so the whole training step is compilable.
+TORCH_COMPILE = True
+TORCH_COMPILE_MODE = "default"
+
+# --- logging ---
+LOG_EVERY = 10
+# Steps between the depth-stratified evaluation: held-out random graphs scored
+# with bit accuracy bucketed by each output node's longest-path rank. This is
+# the Phase 0 gate -- average accuracy can look fine while deep outputs sit at
+# chance, and that gap is what says whether the simulator is simulating.
+EVAL_EVERY = 500
+EVAL_BATCH_SIZE = 256
+# Patches per eval graph. Higher than training since there is no backward pass.
+EVAL_PATCHES = 64
+CHECKPOINT_EVERY = 5000
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
-# Stage-one pretraining runs: the autoencoder learning to reconstruct random
-# graphs. Checkpoints downstream stages load live here.
-TENSORBOARD_LOG_DIR = "runs"
-# Stage-two task-adaptation runs: anything trained *against* a frozen
-# stage-one checkpoint rather than producing one. Kept separate so a directory
-# listing of `runs/` stays a list of checkpoints worth loading, and so the two
-# stages' TensorBoard scalars -- which share no axes and no meaning -- never
-# land in the same board.
-ADAPTATION_LOG_DIR = "adaptations"
-
-# --- loss weights ---
-# Trunk-type classification cross-entropy over the reconstructed sequence.
-# Only trunk positions are scored: the canonical layout fixes the first
-# positions as the ordered roots and the last positions as the ordered
-# outputs, so their identities are known by construction. Logged as
-# loss/primary_decoded_classification for TensorBoard continuity.
-W_TYPE_CLASSIFICATION = 1.0
-
-# Parent-pointer cross-entropy, averaged over valid input slots: each slot's
-# query must pick its true parent's canonical position from the
-# strictly-earlier non-output positions. Logged as loss/parent_pointer.
-W_PARENT_POINTER = 1.0
+LOG_DIR = "runs"

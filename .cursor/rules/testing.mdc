@@ -1,0 +1,20 @@
+---
+description: run the test suite with pytest under uv run
+alwaysApply: true
+---
+
+# Running Tests
+
+pytest is installed and the suite is written for it (fixtures, `parametrize`,
+`pytest.raises`). Run it as a module so it picks up `pytest.ini`:
+
+```bash
+# the whole suite
+uv run python -m pytest dagnabbit -q
+
+# one file
+uv run python -m pytest dagnabbit/dag/tests/test_canonical.py -q
+
+# skip anything marked slow
+uv run python -m pytest dagnabbit -q -m "not slow"
+```

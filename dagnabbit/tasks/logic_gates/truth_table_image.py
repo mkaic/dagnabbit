@@ -13,9 +13,8 @@ pixels differ in exactly one input bit -- a Karnaugh map, and the obviously
 correct prior for a *boolean* function, whose natural metric is Hamming
 distance.
 
-It is nonetheless the wrong default here, and
-``dagnabbit.scripts.render_truth_table_images`` shows why: the targets in this
-package are **arithmetic**. Every output bit of ``a + b`` is a function of the
+It is nonetheless the wrong default here: the targets in this package are
+**arithmetic**. Every output bit of ``a + b`` is a function of the
 integer sum, so in plain binary ordering the target's bit planes are clean
 diagonal stripes -- constant along anti-diagonals -- while Gray ordering
 scrambles that into a Sierpinski-like fractal. Random graphs, meanwhile, come
@@ -33,7 +32,7 @@ everything else takes the grid size as an argument.
 import torch
 from torch import Tensor
 
-BITS_PER_WORD = 8
+from dagnabbit.tasks.logic_gates.evaluate import unpack_bits
 
 
 def gray_permutation(size: int, device: torch.device | str = "cpu") -> Tensor:
@@ -49,26 +48,6 @@ def gray_permutation(size: int, device: torch.device | str = "cpu") -> Tensor:
     return indices ^ (indices >> 1)
 
 
-def unpack_bits(words: Tensor) -> Tensor:
-    """``[..., W]`` uint8 -> ``[..., W * 8]`` uint8 of 0/1, big-endian.
-
-    Matches ``np.packbits``' default bit order, which is how every truth table
-    in :mod:`.bitarrays` is packed. Done with shifts rather than a numpy round
-    trip so this stays on whatever device the batch already lives on.
-    """
-    if words.dtype != torch.uint8:
-        raise TypeError(f"expected uint8, got {words.dtype}")
-    shifts = torch.arange(
-        BITS_PER_WORD - 1,
-        -1,
-        -1,
-        dtype=torch.uint8,
-        device=words.device,
-    )
-    bits = (words.unsqueeze(-1) >> shifts) & 1
-    return bits.flatten(start_dim=-2)
-
-
 def outputs_to_image(
     packed: Tensor,
     height: int,
@@ -77,11 +56,11 @@ def outputs_to_image(
 ) -> Tensor:
     """``[B, C, W]`` packed output columns -> ``[B, C, H, W]`` uint8 bit planes.
 
-    ``packed`` is what :func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_graphs`
+    ``packed`` is what :func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices`
     returns, or a task's ``target_values`` with a batch axis added. Rows are
     consumed in truth-table order and folded into ``height`` rows of ``width``
-    columns, matching how :func:`.bitarrays.get_8bit_adder_truth_table`
-    flattens its ``(256, 256)`` meshgrid.
+    columns, so for the 16-input geometry the row axis is ``a`` and the column
+    axis is ``b``.
     """
     if packed.ndim != 3:
         raise ValueError("packed must have shape [B, C, num_words]")

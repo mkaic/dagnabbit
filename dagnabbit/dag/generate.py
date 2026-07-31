@@ -19,9 +19,9 @@ array                        shape                       meaning
 ``canonical_order``          ``[B, N]``                  position -> node index
 ===========================  ==========================  ======================
 
-:func:`sample_graph_batch` wraps those into descriptions via
-:meth:`~dagnabbit.dag.description.FixedInDegreeDAGDescription.from_arrays`, which
-adopts per-graph slices without recomputing anything.
+:func:`~dagnabbit.dag.canonical.sample` reindexes those into canonical position
+space with a handful of vectorized gathers. Nothing here builds a per-graph
+Python object.
 
 Why one call per batch
 ----------------------
@@ -33,14 +33,15 @@ returns flat arrays that ``torch.from_numpy`` wraps for free.
 
 Fidelity to the Python implementation
 -------------------------------------
-The kernels below reimplement
-:func:`~dagnabbit.dag.description.make_random_graph_description` and the two
-derived overlays, so the risk is silent divergence. Two things pin them:
+The kernels below reimplement the two derived overlays that
+:mod:`dagnabbit.dag.canonical` also computes in Python, so the risk is silent
+divergence. Two things pin them:
 
 * ``ranks`` and ``canonical_order`` must be **bit-identical** to
-  :meth:`compute_node_ranks` and :meth:`compute_canonical_order` for the same
-  structure. The canonical order is load-bearing -- it defines the sequence
-  model's targets, and isomorphic graphs must produce identical sequences -- so
+  :func:`~dagnabbit.dag.canonical.ranks_from_lists` and
+  :func:`~dagnabbit.dag.canonical.canonical_order_from_lists` for the same
+  structure. The canonical order is load-bearing -- it defines the model's
+  sequence positions, and isomorphic graphs must produce identical sequences -- so
   :func:`_ready_key_less` reproduces Python's tuple comparison exactly, including
   that a shorter tuple which is a prefix of a longer one sorts first.
 * the sampled distribution must match statistically.
@@ -49,10 +50,7 @@ Both are asserted in ``dagnabbit/dag/tests/test_generate.py``.
 """
 
 import numpy as np
-import torch
 from numba import njit
-
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
 
 # ---- canonical order: a heap of node indices under a lexicographic key ------
 #
@@ -399,69 +397,3 @@ def check_geometry(
         f"{num_output_nodes} = {max_coverable_roots}); add trunk nodes "
         "(ideally with in-degree > 1) or output nodes"
     )
-
-
-def sample_graph_batch(
-    count: int,
-    *,
-    num_root_nodes: int,
-    num_trunk_nodes: int,
-    num_output_nodes: int,
-    num_trunk_node_types: int,
-    trunk_node_in_degrees: int | list[int],
-) -> list[FixedInDegreeDAGDescription]:
-    """``count`` freshly sampled graphs.
-
-    Seeded from ``torch.randint``, so ``torch.manual_seed`` still determines the
-    whole stream exactly as it did when generation was pure Python. numba keeps
-    its own RNG state, separate from numpy's, which is why the seed is passed in
-    explicitly rather than inherited.
-    """
-    if count <= 0:
-        raise ValueError(f"count must be positive, got {count}")
-    if isinstance(trunk_node_in_degrees, int):
-        trunk_node_in_degrees = [trunk_node_in_degrees] * num_trunk_node_types
-    else:
-        trunk_node_in_degrees = list(trunk_node_in_degrees)
-    check_geometry(
-        num_root_nodes,
-        num_trunk_nodes,
-        num_output_nodes,
-        num_trunk_node_types,
-        trunk_node_in_degrees,
-    )
-
-    maximum_indegree = max([1, *trunk_node_in_degrees])
-    # numba's seed is a uint32, so draw in that range rather than truncating.
-    seed = int(torch.randint(0, 2**32, (1,), dtype=torch.int64).item())
-
-    node_types, in_degrees, padded_parents, ranks, order = generate_arrays(
-        count,
-        num_root_nodes,
-        num_trunk_nodes,
-        num_output_nodes,
-        num_trunk_node_types,
-        np.asarray(trunk_node_in_degrees, dtype=np.int64),
-        maximum_indegree,
-        seed,
-    )
-
-    # One vectorized comparison for the whole batch's slot masks, rather than one
-    # per graph. Everything else is already in its final form.
-    slot_masks = np.arange(maximum_indegree) < in_degrees[..., None]
-
-    return [
-        FixedInDegreeDAGDescription.from_arrays(
-            num_root_nodes=num_root_nodes,
-            num_trunk_nodes=num_trunk_nodes,
-            num_output_nodes=num_output_nodes,
-            num_trunk_node_types=num_trunk_node_types,
-            trunk_node_in_degrees=trunk_node_in_degrees,
-            node_types_array=node_types[index],
-            padded_parents=padded_parents[index],
-            parent_slot_mask=slot_masks[index],
-            ranks_array=ranks[index],
-            canonical_order_array=order[index],
-        )
-        for index in range(count)
-    ]

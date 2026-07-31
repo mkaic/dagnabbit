@@ -1,48 +1,90 @@
 # dagnabbit
-Is it possible to use machine learning and neural networks to automatically search through the space of all possible fixed-indegree DAGs?
 
-Idk but I want to find out.
+Is it possible to use machine learning to search the space of fixed-in-degree
+DAGs for one that computes a given boolean function?
 
-## Prerequisites
+The target is an 8-bit adder: 16 input bits, 8 output bits, built from a budget
+of 128 NAND/NOR gates. A hand-wired solution exists inside that budget
+(`nand_ripple_carry_adder`), so the search has a known optimum to measure
+against.
 
-DAG rendering requires the [Graphviz](https://graphviz.org/) system package (the `dot` layout engine). Install it before using `render_dag`:
+## The approach
 
-**macOS (Homebrew):**
+Rather than pretrain a task-agnostic representation of graphs, train one model
+on the downstream question directly: **given a DAG, what is its truth table?**
+Random graphs are cheap to sample (~35 us each) and exact to evaluate, so this
+is an unlimited supply of labeled data and no example is ever seen twice.
+
+That model is a differentiable surrogate for the real evaluator. Inverse design
+then means running it backwards: hold the surrogate fixed, and optimize a
+circuit until its *predicted* truth table matches the one you want.
+
+### Phase 0 — the simulator (`dagnabbit/scripts/train_simulator.py`)
+
+Three stages, in `dagnabbit/dag/model.py`:
+
+1. Each node becomes one token by summing embeddings of its type, its own
+   canonical position, and its parents' canonical positions. No transformer, no
+   pooling — a gather and three matmuls, fully parallel across nodes.
+2. An unmasked transformer runs over the 152-token sequence. This is where the
+   work happens: composing a gate with its ancestors' values is a hop of message
+   passing, and the layer count bounds how many hops are available.
+3. A grid of learned patch queries cross-attends the result. Patch `p` owns a
+   contiguous block of truth-table rows across every output, so one query
+   decodes thousands of bits and the loss can be taken on a random subset of
+   patches per step.
+
+There is no reconstruction loss and nothing decodes back to a graph. The token
+space is never inverted — Phase 1 emits categorical choices and *constructs*
+tokens from them, so what the simulator reads is always a real graph's encoding.
+
+**The gate.** Average bit accuracy is not the number to watch: a model can score
+well above chance on statistical regularities of random NAND/NOR circuits
+without simulating anything, and such a model has a useless loss landscape near
+an actual target. Watch `eval/accuracy_by_rank` — accuracy bucketed by each
+output node's longest-path depth. Output nodes in this sampling distribution sit
+at median depth 11 (p95 15, max 23), so if accuracy falls off a cliff at the
+simulator's layer count, the receptive field is binding and the fix is more
+layers or a weight-tied recurrent simulator. If it degrades smoothly past the
+layer count, the model found something cheaper than hop-by-hop propagation.
+
+### Phase 1 — inverse design, not yet built
+
+Optimize a batch of independent candidate circuits by gradient descent through
+the frozen simulator, with Gumbel-softmax and a straight-through estimator so
+the forward value is always a real discrete graph. Periodically re-evaluate the
+hard-sampled graphs with the exact evaluator and fine-tune the simulator on the
+result, which is what keeps it from being exploited.
+
+The diagnostic that matters: the gap between predicted and true truth-table
+loss. If predicted loss goes to zero while true loss does not, the optimizer is
+exploiting the surrogate rather than finding a circuit.
+
+### Phase 2 — amortization, only if Phase 1 earns it
+
+Replace the population of independent candidates with a generator mapping noise
+to circuits. That buys parameter sharing and a smoother search landscape, but it
+sits downstream of the same surrogate, so it can fix an optimization failure and
+not a model failure.
+
+## Layout
+
+| path | what |
+| --- | --- |
+| `dag/generate.py` | compiled (numba) random DAG sampler |
+| `dag/canonical.py` | the one graph representation: types, parent positions, ranks |
+| `dag/model.py` | node tokens, simulator, truth-table patch decoder |
+| `tasks/logic_gates/evaluate.py` | exact bitpacked circuit evaluation and scoring |
+| `tasks/logic_gates/reference_circuits.py` | the hand-wired adder, as a known optimum |
+| `scripts/train_simulator.py` | Phase 0 training loop |
+| `scripts/config.py` | geometry, model, and training knobs |
+
+## Running
+
 ```bash
-brew install graphviz
+uv run python -m dagnabbit.scripts.train_simulator --name my-run
 ```
 
-**Ubuntu / Debian:**
 ```bash
-sudo apt install graphviz
+uv run python -m pytest dagnabbit -q
 ```
-
-The Python `graphviz` wrapper is included in the project dependencies and will be installed automatically via `uv sync` or `pip install`.
-
-## Ideas
-
-### Encoder
-* Encoding itself is pretty straightforward and kind of the backbone of the whole approach
-* Get down to one vector
-* Then, primary loss is going to be from guided autoregressive decoding — use the known structure of the graph for matching targets and predictions.
-    * Objective 1 — correctly classify the _node type_ (one type per root node and output node, one type per kind of trunk node, one type for aggregator/scaffolding nodes)
-    * Objective 2 — parent node embeddings predicted from different children for the same parent node should be similar
-    * Objective 3 — postprocessing MLP which strips the impact of the scaffolding node from the embedding — trained with CLIP-style contrastive loss. Embeddings from multiple random scaffolds should be similar, embeddings from different underlying graphs should be different. Ideally, this encourages a monotonic/smooth embedding trajectory from the base graph to the final graph.
-    * Objective 4 (?) — Explicitly enforce monotonicity of similarity between empty graph and a given random graph? Not sure how to do this.
-
-### Decoder
-* Blind decoding —
-    * one idea is to grow from the leaves backwards (or well the single aggregate leaf in this scenario)
-        * Would require a *shit ton* of compute though. Bc you'd have to predict the *whole* ancestor set *un-deduplicated* *before* you can dedupe it, because you can only dedupe confidently if you can guarantee the parent nodes of a given node are identical, and you don't know *that* until you've traced ancestry all the way back to root nodes along *all* branches.
-        * Another issue with this is that it isn't guaranteed to produce a valid graph, and ways of coercing it into always terminating feel unwieldy and inelegant.
-    * Alternatively, we cant try to build node-by-node from the roots up.
-        * Start with the root nodes as your base graph. Embed that graph.
-        * Give a "builder" network access to the *current* graph embedding and the *target* graph embedding
-        * Have it iteratively predict (1) the type of the next trunk node, and then (2) the set of the parent node embeddings for that child node.
-        * Match the parent node embeddings against all topologically previous nodes
-        * Re-embed the new graph, rinse and repeat.
-        * After you've hit your trunk node budget, you then predict the single-input for each output node.
-        * You'd use the sanitized embedding from the contrastive head for this, since it should "blur out" information about the random aggregation.
-        * This would probably need to be trained with RL, which kind of sucks. I don't see an easy way to make this differentiable because the child node embedding can't be computed without knowing its discrete type, so we have to make discrete type samples at every step, and those break differentiability *I THINK*. Because there's no way to differentiate through a max().
-        * At least this has a more elegant termination criteria though.
-        * And it can be trained separately from the encoder.

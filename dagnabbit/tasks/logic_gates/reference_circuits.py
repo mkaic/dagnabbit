@@ -1,8 +1,8 @@
 """Hand-built circuits with known behaviour, for testing and as search targets.
 
-These are constructed directly as :class:`FixedInDegreeDAGDescription`s rather
-than generated, so their semantics are known independently of anything the
-model or the evaluator does. :func:`nand_ripple_carry_adder` in particular is a
+These are constructed as ragged parent lists and canonicalized on the way out,
+so their semantics are known independently of anything the model or the
+evaluator does. :func:`nand_ripple_carry_adder` in particular is a
 ground-truth optimum for the adder task: any search that works should be able
 to reach a fitness of 1.0, because a circuit achieving it demonstrably exists
 inside the graph budget.
@@ -12,8 +12,8 @@ Padding
 The model's geometry fixes the trunk node count (128 by default) while the
 adder core needs only 67 gates. The spare capacity is spent on **identity
 buffers** rather than dead gates, which matters whenever the circuit is used to
-probe a trained model: ``make_random_graph_description``'s coverage pass
-guarantees every trunk node has at least one child, so a circuit padded with
+probe a trained model: the sampler's coverage pass guarantees every trunk node
+has at least one child, so a circuit padded with
 dead gates is off-distribution in a way that has nothing to do with what it
 computes, and its padding gates are structural twins that the canonical
 ordering cannot distinguish.
@@ -31,14 +31,18 @@ topologically sorted at the end.
 
 from dataclasses import dataclass, field
 
-from dagnabbit.dag.description import FixedInDegreeDAGDescription
+from dagnabbit.dag.canonical import CanonicalGraphs, Geometry, from_lists
 
 NAND_TYPE = 0
 
 
 @dataclass
 class AdderAnnotations:
-    """Which gate does what, for rendering and for reading the circuit."""
+    """Which gate does what, for rendering and for reading the circuit.
+
+    Every index here is a *node storage index*, not a canonical position. The
+    two coincide only for roots and outputs, whose positions are pinned.
+    """
 
     bit_of_node: dict[int, int] = field(default_factory=dict)
     role_of_node: dict[int, str] = field(default_factory=dict)
@@ -141,7 +145,7 @@ def build_nand_ripple_carry_adder(
     num_trunk_nodes: int = 128,
     num_output_nodes: int = 8,
     num_trunk_node_types: int = 2,
-) -> tuple[FixedInDegreeDAGDescription, AdderAnnotations]:
+) -> tuple[CanonicalGraphs, AdderAnnotations]:
     """An 8-bit ripple-carry adder, padded to the trunk budget with buffers.
 
     Scores exactly 1.0 on :func:`~dagnabbit.tasks.logic_gates.evaluate.adder_task`
@@ -233,7 +237,7 @@ def build_nand_bitwise_xor(
     num_trunk_nodes: int = 128,
     num_output_nodes: int = 8,
     num_trunk_node_types: int = 2,
-) -> tuple[FixedInDegreeDAGDescription, AdderAnnotations]:
+) -> tuple[CanonicalGraphs, AdderAnnotations]:
     """Bitwise ``a XOR b``: the same inputs and outputs, no long-range structure.
 
     Deliberately the adder's opposite. Output j depends on exactly two input
@@ -295,7 +299,7 @@ def _pad_and_emit(
     num_trunk_nodes: int,
     num_output_nodes: int,
     num_trunk_node_types: int,
-) -> tuple[FixedInDegreeDAGDescription, dict[int, int]]:
+) -> tuple[CanonicalGraphs, dict[int, int]]:
     """Pad a core circuit to the trunk budget with buffers, then emit it.
 
     Returns the description and the symbolic-id -> final-index map, which the
@@ -374,28 +378,24 @@ def _pad_and_emit(
         node_types.append(output_type)
         annotations.output_of_bit[(width - 1) - slot] = len(node_inputs_indices) - 1
 
-    graph = FixedInDegreeDAGDescription(
+    geometry = Geometry(
         num_root_nodes=num_root_nodes,
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         num_trunk_node_types=num_trunk_node_types,
-        trunk_node_in_degrees=[2] * num_trunk_node_types,
-        node_inputs_indices=node_inputs_indices,
-        node_types=node_types,
+        trunk_node_in_degrees=(2,) * num_trunk_node_types,
     )
-    return graph, final_index
+    return from_lists(node_inputs_indices, node_types, geometry), final_index
 
 
-def nand_ripple_carry_adder(
-    num_root_nodes: int = 16,
-    num_trunk_nodes: int = 128,
-    num_output_nodes: int = 8,
-    num_trunk_node_types: int = 2,
-) -> FixedInDegreeDAGDescription:
-    """The adder circuit alone. See :func:`build_nand_ripple_carry_adder`."""
+def nand_ripple_carry_adder(geometry: Geometry) -> CanonicalGraphs:
+    """The adder circuit alone, as a batch of one.
+
+    See :func:`build_nand_ripple_carry_adder` for the construction.
+    """
     return build_nand_ripple_carry_adder(
-        num_root_nodes=num_root_nodes,
-        num_trunk_nodes=num_trunk_nodes,
-        num_output_nodes=num_output_nodes,
-        num_trunk_node_types=num_trunk_node_types,
+        num_root_nodes=geometry.num_root_nodes,
+        num_trunk_nodes=geometry.num_trunk_nodes,
+        num_output_nodes=geometry.num_output_nodes,
+        num_trunk_node_types=geometry.num_trunk_node_types,
     )[0]
