@@ -26,7 +26,7 @@ GEOMETRY = Geometry(
 # bound is binding and this is the number to raise; if it degrades smoothly
 # past it, the model found something cheaper than message passing.
 MODEL = SimulatorConfig(
-    embedding_dim=256,
+    embedding_dim=384,
     attention_head_dim=64,
     mlp_expansion_factor=4.0,
     num_simulator_layers=24,
@@ -37,12 +37,12 @@ MODEL = SimulatorConfig(
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRAPH_BATCH_SIZE = 256
+GRAPH_BATCH_SIZE = 64
 # Patches scored per step, out of MODEL.num_patches. The full table is 524288
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
 # it trades directly against GRAPH_BATCH_SIZE.
-PATCHES_PER_STEP = 32
+PATCHES_PER_STEP = 256
 
 LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 1
@@ -88,9 +88,9 @@ LOG_EVERY = 10
 # the Phase 0 gate -- average accuracy can look fine while deep outputs sit at
 # chance, and that gap is what says whether the simulator is simulating.
 EVAL_EVERY = 100
-EVAL_BATCH_SIZE = 64
+EVAL_BATCH_SIZE = 32
 # Patches per eval graph. Higher than training since there is no backward pass.
-EVAL_PATCHES = 64
+EVAL_PATCHES = 256
 CHECKPOINT_EVERY = 5000
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
