@@ -2,25 +2,25 @@
 
 import torch
 
-from dagnabbit.dag.canonical import Geometry
+from dagnabbit.dag.graphs import Geometry
 from dagnabbit.dag.model import SimulatorConfig
 from dagnabbit.optimizers import AutoMuon
 
 # --- graph geometry ---
-# 16 roots + 128 NAND/NOR gates + 8 outputs = a 152-token sequence, and a
-# 2^16-row truth table.
+# 16 roots + 128 NAND/XOR/XNOR gates + 8 outputs = a 152-token sequence, and
+# a 2^16-row truth table.
 GEOMETRY = Geometry(
     num_root_nodes=16,
     num_trunk_nodes=128,
     num_output_nodes=8,
-    num_trunk_node_types=2,
-    trunk_node_in_degrees=(2, 2),
+    num_trunk_node_types=3,
+    trunk_node_in_degrees=(2, 2, 2),
 )
 
 # --- model ---
 # num_simulator_layers is the one knob the depth analysis actually pins down.
 # Under pure value propagation a layer buys one hop, and output nodes in this
-# sampling distribution sit at median depth 11 (p95 15, max 23) -- so 8 layers
+# sampling distribution sit at median depth 11 (p95 15, max 22) -- so 8 layers
 # would leave three quarters of outputs out of reach and 16 covers p95. If
 # accuracy stratified by output rank falls off a cliff at the layer count, that
 # bound is binding and this is the number to raise; if it degrades smoothly

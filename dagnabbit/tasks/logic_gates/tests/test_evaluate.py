@@ -3,7 +3,7 @@
 The load-bearing test is :func:`test_matches_unpacked_reference`, which checks
 the packed evaluator against a deliberately naive per-row boolean implementation
 written against the *ragged node-index* form. Since the evaluator consumes
-canonical positions, that comparison covers canonicalization end to end as well.
+node indices, that comparison covers the node layout end to end as well.
 Everything else pins down a specific way the packing can be subtly wrong: bit
 order, root/output slot mapping, padding contamination, cross-graph leakage in
 the batch, and popcount.
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from dagnabbit.dag.canonical import Geometry, from_lists, ranks_from_lists
+from dagnabbit.dag.graphs import Geometry, from_lists, ranks_from_lists
 from dagnabbit.dag.generate import generate_arrays
 from dagnabbit.tasks.logic_gates.evaluate import (
     BITS_PER_WORD,
@@ -27,8 +27,14 @@ from dagnabbit.tasks.logic_gates.evaluate import (
     popcount,
     unpack_bits,
 )
-from dagnabbit.tasks.logic_gates.operators import GATE_NAMES
+from dagnabbit.tasks.logic_gates.operators import nand, nor
 from dagnabbit.tasks.logic_gates.reference_circuits import nand_ripple_carry_adder
+
+# These tests exercise NAND/NOR semantics and slot mapping, so they pin that
+# pair explicitly rather than following whatever GATE_OPERATORS currently is
+# (NAND, XOR, XNOR -- see operators.py for why).
+GATE_NAMES = ("NAND", "NOR")
+OPERATORS = (nand, nor)
 
 NAND, NOR = 0, 1
 ADDER_GEOMETRY = Geometry(16, 128, 8, 2, (2, 2))
@@ -116,7 +122,7 @@ def circuit(
     node_types: list[int],
     geometry: Geometry,
 ):
-    """A hand-built circuit as both ragged lists and a canonical batch of one."""
+    """A hand-built circuit as both ragged lists and a node-index batch of one."""
     return (
         node_inputs_indices,
         node_types,
@@ -126,7 +132,7 @@ def circuit(
 
 def random_circuit(seed: int, geometry: Geometry = RANDOM_GEOMETRY):
     """A reproducible random circuit, in both forms."""
-    node_types, in_degrees, parents, _, _ = generate_arrays(
+    node_types, in_degrees, parents, _ = generate_arrays(
         1,
         geometry.num_root_nodes,
         geometry.num_trunk_nodes,
@@ -192,7 +198,7 @@ def test_matches_unpacked_reference(num_rows):
     )
 
     for index, (inputs, types, graphs) in enumerate(circuits):
-        packed = evaluate_graphs(graphs, root_values)
+        packed = evaluate_graphs(graphs, root_values, OPERATORS)
         actual = unpack_rows(packed, num_rows)[0]
         expected = evaluate_reference(inputs, types, RANDOM_GEOMETRY, root_bits)
         assert np.array_equal(actual, expected), f"circuit {index} mismatch"
@@ -204,18 +210,17 @@ def test_batch_matches_individual_evaluation():
     root_values, _ = random_root_bits(RANDOM_GEOMETRY.num_root_nodes, 333, 7)
 
     stacked_types = torch.cat([graphs.trunk_types for _, _, graphs in circuits])
-    stacked_positions = torch.cat(
-        [graphs.parent_positions for _, _, graphs in circuits]
-    )
+    stacked_positions = torch.cat([graphs.parent_indices for _, _, graphs in circuits])
     batched = evaluate_choices(
         stacked_types,
         stacked_positions,
         root_values,
         RANDOM_GEOMETRY.num_output_nodes,
         RANDOM_GEOMETRY.trunk_node_in_degrees,
+        OPERATORS,
     )
     for index, (_, _, graphs) in enumerate(circuits):
-        alone = evaluate_graphs(graphs, root_values)
+        alone = evaluate_graphs(graphs, root_values, OPERATORS)
         assert torch.equal(batched[index : index + 1], alone)
 
 
@@ -256,15 +261,14 @@ def test_batch_with_differing_depths():
 
     root_values, root_bits = random_root_bits(2, 64, 11)
     stacked_types = torch.cat([shallow[2].trunk_types, deep[2].trunk_types])
-    stacked_positions = torch.cat(
-        [shallow[2].parent_positions, deep[2].parent_positions]
-    )
+    stacked_positions = torch.cat([shallow[2].parent_indices, deep[2].parent_indices])
     packed = evaluate_choices(
         stacked_types,
         stacked_positions,
         root_values,
         geometry.num_output_nodes,
         geometry.trunk_node_in_degrees,
+        OPERATORS,
     )
     actual = unpack_rows(packed, 64)
 
@@ -305,7 +309,7 @@ def test_nand_built_xor():
         valid_bit_mask=make_valid_bit_mask(4, root_values.shape[1]),
     )
 
-    packed = evaluate_graphs(graphs, root_values)
+    packed = evaluate_graphs(graphs, root_values, OPERATORS)
     assert np.array_equal(unpack_rows(packed, 4)[0, 0], a ^ b)
 
     overall, per_output = bit_accuracy(packed, task)
@@ -324,7 +328,7 @@ def test_nor_built_or():
     a = np.array([0, 0, 1, 1], dtype=bool)
     b = np.array([0, 1, 0, 1], dtype=bool)
     root_values = pack_rows(np.stack([a, b]))
-    packed = evaluate_graphs(graphs, root_values)
+    packed = evaluate_graphs(graphs, root_values, OPERATORS)
     assert np.array_equal(unpack_rows(packed, 4)[0, 0], a | b)
 
 
@@ -341,7 +345,7 @@ def test_gate_types_are_not_swapped():
             [*root_types(geometry), gate_type, geometry.output_type],
             geometry,
         )
-        result = unpack_rows(evaluate_graphs(graphs, root_values), 4)[0, 0]
+        result = unpack_rows(evaluate_graphs(graphs, root_values, OPERATORS), 4)[0, 0]
         assert np.array_equal(result, expected), f"gate type {gate_type} is wrong"
 
 
@@ -370,7 +374,7 @@ def test_padding_bits_cannot_affect_the_score():
         valid_bit_mask=make_valid_bit_mask(num_rows, root_values.shape[1]),
     )
 
-    packed = evaluate_graphs(graphs, root_values)
+    packed = evaluate_graphs(graphs, root_values, OPERATORS)
     # The padding really is contaminated -- this is what the mask is for.
     assert packed[0, 0, 0].item() == 0xFF
     overall, _ = bit_accuracy(packed, task)
@@ -467,7 +471,9 @@ def test_adder_task_slot_mapping():
         types.append(geometry.output_type)
 
     _, _, graphs = circuit(inputs, types, geometry)
-    _, per_output = bit_accuracy(evaluate_graphs(graphs, task.root_values), task)
+    _, per_output = bit_accuracy(
+        evaluate_graphs(graphs, task.root_values, OPERATORS), task
+    )
 
     input_bits = unpack_bits(task.root_values).numpy().astype(bool)
     sum_bits = unpack_bits(task.target_values).numpy().astype(bool)
@@ -480,19 +486,57 @@ def test_reference_adder_is_exactly_correct():
     """A hand-wired NAND adder must score 1.0 on every bit of every row.
 
     The strongest end-to-end check available: root slot mapping, gate semantics,
-    23 ranks of topological evaluation, canonicalization, output slot mapping and
+    23 ranks of topological evaluation, the node layout, output slot mapping and
     scoring all at once, against a circuit whose behaviour is known from its
     construction rather than from this code.
     """
     graphs = nand_ripple_carry_adder(ADDER_GEOMETRY)
     task = adder_task()
 
-    outputs = evaluate_graphs(graphs, task.root_values)
+    outputs = evaluate_graphs(graphs, task.root_values, OPERATORS)
     assert torch.equal(outputs[0], task.target_values)
 
     overall, per_output = bit_accuracy(outputs, task)
     assert overall.item() == 1.0
     assert bool((per_output == 1.0).all())
+
+
+def test_both_adder_vocabularies_compute_the_adder():
+    """The NAND and NAND+XOR builds must agree on behaviour and differ on gates.
+
+    The pair only isolates gate vocabulary if everything else is held roughly
+    fixed, so this also pins that they stay comparable in depth. If one drifts
+    far deeper than the other, the probe stops being a controlled comparison and
+    starts measuring depth again.
+    """
+    from dagnabbit.tasks.logic_gates.operators import GATE_OPERATORS
+    from dagnabbit.tasks.logic_gates.reference_circuits import (
+        mixed_ripple_carry_adder,
+        nand_ripple_carry_adder,
+    )
+
+    geometry = Geometry(16, 128, 8, 3, (2, 2, 2))
+    task = adder_task()
+    depths = {}
+    for name, build in (
+        ("nand", nand_ripple_carry_adder),
+        ("mixed", mixed_ripple_carry_adder),
+    ):
+        graphs = build(geometry)
+        outputs = evaluate_graphs(graphs, task.root_values, GATE_OPERATORS)
+        assert torch.equal(outputs[0], task.target_values), name
+        assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, name
+        depths[name] = int(graphs.ranks.max())
+
+        used = graphs.trunk_types[0].unique().tolist()
+        if name == "nand":
+            assert used == [0], "the all-NAND build must use only NAND"
+        else:
+            assert 1 in used, "the mixed build must actually spend XOR gates"
+
+    assert abs(depths["nand"] - depths["mixed"]) <= 6, (
+        f"the two builds have drifted apart in depth: {depths}"
+    )
 
 
 def test_reference_adder_rejects_an_impossible_width():
@@ -504,12 +548,14 @@ def test_reference_adder_rejects_an_impossible_width():
 
 def test_random_circuits_score_near_half():
     """Sanity floor: random circuits on the adder land close to chance."""
-    from dagnabbit.dag.canonical import sample
+    from dagnabbit.dag.graphs import sample
 
     torch.manual_seed(0)
     graphs = sample(8, Geometry(16, 64, 8, 2, (2, 2)))
     task = adder_task()
-    overall, _ = bit_accuracy(evaluate_graphs(graphs, task.root_values), task)
+    overall, _ = bit_accuracy(
+        evaluate_graphs(graphs, task.root_values, OPERATORS), task
+    )
     assert 0.2 < overall.mean().item() < 0.8
 
 
@@ -521,7 +567,7 @@ def test_random_circuits_score_near_half():
 def test_rejects_a_forward_reference():
     """A parent at or after its consumer would silently alias a real node."""
     _, _, graphs = random_circuit(0)
-    positions = graphs.parent_positions.clone()
+    positions = graphs.parent_indices.clone()
     consumer = RANDOM_GEOMETRY.num_root_nodes + 1
     positions[0, consumer, 0] = consumer  # points at itself
     with pytest.raises(ValueError, match="at or after its consumer"):
@@ -531,12 +577,13 @@ def test_rejects_a_forward_reference():
             exhaustive_root_values(RANDOM_GEOMETRY.num_root_nodes),
             RANDOM_GEOMETRY.num_output_nodes,
             RANDOM_GEOMETRY.trunk_node_in_degrees,
+            OPERATORS,
         )
 
 
 def test_rejects_a_reference_into_the_output_block():
     _, _, graphs = random_circuit(0)
-    positions = graphs.parent_positions.clone()
+    positions = graphs.parent_indices.clone()
     positions[0, -1, 0] = RANDOM_GEOMETRY.output_start  # an output reading an output
     with pytest.raises(ValueError, match="output block"):
         evaluate_choices(
@@ -545,6 +592,7 @@ def test_rejects_a_reference_into_the_output_block():
             exhaustive_root_values(RANDOM_GEOMETRY.num_root_nodes),
             RANDOM_GEOMETRY.num_output_nodes,
             RANDOM_GEOMETRY.trunk_node_in_degrees,
+            OPERATORS,
         )
 
 
@@ -553,8 +601,9 @@ def test_rejects_mismatched_node_count():
     with pytest.raises(ValueError, match="expected"):
         evaluate_choices(
             graphs.trunk_types,
-            graphs.parent_positions[:, :-1],
+            graphs.parent_indices[:, :-1],
             exhaustive_root_values(RANDOM_GEOMETRY.num_root_nodes),
             RANDOM_GEOMETRY.num_output_nodes,
             RANDOM_GEOMETRY.trunk_node_in_degrees,
+            OPERATORS,
         )

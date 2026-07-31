@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dagnabbit.dag import canonical
+from dagnabbit.dag.graphs import sample as sample_graphs
 from dagnabbit.dag.metrics import (
     bucket_by_rank,
     confusion_counts,
@@ -59,7 +59,7 @@ from dagnabbit.tasks.logic_gates.evaluate import (
 
 def make_batch(batch_size: int, root_values: torch.Tensor, device: torch.device):
     """Fresh graphs plus their exact packed truth tables."""
-    graphs = canonical.sample(batch_size, cfg.GEOMETRY, device)
+    graphs = sample_graphs(batch_size, cfg.GEOMETRY, device)
     return graphs, evaluate_graphs(graphs, root_values)
 
 
@@ -135,42 +135,55 @@ def evaluate(
 
 
 @torch.no_grad()
-def probe_adder(
+def probe_references(
     model: GraphSimulator, rows_per_patch: int, device: torch.device
-) -> tuple[float, float]:
-    """How well does the simulator predict the *reference adder's* behaviour?
+) -> dict[str, tuple[float, float]]:
+    """Predict the hand-built adders' behaviour. Returns {name: (accuracy, mcc)}.
 
-    Returns ``(bit accuracy, MCC)``. Not a training signal -- an
-    out-of-distribution check. The hand-built adder is a structured circuit,
-    which is exactly what random sampling never produces and exactly what Phase
-    1 will be searching for.
+    Not a training signal -- an out-of-distribution check. Two circuits compute
+    the same function from different vocabularies: ``nand`` is all-NAND with a
+    67-gate core, ``mixed`` spends XOR where the NAND version spends four gates
+    and has a 35-gate core. Both are padded to the same trunk budget and end up
+    at comparable depth, so the difference between the two scores isolates gate
+    vocabulary from depth and structure.
 
     MCC matters more here than on random graphs: every bit of ``a + b`` is
     balanced almost exactly 50/50 over the full table, so bit accuracy has a
-    hard floor of ~0.5 that says nothing, while MCC starts at 0.
+    hard floor near 0.5 that says nothing, while MCC starts at 0.
     """
-    from dagnabbit.tasks.logic_gates.reference_circuits import nand_ripple_carry_adder
+    from dagnabbit.tasks.logic_gates.reference_circuits import (
+        mixed_ripple_carry_adder,
+        nand_ripple_carry_adder,
+    )
 
-    graphs = nand_ripple_carry_adder(cfg.GEOMETRY).to(device)
     task = adder_task(device)
     patch_indices = torch.arange(cfg.MODEL.num_patches, device=device)
-    with torch.autocast(
-        device_type=device.type, dtype=cfg.AMP_DTYPE, enabled=cfg.AMP_ENABLED
+    results: dict[str, tuple[float, float]] = {}
+
+    for name, build in (
+        ("nand", nand_ripple_carry_adder),
+        ("mixed", mixed_ripple_carry_adder),
     ):
-        logits = model.forward_graphs(graphs, patch_indices)
+        graphs = build(cfg.GEOMETRY).to(device)
+        with torch.autocast(
+            device_type=device.type, dtype=cfg.AMP_DTYPE, enabled=cfg.AMP_ENABLED
+        ):
+            logits = model.forward_graphs(graphs, patch_indices)
 
-    # The circuit really computes the adder, so the task's targets are its truth
-    # table; this checks the *prediction* against it. Sanity-check the premise
-    # too, since a mis-wired reference would silently make this meaningless.
-    packed = evaluate_graphs(graphs, task.root_values)
-    exact, _ = bit_accuracy(packed, task)
-    assert float(exact[0]) == 1.0, "reference adder does not compute the adder"
+        # The circuit really computes the adder, so the task's targets are its
+        # truth table; this checks the *prediction* against it. Sanity-check the
+        # premise too, since a mis-wired reference would make this meaningless.
+        packed = evaluate_graphs(graphs, task.root_values)
+        exact, _ = bit_accuracy(packed, task)
+        assert float(exact[0]) == 1.0, f"the {name} reference is not an adder"
 
-    targets = patch_targets(packed, patch_indices, rows_per_patch)
-    logits = logits.float()
-    _, accuracy = loss_and_accuracy(logits, targets)
-    mcc, _ = matthews_correlation(confusion_counts(logits, targets))
-    return float(accuracy.mean()), float(mcc.mean())
+        targets = patch_targets(packed, patch_indices, rows_per_patch)
+        logits = logits.float()
+        _, accuracy = loss_and_accuracy(logits, targets)
+        mcc, _ = matthews_correlation(confusion_counts(logits, targets))
+        results[name] = (float(accuracy.mean()), float(mcc.mean()))
+
+    return results
 
 
 def format_rank_ladder(
@@ -279,7 +292,7 @@ def main() -> None:
 
         if step % cfg.EVAL_EVERY == 0:
             result = evaluate(model, root_values, rows_per_patch, device)
-            adder_accuracy, adder_mcc = probe_adder(model, rows_per_patch, device)
+            probes = probe_references(model, rows_per_patch, device)
 
             writer.add_scalar("eval/bit_accuracy", result.bit_accuracy, step)
             writer.add_scalar("eval/mcc", result.mcc, step)
@@ -295,18 +308,25 @@ def main() -> None:
                 )
             for rank, value in result.mcc_by_rank.items():
                 writer.add_scalar(f"eval/mcc_by_rank/{rank:02d}", value, step)
-            writer.add_scalar("probe/adder_bit_accuracy", adder_accuracy, step)
-            writer.add_scalar("probe/adder_mcc", adder_mcc, step)
+            for name, (probe_accuracy, probe_mcc) in probes.items():
+                writer.add_scalar(
+                    f"probe/{name}_adder_bit_accuracy", probe_accuracy, step
+                )
+                writer.add_scalar(f"probe/{name}_adder_mcc", probe_mcc, step)
 
             postfix["eval"] = f"{result.bit_accuracy:.4f}"
             postfix["mcc"] = f"{result.mcc:+.4f}"
-            postfix["adder"] = f"{adder_accuracy:.4f}"
+            postfix["adder"] = "/".join(f"{mcc:+.3f}" for _, mcc in probes.values())
             progress.set_postfix(postfix, refresh=False)
 
             lines = [
                 f"step {step:>8}  acc {result.bit_accuracy:.4f}  "
                 f"mcc {result.mcc:+.4f}  "
-                f"adder {adder_accuracy:.4f}/{adder_mcc:+.4f}  "
+                + "  ".join(
+                    f"{name} {acc:.4f}/{mcc:+.4f}"
+                    for name, (acc, mcc) in probes.items()
+                )
+                + "  "
                 f"const {result.constant_target_fraction:.1%}",
                 f"  cells: rank, accuracy, mcc, outputs -- past "
                 f"r{cfg.MODEL.num_simulator_layers} exceeds the simulator's depth",

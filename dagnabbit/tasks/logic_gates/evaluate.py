@@ -1,4 +1,4 @@
-"""Bitpacked evaluation of canonical circuits.
+"""Bitpacked evaluation of node-index circuits.
 
 A circuit is run by pushing every row of its truth table through the DAG at
 once: each node's value is a packed bit vector with one bit per row, so one
@@ -86,7 +86,7 @@ class BitpackedTask:
 
     ``root_values[i]`` is the input column driving root node ``i`` and
     ``target_values[j]`` is the desired output of output node ``j``. Both index
-    by node slot, matching the canonical layout: roots occupy positions
+    by node slot, matching the node layout: roots occupy positions
     ``[0, R)`` and outputs the final ``num_output_nodes`` positions.
 
     Only Phase-1 inverse design and the reference probes need a task. Simulator
@@ -167,17 +167,17 @@ def adder_task(device: torch.device | str = "cpu") -> BitpackedTask:
 @torch.no_grad()
 def evaluate_choices(
     trunk_types: Tensor,
-    parent_positions: Tensor,
+    parent_indices: Tensor,
     root_values: Tensor,
     num_output_nodes: int,
     trunk_node_in_degrees: Sequence[int],
     gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
 ) -> Tensor:
-    """Run a batch of circuits, on-device, straight from canonical tensors.
+    """Run a batch of circuits, on-device, straight from graph tensors.
 
-    ``trunk_types`` is ``[B, T]`` trunk class ids and ``parent_positions`` is
-    ``[B, N, S]`` canonical parent positions -- exactly what
-    :class:`~dagnabbit.dag.canonical.CanonicalGraphs` holds, and exactly what a
+    ``trunk_types`` is ``[B, T]`` trunk class ids and ``parent_indices`` is
+    ``[B, N, S]`` parent node indices -- exactly what
+    :class:`~dagnabbit.dag.graphs.GraphBatch` holds, and exactly what a
     generator's straight-through argmax produces. Returns packed outputs
     ``[B, num_output_nodes, num_words]`` uint8, in output-slot order.
 
@@ -187,22 +187,22 @@ def evaluate_choices(
     so the sweep is launch-cheap and bandwidth-bound. Routing through per-graph
     Python objects instead cost ~0.5 ms per graph with the device idle throughout.
     """
-    if trunk_types.ndim != 2 or parent_positions.ndim != 3:
+    if trunk_types.ndim != 2 or parent_indices.ndim != 3:
         raise ValueError(
             f"expected [B, T] types and [B, N, S] positions; got "
-            f"{tuple(trunk_types.shape)} and {tuple(parent_positions.shape)}"
+            f"{tuple(trunk_types.shape)} and {tuple(parent_indices.shape)}"
         )
     device = root_values.device
     trunk_types = trunk_types.to(device)
-    parent_positions = parent_positions.to(device)
+    parent_indices = parent_indices.to(device)
 
     batch_size, num_trunk_nodes = trunk_types.shape
     num_root_nodes, num_words = root_values.shape
     output_start = num_root_nodes + num_trunk_nodes
     num_nodes = output_start + num_output_nodes
-    if parent_positions.shape[:2] != (batch_size, num_nodes):
+    if parent_indices.shape[:2] != (batch_size, num_nodes):
         raise ValueError(
-            f"parent_positions is {tuple(parent_positions.shape)}, expected "
+            f"parent_indices is {tuple(parent_indices.shape)}, expected "
             f"[{batch_size}, {num_nodes}, S]"
         )
     if len(gate_operators) < len(trunk_node_in_degrees):
@@ -211,9 +211,9 @@ def evaluate_choices(
             f"{len(trunk_node_in_degrees)} trunk node types"
         )
     max_in_degree = max(trunk_node_in_degrees)
-    if parent_positions.shape[2] < max_in_degree:
+    if parent_indices.shape[2] < max_in_degree:
         raise ValueError(
-            f"parent_positions has {parent_positions.shape[2]} slots, but the "
+            f"parent_indices has {parent_indices.shape[2]} slots, but the "
             f"widest trunk type needs {max_in_degree}"
         )
 
@@ -221,7 +221,7 @@ def evaluate_choices(
     # strictly earlier and never at an output. A garbage index would otherwise
     # silently alias a real node rather than raising.
     positions = torch.arange(num_nodes, device=device)
-    read_slots = parent_positions[:, num_root_nodes:, :max_in_degree]
+    read_slots = parent_indices[:, num_root_nodes:, :max_in_degree]
     if not bool(
         (
             (read_slots < positions[num_root_nodes:, None])
@@ -229,7 +229,7 @@ def evaluate_choices(
         ).all()
     ):
         raise ValueError(
-            "parent_positions contains an index at or after its consumer "
+            "parent_indices contains an index at or after its consumer "
             "(or pointing into the output block)"
         )
 
@@ -241,7 +241,7 @@ def evaluate_choices(
     outputs = []
     for start in range(0, batch_size, chunk):
         chunk_types = trunk_types[start : start + chunk]
-        chunk_positions = parent_positions[start : start + chunk]
+        chunk_positions = parent_indices[start : start + chunk]
         rows = chunk_types.shape[0]
 
         # Producer values only: outputs are leaves and are never gathered from.
@@ -277,15 +277,25 @@ def evaluate_choices(
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
 
-def evaluate_graphs(graphs, root_values: Tensor) -> Tensor:
-    """:func:`evaluate_choices` for a :class:`CanonicalGraphs` batch."""
+def evaluate_graphs(
+    graphs,
+    root_values: Tensor,
+    gate_operators: Sequence[GateOperator] = GATE_OPERATORS,
+) -> Tensor:
+    """:func:`evaluate_choices` for a :class:`GraphBatch`.
+
+    ``gate_operators`` is explicit only so tests and experiments can score a
+    geometry against a gate set other than the configured one; training always
+    takes the default.
+    """
     geometry = graphs.geometry
     return evaluate_choices(
         graphs.trunk_types,
-        graphs.parent_positions,
+        graphs.parent_indices,
         root_values,
         geometry.num_output_nodes,
         geometry.trunk_node_in_degrees,
+        gate_operators,
     )
 
 

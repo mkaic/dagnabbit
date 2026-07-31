@@ -1,131 +1,52 @@
 """Compiled random-graph generation.
 
-Generating graph batches is the training loop's inner loop, and it was its
-dominant cost: 70-90% of a stage-one step. Successive rewrites in Python took it
-from 443 to 190 us/graph, at which point ~70% of what remained was sequential
-interpreted work with no vectorized form -- two wiring passes, a longest-path
-sweep, and a heap-ordered Kahn sort. Those are what compiled code is good at, and
-numba gets the whole pipeline to ~11 us/graph.
+Generating graph batches used to be the training loop's dominant cost: 70-90% of
+a step. Successive rewrites in Python took it from 443 to 190 us/graph, at which
+point ~70% of what remained was sequential interpreted work with no vectorized
+form. That is what compiled code is good at, and numba gets the whole pipeline
+to roughly 10 us/graph.
 
 Everything is produced into batch-wide preallocated arrays:
 
-===========================  ==========================  ======================
-array                        shape                       meaning
-===========================  ==========================  ======================
-``node_types``               ``[B, N]``                  raw type index per node
-``in_degrees``               ``[B, N]``                  filled parent slots
+===========================  ============================  ======================
+array                        shape                         meaning
+===========================  ============================  ======================
+``node_types``               ``[B, N]``                    raw type index per node
+``in_degrees``               ``[B, N]``                    filled parent slots
 ``padded_parents``           ``[B, N, maximum_indegree]``  zero-padded parents
-``ranks``                    ``[B, N]``                  longest-path depth
-``canonical_order``          ``[B, N]``                  position -> node index
-===========================  ==========================  ======================
+``ranks``                    ``[B, N]``                    longest-path depth
+===========================  ============================  ======================
 
-:func:`~dagnabbit.dag.canonical.sample` reindexes those into canonical position
-space with a handful of vectorized gathers. Nothing here builds a per-graph
-Python object.
+Node index order *is* a valid topological order: roots occupy ``[0, R)``,
+outputs the final positions, and every non-root references only earlier indices.
+Nothing downstream needs more than that, so no separate ordering is computed.
+
+Duplicate parents
+-----------------
+A gate may draw the same producer into both slots. ``NAND(x, x) = NOT x``, so
+this is how inverters exist at all -- without it the sampler could not express
+one, while the hand-built reference adder is ~48% inverters. Coverage is
+unaffected: pass 1 places every producer into some consumer before pass 2 fills
+what is left, so the two concerns are independent and no node is ever dead.
 
 Why one call per batch
 ----------------------
 The compiled kernel is only worth having if the boundary is crossed rarely. Per
 graph, converting a ragged ``list[list[int]]`` in and out would cost several
-times the algorithm it replaces -- which is the trap an earlier attempt at this in
-another language fell into. One call per batch amortizes the boundary ~256x and
-returns flat arrays that ``torch.from_numpy`` wraps for free.
+times the algorithm it replaces -- which is the trap an earlier attempt at this
+in another language fell into. One call per batch amortizes the boundary ~256x
+and returns flat arrays that ``torch.from_numpy`` wraps for free.
 
-Fidelity to the Python implementation
--------------------------------------
-The kernels below reimplement the two derived overlays that
-:mod:`dagnabbit.dag.canonical` also computes in Python, so the risk is silent
-divergence. Two things pin them:
-
-* ``ranks`` and ``canonical_order`` must be **bit-identical** to
-  :func:`~dagnabbit.dag.canonical.ranks_from_lists` and
-  :func:`~dagnabbit.dag.canonical.canonical_order_from_lists` for the same
-  structure. The canonical order is load-bearing -- it defines the model's
-  sequence positions, and isomorphic graphs must produce identical sequences -- so
-  :func:`_ready_key_less` reproduces Python's tuple comparison exactly, including
-  that a shorter tuple which is a prefix of a longer one sorts first.
-* the sampled distribution must match statistically.
-
-Both are asserted in ``dagnabbit/dag/tests/test_generate.py``.
+Fidelity
+--------
+``ranks`` must stay bit-identical to
+:func:`~dagnabbit.dag.graphs.ranks_from_lists`, and the sampled distribution
+must match statistically. Both are asserted in
+``dagnabbit/dag/tests/test_graphs.py``.
 """
 
 import numpy as np
 from numba import njit
-
-# ---- canonical order: a heap of node indices under a lexicographic key ------
-#
-# numba has no heapq with a custom comparator, so the heap is written out over an
-# int64 array. The key is never materialized; it is compared field by field
-# straight out of the arrays, which is also why this is cheap.
-
-
-@njit(cache=True, inline="always")
-def _ready_key_less(left, right, positions, parents, degrees, node_types):
-    """Is ``left``'s ready key below ``right``'s?
-
-    The key is ``(parent canonical positions in slot order, node_type, index)``.
-    Parent positions are compared in *slot* order, not sorted, because input-slot
-    order is semantically meaningful.
-    """
-    left_degree = degrees[left]
-    right_degree = degrees[right]
-    shared = left_degree if left_degree < right_degree else right_degree
-    for slot in range(shared):
-        left_position = positions[parents[left, slot]]
-        right_position = positions[parents[right, slot]]
-        if left_position != right_position:
-            return left_position < right_position
-    # A prefix sorts before the longer tuple, matching Python.
-    if left_degree != right_degree:
-        return left_degree < right_degree
-    if node_types[left] != node_types[right]:
-        return node_types[left] < node_types[right]
-    return left < right
-
-
-@njit(cache=True)
-def _heap_push(heap, size, node, positions, parents, degrees, node_types):
-    heap[size] = node
-    child = size
-    while child > 0:
-        parent = (child - 1) // 2
-        if _ready_key_less(
-            heap[child], heap[parent], positions, parents, degrees, node_types
-        ):
-            heap[child], heap[parent] = heap[parent], heap[child]
-            child = parent
-        else:
-            break
-    return size + 1
-
-
-@njit(cache=True)
-def _heap_pop(heap, size, positions, parents, degrees, node_types):
-    top = heap[0]
-    size -= 1
-    heap[0] = heap[size]
-    parent = 0
-    while True:
-        left = 2 * parent + 1
-        if left >= size:
-            break
-        smallest = left
-        right = left + 1
-        if right < size and _ready_key_less(
-            heap[right], heap[left], positions, parents, degrees, node_types
-        ):
-            smallest = right
-        if _ready_key_less(
-            heap[smallest], heap[parent], positions, parents, degrees, node_types
-        ):
-            heap[parent], heap[smallest] = heap[smallest], heap[parent]
-            parent = smallest
-        else:
-            break
-    return top, size
-
-
-# ---- one graph --------------------------------------------------------------
 
 
 @njit(cache=True)
@@ -139,16 +60,9 @@ def _generate_one(
     in_degrees,
     parents,
     ranks,
-    order,
-    positions,
     filled,
     coverable,
     slot_of,
-    blocking,
-    children_start,
-    children_cursor,
-    children,
-    heap,
 ):
     """Fill one graph's row of every output array. Scratch arrays are reused."""
     num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
@@ -173,6 +87,10 @@ def _generate_one(
         filled[node] = 0
 
     # --- pass 1: coverage, producers latest-first ---
+    #
+    # This is what guarantees no dead nodes, and it runs to completion before
+    # pass 2 draws anything, which is why allowing duplicates below cannot
+    # orphan a producer.
     #
     # ``coverable`` holds exactly the consumers eligible for the producer being
     # processed: strictly later than it, and still holding an open slot. Walking
@@ -205,23 +123,12 @@ def _generate_one(
 
     # --- pass 2: fill every remaining slot from a strictly-earlier producer ---
     #
-    # Rejection-sample rather than materialize the filtered pool: at most
-    # in_degree - 1 values are excluded from a range at least num_root_nodes
-    # wide, so a draw is accepted on the first try in almost every case.
+    # Drawn uniformly with no rejection: a repeat of a slot already filled is a
+    # legal gate, not a collision to resample away. See the module docstring.
     for consumer in range(num_root_nodes, num_nodes):
         limit = consumer if consumer < output_start else output_start
         while filled[consumer] < in_degrees[consumer]:
-            chosen = np.random.randint(0, limit)
-            duplicate = True
-            while duplicate:
-                duplicate = False
-                for slot in range(filled[consumer]):
-                    if parents[consumer, slot] == chosen:
-                        duplicate = True
-                        break
-                if duplicate:
-                    chosen = np.random.randint(0, limit)
-            parents[consumer, filled[consumer]] = chosen
+            parents[consumer, filled[consumer]] = np.random.randint(0, limit)
             filled[consumer] += 1
 
     # --- erase the slot-position artifact the two passes leave behind ---
@@ -243,60 +150,6 @@ def _generate_one(
                 deepest = parent_rank
         ranks[node] = deepest + 1
 
-    # --- canonical order: Kahn's algorithm with the lexicographic tie-break ---
-    for node in range(num_nodes):
-        positions[node] = -1
-    for root in range(num_root_nodes):
-        positions[root] = root
-        order[root] = root
-
-    # Child lists in CSR form: count into the offsets, prefix-sum, then fill.
-    for node in range(output_start + 2):
-        children_start[node] = 0
-    for node in range(num_root_nodes, output_start):
-        blocking[node] = 0
-        for slot in range(in_degrees[node]):
-            parent = parents[node, slot]
-            if parent >= num_root_nodes:
-                blocking[node] += 1
-                children_start[parent + 1] += 1
-    for node in range(output_start):
-        children_start[node + 1] += children_start[node]
-    for node in range(output_start + 1):
-        children_cursor[node] = children_start[node]
-    for node in range(num_root_nodes, output_start):
-        for slot in range(in_degrees[node]):
-            parent = parents[node, slot]
-            if parent >= num_root_nodes:
-                children[children_cursor[parent]] = node
-                children_cursor[parent] += 1
-
-    size = 0
-    for node in range(num_root_nodes, output_start):
-        if blocking[node] == 0:
-            size = _heap_push(
-                heap, size, node, positions, parents, in_degrees, node_types
-            )
-
-    placed = num_root_nodes
-    while size > 0:
-        node, size = _heap_pop(heap, size, positions, parents, in_degrees, node_types)
-        positions[node] = placed
-        order[placed] = node
-        placed += 1
-        for index in range(children_start[node], children_start[node + 1]):
-            child = children[index]
-            blocking[child] -= 1
-            if blocking[child] == 0:
-                size = _heap_push(
-                    heap, size, child, positions, parents, in_degrees, node_types
-                )
-
-    # Outputs are leaves and pinned to the final positions in slot order.
-    for node in range(output_start, num_nodes):
-        positions[node] = node
-        order[node] = node
-
 
 @njit(cache=True)
 def generate_arrays(
@@ -312,24 +165,16 @@ def generate_arrays(
     """``count`` graphs into batch-wide arrays. The only compiled entry point."""
     np.random.seed(seed)
     num_nodes = num_root_nodes + num_trunk_nodes + num_output_nodes
-    output_start = num_root_nodes + num_trunk_nodes
 
     node_types = np.zeros((count, num_nodes), dtype=np.int64)
     in_degrees = np.zeros((count, num_nodes), dtype=np.int64)
     padded_parents = np.zeros((count, num_nodes, maximum_indegree), dtype=np.int64)
     ranks = np.zeros((count, num_nodes), dtype=np.int64)
-    order = np.zeros((count, num_nodes), dtype=np.int64)
-    positions = np.zeros((count, num_nodes), dtype=np.int64)
 
     # Scratch, reused across graphs: allocating per graph would show up.
     filled = np.zeros(num_nodes, dtype=np.int64)
     coverable = np.zeros(num_nodes, dtype=np.int64)
     slot_of = np.full(num_nodes, -1, dtype=np.int64)
-    blocking = np.zeros(output_start + 1, dtype=np.int64)
-    children_start = np.zeros(output_start + 2, dtype=np.int64)
-    children_cursor = np.zeros(output_start + 1, dtype=np.int64)
-    children = np.zeros(num_nodes * maximum_indegree, dtype=np.int64)
-    heap = np.zeros(num_nodes + 1, dtype=np.int64)
 
     for index in range(count):
         _generate_one(
@@ -342,18 +187,11 @@ def generate_arrays(
             in_degrees[index],
             padded_parents[index],
             ranks[index],
-            order[index],
-            positions[index],
             filled,
             coverable,
             slot_of,
-            blocking,
-            children_start,
-            children_cursor,
-            children,
-            heap,
         )
-    return node_types, in_degrees, padded_parents, ranks, order
+    return node_types, in_degrees, padded_parents, ranks
 
 
 def check_geometry(
@@ -365,23 +203,16 @@ def check_geometry(
 ) -> None:
     """The preconditions the sampler relies on, checked once per batch.
 
-    These used to live inside the per-graph function. They depend only on the
-    geometry, so checking them per graph was pure waste -- but they must still be
-    checked, because the compiled sampler would otherwise fail obscurely (an
-    infeasible coverage pass draws from an empty pool).
+    These depend only on the geometry, so checking them per graph would be pure
+    waste -- but they must still be checked, because the compiled sampler would
+    otherwise fail obscurely (an infeasible coverage pass draws from an empty
+    pool, and njit does no bounds checking).
     """
     assert len(trunk_node_in_degrees) == num_trunk_node_types
     assert all(in_degree >= 1 for in_degree in trunk_node_in_degrees)
     assert num_root_nodes >= 1
     assert num_output_nodes >= 1
     assert num_trunk_node_types >= 1
-    if num_trunk_nodes > 0:
-        # The earliest trunk can draw distinct inputs only from the roots, so
-        # there must be at least max-in-degree of them.
-        assert num_root_nodes >= max(trunk_node_in_degrees), (
-            "num_root_nodes must be >= the largest trunk in-degree so every "
-            "gate can be given distinct inputs"
-        )
 
     # Coverage feasibility: with every trunk at the smallest possible in-degree,
     # the downstream input slots must still outnumber the producers enough to

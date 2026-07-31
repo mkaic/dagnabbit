@@ -23,7 +23,7 @@ encoding of a real graph by construction.
 
 Position identity
 -----------------
-One shared table indexes canonical positions, read through a different learned
+One shared table indexes node indices, read through a different learned
 projection depending on the role the position is playing (mine, slot-0 parent,
 slot-1 parent). Sharing it is what makes "find my parent's token" a dot product:
 position 37 has the same underlying identity whether it appears as a node's own
@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from dagnabbit.dag.canonical import CanonicalGraphs, Geometry
+from dagnabbit.dag.graphs import GraphBatch, Geometry
 
 
 @dataclass(frozen=True)
@@ -197,7 +197,7 @@ class NodeTokens(nn.Module):
     def forward(
         self,
         node_types: Tensor,
-        parent_positions: Tensor,
+        parent_indices: Tensor,
         parent_slot_mask: Tensor,
     ) -> Tensor:
         """``[B, N] , [B, N, S], [B, N, S] -> [B, N, D]``."""
@@ -205,7 +205,7 @@ class NodeTokens(nn.Module):
         tokens = self.type_embeddings(node_types) + self.self_projection(positions)
 
         for slot, projection in enumerate(self.parent_projections):
-            gathered = positions[parent_positions[..., slot]]
+            gathered = positions[parent_indices[..., slot]]
             contribution = torch.where(
                 parent_slot_mask[..., slot].unsqueeze(-1),
                 projection(gathered),
@@ -219,7 +219,7 @@ class NodeTokens(nn.Module):
 class Simulator(nn.Module):
     """Stack of unmasked self-attention blocks over the node sequence.
 
-    Returns ``[B, N + R, D]``: the ``N`` node positions in canonical order,
+    Returns ``[B, N + R, D]``: the ``N`` node positions in node index order,
     followed by the ``R`` register tokens. The registers are deliberately left
     in rather than sliced off, because the only consumer is the patch decoder's
     cross-attention and global circuit state is exactly what a truth-table query
@@ -334,19 +334,19 @@ class GraphSimulator(nn.Module):
     def forward(
         self,
         node_types: Tensor,
-        parent_positions: Tensor,
+        parent_indices: Tensor,
         parent_slot_mask: Tensor,
         patch_indices: Tensor | None = None,
     ) -> Tensor:
-        tokens = self.node_tokens(node_types, parent_positions, parent_slot_mask)
+        tokens = self.node_tokens(node_types, parent_indices, parent_slot_mask)
         return self.decoder(self.simulator(tokens), patch_indices)
 
     def forward_graphs(
-        self, graphs: CanonicalGraphs, patch_indices: Tensor | None = None
+        self, graphs: GraphBatch, patch_indices: Tensor | None = None
     ) -> Tensor:
         return self(
             graphs.node_types,
-            graphs.parent_positions,
+            graphs.parent_indices,
             graphs.parent_slot_mask,
             patch_indices,
         )

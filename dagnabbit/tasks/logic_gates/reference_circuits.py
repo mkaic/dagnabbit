@@ -1,21 +1,24 @@
 """Hand-built circuits with known behaviour, for testing and as search targets.
 
-These are constructed as ragged parent lists and canonicalized on the way out,
+These are constructed as ragged parent lists and wrapped on the way out,
 so their semantics are known independently of anything the model or the
-evaluator does. :func:`nand_ripple_carry_adder` in particular is a
-ground-truth optimum for the adder task: any search that works should be able
-to reach a fitness of 1.0, because a circuit achieving it demonstrably exists
-inside the graph budget.
+evaluator does. :func:`nand_ripple_carry_adder` and
+:func:`mixed_ripple_carry_adder` are both ground-truth optima for the adder
+task: any search that works should be able to reach a fitness of 1.0, because
+circuits achieving it demonstrably exist inside the graph budget. They compute
+the same function from different vocabularies -- all-NAND versus NAND plus XOR
+-- and are padded to comparable depth, so probing a trained model on both
+separates gate vocabulary from depth and structure.
 
 Padding
 -------
-The model's geometry fixes the trunk node count (128 by default) while the
-adder core needs only 67 gates. The spare capacity is spent on **identity
+The model's geometry fixes the trunk node count (128 by default) while an
+adder core needs only 67 gates (36 with XOR). The spare capacity is spent on **identity
 buffers** rather than dead gates, which matters whenever the circuit is used to
 probe a trained model: the sampler's coverage pass guarantees every trunk node
 has at least one child, so a circuit padded with
 dead gates is off-distribution in a way that has nothing to do with what it
-computes, and its padding gates are structural twins that the canonical
+computes, and its padding gates are structural twins that the node-index
 ordering cannot distinguish.
 
 A buffer is transparent because ``NAND(x, x) = NOT x``, so an inverter feeding
@@ -31,16 +34,17 @@ topologically sorted at the end.
 
 from dataclasses import dataclass, field
 
-from dagnabbit.dag.canonical import CanonicalGraphs, Geometry, from_lists
+from dagnabbit.dag.graphs import GraphBatch, Geometry, from_lists
 
 NAND_TYPE = 0
+XOR_TYPE = 1
 
 
 @dataclass
 class AdderAnnotations:
     """Which gate does what, for rendering and for reading the circuit.
 
-    Every index here is a *node storage index*, not a canonical position. The
+    Every index here is a *node storage index*, not a node index. The
     two coincide only for roots and outputs, whose positions are pinned.
     """
 
@@ -75,14 +79,18 @@ class _SymbolicCircuit:
         self.parents: dict[int, list[int]] = {}
         self.role: dict[int, str] = {}
         self.bit: dict[int, int] = {}
+        self.kind: dict[int, int] = {}
         self._next_id = num_root_nodes
 
-    def gate(self, left: int, right: int, role: str, bit: int) -> int:
+    def gate(
+        self, left: int, right: int, role: str, bit: int, kind: int = NAND_TYPE
+    ) -> int:
         gate_id = self._next_id
         self._next_id += 1
         self.parents[gate_id] = [left, right]
         self.role[gate_id] = role
         self.bit[gate_id] = bit
+        self.kind[gate_id] = kind
         return gate_id
 
     def is_root(self, node: int) -> bool:
@@ -140,12 +148,13 @@ def _insert_buffer(
     return 1 + len(consumers)
 
 
-def build_nand_ripple_carry_adder(
+def build_ripple_carry_adder(
     num_root_nodes: int = 16,
     num_trunk_nodes: int = 128,
     num_output_nodes: int = 8,
-    num_trunk_node_types: int = 2,
-) -> tuple[CanonicalGraphs, AdderAnnotations]:
+    num_trunk_node_types: int = 3,
+    use_xor: bool = False,
+) -> tuple[GraphBatch, AdderAnnotations]:
     """An 8-bit ripple-carry adder, padded to the trunk budget with buffers.
 
     Scores exactly 1.0 on :func:`~dagnabbit.tasks.logic_gates.evaluate.adder_task`
@@ -157,10 +166,22 @@ def build_nand_ripple_carry_adder(
     ``a_k`` is root ``7 - k``, ``b_k`` is root ``15 - k``, and the sum bit goes
     to output ``7 - k``.
 
-    Each stage is the standard 9-NAND full adder; the least significant bit
-    needs no carry-in and uses a 5-NAND half adder, and the most significant
-    bit omits its carry-out, which ``(a + b) mod 256`` discards -- that gate
-    would otherwise be the circuit's only childless node.
+    ``use_xor`` picks the vocabulary. False builds the standard 9-NAND full
+    adder (5-NAND half adder at the LSB) -- 67 core gates. True spends an XOR
+    gate where the NAND version spends four, since ``sum = a XOR b XOR cin``
+    is two XORs and the carry stays three NANDs -- 36 core gates.
+
+    Fewer core gates means *more* padding at a fixed trunk budget, so the two
+    land at comparable depth (29 and 28) rather than the XOR version being
+    shallower. That is what makes them a controlled pair.
+
+    Both compute the same function and both score exactly 1.0. Keeping the pair
+    is the point: probing a trained simulator on each separates "this circuit is
+    deep and structured" from "this circuit uses gates the training distribution
+    rarely puts on that path".
+
+    Either way the most significant bit omits its carry-out, which
+    ``(a + b) mod 256`` discards -- that gate would otherwise be childless.
     """
     if num_root_nodes % 2 != 0:
         raise ValueError("an adder needs an even number of input bits")
@@ -184,14 +205,18 @@ def build_nand_ripple_carry_adder(
         annotations.root_of_input[("b", bit)] = b
         is_last = bit == width - 1
 
-        # Half adder: xor_ab = a XOR b, and n1 = NOT (a AND b).
+        # n1 = NOT (a AND b) either way; it is the carry-generate term.
         n1 = circuit.gate(a, b, "¬(a∧b)", bit)
-        xor_ab = circuit.gate(
-            circuit.gate(a, n1, "a·¬(a∧b)", bit),
-            circuit.gate(b, n1, "b·¬(a∧b)", bit),
-            "a⊕b",
-            bit,
-        )
+        if use_xor:
+            xor_ab = circuit.gate(a, b, "a⊕b", bit, XOR_TYPE)
+        else:
+            # a XOR b from NANDs alone costs three more gates.
+            xor_ab = circuit.gate(
+                circuit.gate(a, n1, "a·¬(a∧b)", bit),
+                circuit.gate(b, n1, "b·¬(a∧b)", bit),
+                "a⊕b",
+                bit,
+            )
 
         if carry is None:
             sum_bits[bit] = xor_ab
@@ -200,18 +225,28 @@ def build_nand_ripple_carry_adder(
                 carry = circuit.gate(n1, n1, "carry out = a∧b", bit)
         else:
             n4 = circuit.gate(xor_ab, carry, "¬((a⊕b)∧cin)", bit)
-            sum_bits[bit] = circuit.gate(
-                circuit.gate(xor_ab, n4, "(a⊕b)·¬(…)", bit),
-                circuit.gate(carry, n4, "cin·¬(…)", bit),
-                "sum = a⊕b⊕cin",
-                bit,
-            )
+            if use_xor:
+                sum_bits[bit] = circuit.gate(
+                    xor_ab, carry, "sum = a⊕b⊕cin", bit, XOR_TYPE
+                )
+            else:
+                sum_bits[bit] = circuit.gate(
+                    circuit.gate(xor_ab, n4, "(a⊕b)·¬(…)", bit),
+                    circuit.gate(carry, n4, "cin·¬(…)", bit),
+                    "sum = a⊕b⊕cin",
+                    bit,
+                )
             if not is_last:
                 # NAND(n1, n4) == (a AND b) OR (xor_ab AND carry): the carry-out.
                 carry = circuit.gate(n1, n4, "carry out", bit)
 
         if not is_last:
             carry_bits[bit] = carry
+        elif use_xor:
+            # The final stage needs no carry-out, so its generate term would be
+            # childless. n4 is not built either; drop n1 rather than pad it.
+            del circuit.parents[n1], circuit.role[n1], circuit.bit[n1]
+            del circuit.kind[n1]
 
     annotations.core_gates = len(circuit.parents)
     output_sources = [sum_bits[(width - 1) - slot] for slot in range(num_output_nodes)]
@@ -237,7 +272,7 @@ def build_nand_bitwise_xor(
     num_trunk_nodes: int = 128,
     num_output_nodes: int = 8,
     num_trunk_node_types: int = 2,
-) -> tuple[CanonicalGraphs, AdderAnnotations]:
+) -> tuple[GraphBatch, AdderAnnotations]:
     """Bitwise ``a XOR b``: the same inputs and outputs, no long-range structure.
 
     Deliberately the adder's opposite. Output j depends on exactly two input
@@ -291,6 +326,29 @@ def build_nand_bitwise_xor(
     return graph, annotations
 
 
+def _descendant_counts(circuit: _SymbolicCircuit) -> dict[int, int]:
+    """How many gates sit downstream of each gate, itself excluded.
+
+    Walked in reverse topological order, so a gate's count is known by the time
+    any of its parents is reached. Used to steer padding toward wires whose
+    lengthening cannot cascade.
+    """
+    children: dict[int, list[int]] = {gate: [] for gate in circuit.parents}
+    for gate, parents in circuit.parents.items():
+        for parent in parents:
+            if not circuit.is_root(parent):
+                children[parent].append(gate)
+
+    reachable: dict[int, set[int]] = {}
+    for gate in reversed(circuit.topological_order()):
+        downstream: set[int] = set()
+        for child in children[gate]:
+            downstream.add(child)
+            downstream.update(reachable[child])
+        reachable[gate] = downstream
+    return {gate: len(downstream) for gate, downstream in reachable.items()}
+
+
 def _pad_and_emit(
     circuit: _SymbolicCircuit,
     annotations: AdderAnnotations,
@@ -299,7 +357,7 @@ def _pad_and_emit(
     num_trunk_nodes: int,
     num_output_nodes: int,
     num_trunk_node_types: int,
-) -> tuple[CanonicalGraphs, dict[int, int]]:
+) -> tuple[GraphBatch, dict[int, int]]:
     """Pad a core circuit to the trunk budget with buffers, then emit it.
 
     Returns the description and the symbolic-id -> final-index map, which the
@@ -317,34 +375,44 @@ def _pad_and_emit(
             "cheapest buffer costs two gates"
         )
 
-    # Interleave candidate wires across bit positions. Walking gates in id
-    # order would spend the whole budget on the first few stages, leaving the
-    # circuit lopsided -- deep and buffer-heavy at the LSB, bare at the MSB.
-    gates_by_bit: dict[int, list[int]] = {}
-    for gate in sorted(circuit.parents):
-        if circuit.consumers_of(gate):
-            gates_by_bit.setdefault(circuit.bit[gate], []).append(gate)
-    buffer_sources = [
-        gates_by_bit[bit][depth]
-        for depth in range(max(len(gates) for gates in gates_by_bit.values()))
-        for bit in sorted(gates_by_bit)
-        if depth < len(gates_by_bit[bit])
-    ]
-    source_index = 0
-    while spare > 0:
-        source = buffer_sources[source_index % len(buffer_sources)]
-        source_index += 1
-        consumers = circuit.consumers_of(source)
-        if not consumers:
-            continue
-        # Cost is 1 + len(rerouted). Leaving exactly one gate over would be
-        # unspendable, so never take a step that lands there.
-        take = min(len(consumers), max(1, spare - 1))
-        if spare - (1 + take) == 1:
-            take -= 1
-            if take < 1:
-                continue
-        spare -= _insert_buffer(circuit, source, consumers[:take])
+    # Spend the budget on the *output* wires, round-robin.
+    #
+    # Every spare gate must lie on some path to an output -- nothing may be dead
+    # -- so padding always lengthens some path; the only question is which.
+    # Buffering an internal wire adds 2 to the depth of everything downstream,
+    # so spending on a shared wire like the carry chain multiplies across bits.
+    # An earlier version walked internal wires and did exactly that, taking the
+    # NAND+XOR adder to depth 46. An output wire feeds exactly one bit and
+    # nothing else, so an insertion there costs 2 gates for 2 levels on one path
+    # and cannot cascade. Round-robin over the outputs then spreads the budget
+    # evenly, which is the ``core_depth + spare / num_outputs`` lower bound.
+    #
+    # Odd budgets need one shared-inverter insertion first (cost 1 + k for k
+    # rerouted consumers): a pure chain of self-NAND pairs can only ever spend
+    # an even number, since an odd chain inverts.
+    if spare % 2 == 1:
+        for source in sorted(circuit.parents, key=_descendant_counts(circuit).get):
+            consumers = circuit.consumers_of(source)
+            if len(consumers) >= 2:
+                spare -= _insert_buffer(circuit, source, consumers[:2])
+                break
+        else:
+            raise ValueError(
+                "an odd spare budget needs some wire with two consumers to "
+                "absorb the odd gate"
+            )
+
+    slot = 0
+    while spare >= 2:
+        index = slot % num_output_nodes
+        source = output_sources[index]
+        bit = circuit.bit.get(source, 0)
+        inverter = circuit.gate(source, source, "buffer (invert)", bit)
+        output_sources[index] = circuit.gate(
+            inverter, inverter, "buffer (restore)", bit
+        )
+        spare -= 2
+        slot += 1
 
     annotations.buffer_gates = len(circuit.parents) - annotations.core_gates
 
@@ -364,7 +432,7 @@ def _pad_and_emit(
     node_inputs_indices: list[list[int]] = [[] for _ in range(num_root_nodes)]
     for gate_id in order:
         node_inputs_indices.append([resolve(p) for p in circuit.parents[gate_id]])
-        node_types.append(NAND_TYPE)
+        node_types.append(circuit.kind[gate_id])
         index = final_index[gate_id]
         annotations.bit_of_node[index] = circuit.bit[gate_id]
         annotations.role_of_node[index] = circuit.role[gate_id]
@@ -388,14 +456,26 @@ def _pad_and_emit(
     return from_lists(node_inputs_indices, node_types, geometry), final_index
 
 
-def nand_ripple_carry_adder(geometry: Geometry) -> CanonicalGraphs:
+def ripple_carry_adder(geometry: Geometry, use_xor: bool = False) -> GraphBatch:
     """The adder circuit alone, as a batch of one.
 
-    See :func:`build_nand_ripple_carry_adder` for the construction.
+    See :func:`build_ripple_carry_adder` for the construction and for why both
+    vocabularies are kept.
     """
-    return build_nand_ripple_carry_adder(
+    return build_ripple_carry_adder(
         num_root_nodes=geometry.num_root_nodes,
         num_trunk_nodes=geometry.num_trunk_nodes,
         num_output_nodes=geometry.num_output_nodes,
         num_trunk_node_types=geometry.num_trunk_node_types,
+        use_xor=use_xor,
     )[0]
+
+
+def nand_ripple_carry_adder(geometry: Geometry) -> GraphBatch:
+    """The all-NAND adder: 67 core gates, output depths up to 23."""
+    return ripple_carry_adder(geometry, use_xor=False)
+
+
+def mixed_ripple_carry_adder(geometry: Geometry) -> GraphBatch:
+    """The NAND+XOR adder: 35 core gates, and much shallower."""
+    return ripple_carry_adder(geometry, use_xor=True)

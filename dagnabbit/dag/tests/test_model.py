@@ -18,7 +18,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from dagnabbit.dag.canonical import Geometry, sample
+from dagnabbit.dag.graphs import Geometry, sample
 from dagnabbit.dag.model import (
     GraphSimulator,
     NodeTokens,
@@ -32,7 +32,7 @@ from dagnabbit.tasks.logic_gates.evaluate import (
     unpack_bits,
 )
 
-GEOMETRY = Geometry(8, 24, 4, 2, (2, 2))
+GEOMETRY = Geometry(8, 24, 4, 1, (2,))
 CONFIG = SimulatorConfig(
     embedding_dim=64,
     attention_head_dim=32,
@@ -103,13 +103,13 @@ def test_node_tokens_ignore_padded_slot_values(graphs):
     torch.manual_seed(0)
     tokens = NodeTokens(GEOMETRY, CONFIG)
     reference = tokens(
-        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+        graphs.node_types, graphs.parent_indices, graphs.parent_slot_mask
     )
 
-    scrambled = graphs.parent_positions.clone()
+    scrambled = graphs.parent_indices.clone()
     # Outputs are in-degree 1, so slot 1 is padding everywhere in that block.
     scrambled[:, GEOMETRY.output_start :, 1] = GEOMETRY.num_nodes - 1
-    assert not torch.equal(scrambled, graphs.parent_positions)
+    assert not torch.equal(scrambled, graphs.parent_indices)
 
     perturbed = tokens(graphs.node_types, scrambled, graphs.parent_slot_mask)
     assert torch.equal(reference, perturbed)
@@ -120,16 +120,18 @@ def test_node_tokens_depend_on_every_input(graphs):
     torch.manual_seed(0)
     tokens = NodeTokens(GEOMETRY, CONFIG)
     reference = tokens(
-        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+        graphs.node_types, graphs.parent_indices, graphs.parent_slot_mask
     )
     node = GEOMETRY.num_root_nodes + 3
 
     types = graphs.node_types.clone()
-    types[:, node] = 1 - types[:, node]
-    moved = tokens(types, graphs.parent_positions, graphs.parent_slot_mask)
+    # Any other valid entry in the type table; with one trunk type the output
+    # class is the nearest distinct one.
+    types[:, node] = GEOMETRY.output_type
+    moved = tokens(types, graphs.parent_indices, graphs.parent_slot_mask)
     assert not torch.allclose(reference[:, node], moved[:, node])
 
-    positions = graphs.parent_positions.clone()
+    positions = graphs.parent_indices.clone()
     positions[:, node, 0] = (positions[:, node, 0] + 1) % GEOMETRY.num_root_nodes
     moved = tokens(graphs.node_types, positions, graphs.parent_slot_mask)
     assert not torch.allclose(reference[:, node], moved[:, node])
@@ -187,7 +189,7 @@ def test_registers_extend_the_sequence_without_changing_the_output_shape(graphs)
     model.eval()
 
     tokens = model.node_tokens(
-        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+        graphs.node_types, graphs.parent_indices, graphs.parent_slot_mask
     )
     sequence = model.simulator(tokens)
     assert sequence.shape == (len(graphs), GEOMETRY.num_nodes + 5, CONFIG.embedding_dim)
@@ -209,7 +211,7 @@ def test_zero_registers_allocates_nothing(graphs):
     assert not any("register" in name for name, _ in model.named_parameters())
 
     tokens = model.node_tokens(
-        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+        graphs.node_types, graphs.parent_indices, graphs.parent_slot_mask
     )
     assert model.simulator(tokens).shape[1] == GEOMETRY.num_nodes
 
@@ -233,7 +235,7 @@ def test_registers_are_trained_and_shared_across_the_batch(graphs):
     # entering the stack must be identical for every row.
     model.eval()
     tokens = model.node_tokens(
-        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+        graphs.node_types, graphs.parent_indices, graphs.parent_slot_mask
     )
     stacked = torch.cat(
         [tokens, model.simulator.register_tokens.expand(len(graphs), -1, -1)], dim=1

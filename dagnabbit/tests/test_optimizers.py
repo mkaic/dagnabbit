@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dagnabbit.dag.canonical import Geometry, sample
+from dagnabbit.dag.graphs import Geometry, sample
 from dagnabbit.dag.model import (
     GraphSimulator,
     SimulatorConfig,
@@ -23,7 +23,7 @@ from dagnabbit.dag.model import (
 from dagnabbit.optimizers import AutoMuon, build_optimizer
 from dagnabbit.tasks.logic_gates.evaluate import evaluate_graphs, exhaustive_root_values
 
-GEOMETRY = Geometry(8, 24, 4, 2, (2, 2))
+GEOMETRY = Geometry(8, 24, 4, 1, (2,))
 MODEL_CONFIG = SimulatorConfig(
     embedding_dim=64,
     attention_head_dim=32,
