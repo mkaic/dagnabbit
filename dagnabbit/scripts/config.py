@@ -31,10 +31,10 @@ GEOMETRY = Geometry(
 # attended sequence by that much. Worth trying if the simulator looks like it is
 # spending node tokens on bookkeeping rather than on that node's value.
 MODEL = SimulatorConfig(
-    embedding_dim=256,
+    embedding_dim=384,
     attention_head_dim=64,
     mlp_expansion_factor=4.0,
-    num_simulator_layers=16,
+    num_simulator_layers=24,
     num_register_tokens=16,
     num_decoder_layers=2,
     num_patches=256,
@@ -43,7 +43,7 @@ MODEL = SimulatorConfig(
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRAPH_BATCH_SIZE = 768
+GRAPH_BATCH_SIZE = 256
 # Patches scored per step, out of MODEL.num_patches. The full table is 524288
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
