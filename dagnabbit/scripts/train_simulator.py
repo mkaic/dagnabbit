@@ -243,7 +243,11 @@ def format_rank_ladder(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", default=None, help="run directory name")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="label appended to the run directory's timestamp prefix",
+    )
     parser.add_argument("--steps", type=int, default=cfg.NUM_STEPS)
     parser.add_argument("--device", default=cfg.DEVICE)
     parser.add_argument("--no-compile", action="store_true")
@@ -251,7 +255,13 @@ def main() -> None:
 
     torch.manual_seed(cfg.SEED)
     device = torch.device(args.device)
-    run_name = args.name or time.strftime("%Y%m%d-%H%M%S")
+    # Timestamp first, always: the run directories are read in a file browser
+    # and in ``ls``, where lexical order is the only order on offer. ``--name``
+    # is a suffix rather than the whole name, because a bare name sorts
+    # alphabetically and buries the newest run in the middle of the list.
+    run_name = time.strftime("%Y%m%d-%H%M%S")
+    if args.name:
+        run_name = f"{run_name}-{args.name}"
     run_directory = Path(cfg.LOG_DIR) / run_name
     run_directory.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(run_directory))
