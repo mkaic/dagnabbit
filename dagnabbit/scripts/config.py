@@ -26,10 +26,10 @@ GEOMETRY = Geometry(
 # bound is binding and this is the number to raise; if it degrades smoothly
 # past it, the model found something cheaper than message passing.
 MODEL = SimulatorConfig(
-    embedding_dim=128,
-    attention_head_dim=32,
+    embedding_dim=256,
+    attention_head_dim=64,
     mlp_expansion_factor=4.0,
-    num_simulator_layers=16,
+    num_simulator_layers=24,
     num_decoder_layers=2,
     num_patches=256,
     dropout=0.0,
@@ -46,7 +46,7 @@ PATCHES_PER_STEP = 32
 
 LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 1
-GRADIENT_CLIP_MAX_NORM = 1.0
+GRADIENT_CLIP_MAX_NORM = None
 LR_WARMUP_OPTIMIZER_STEPS = 200
 
 # AutoMuon runs torch.optim.Muon on the transformer blocks' attention/MLP weight
@@ -87,8 +87,8 @@ LOG_EVERY = 10
 # with bit accuracy bucketed by each output node's longest-path rank. This is
 # the Phase 0 gate -- average accuracy can look fine while deep outputs sit at
 # chance, and that gap is what says whether the simulator is simulating.
-EVAL_EVERY = 500
-EVAL_BATCH_SIZE = 256
+EVAL_EVERY = 100
+EVAL_BATCH_SIZE = 64
 # Patches per eval graph. Higher than training since there is no backward pass.
 EVAL_PATCHES = 64
 CHECKPOINT_EVERY = 5000
