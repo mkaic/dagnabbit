@@ -55,12 +55,16 @@ from dagnabbit.tasks.logic_gates.evaluate import (
     evaluate_graphs,
     exhaustive_root_values,
 )
+from dagnabbit.tasks.logic_gates.reference_circuits import (
+    mixed_ripple_carry_adder,
+    nand_ripple_carry_adder,
+)
 
 
 def make_batch(batch_size: int, root_values: torch.Tensor, device: torch.device):
     """Fresh graphs plus their exact packed truth tables."""
     graphs = sample_graphs(batch_size, cfg.GEOMETRY, device, sampling=cfg.SAMPLING)
-    return graphs, evaluate_graphs(graphs, root_values)
+    return graphs, evaluate_graphs(graphs, root_values, cfg.GATES.operators)
 
 
 def loss_and_accuracy(
@@ -139,6 +143,29 @@ def evaluate(
     )
 
 
+# Each reference circuit is written in a particular vocabulary, so a configured
+# gate set that lacks one of its gates cannot build it at all. The requirement
+# is declared here rather than discovered by catching the builder's error: a
+# probe is a side observation, and a gate set chosen for the *training*
+# distribution should not abort the run because a probe happens to be
+# unbuildable. Catching the exception instead would also swallow a genuinely
+# mis-wired reference, which is exactly what the fitness assertion below exists
+# to catch.
+REFERENCE_PROBES: tuple[tuple[str, object, tuple[str, ...]], ...] = (
+    ("nand", nand_ripple_carry_adder, ("NAND",)),
+    ("mixed", mixed_ripple_carry_adder, ("NAND", "XOR")),
+)
+
+
+def available_probes(gates) -> list[tuple[str, object]]:
+    """The reference circuits ``gates`` can express, in declaration order."""
+    return [
+        (name, build)
+        for name, build, required in REFERENCE_PROBES
+        if all(gate in gates.names for gate in required)
+    ]
+
+
 @torch.no_grad()
 def probe_references(
     model: GraphSimulator, rows_per_patch: int, device: torch.device
@@ -155,21 +182,16 @@ def probe_references(
     MCC matters more here than on random graphs: every bit of ``a + b`` is
     balanced almost exactly 50/50 over the full table, so bit accuracy has a
     hard floor near 0.5 that says nothing, while MCC starts at 0.
-    """
-    from dagnabbit.tasks.logic_gates.reference_circuits import (
-        mixed_ripple_carry_adder,
-        nand_ripple_carry_adder,
-    )
 
+    Only the probes ``cfg.GATES`` can express are run -- see
+    :func:`available_probes`. With the default gate set that is both of them.
+    """
     task = adder_task(device)
     patch_indices = torch.arange(cfg.MODEL.num_patches, device=device)
     results: dict[str, tuple[float, float]] = {}
 
-    for name, build in (
-        ("nand", nand_ripple_carry_adder),
-        ("mixed", mixed_ripple_carry_adder),
-    ):
-        graphs = build(cfg.GEOMETRY).to(device)
+    for name, build in available_probes(cfg.GATES):
+        graphs = build(cfg.GEOMETRY, cfg.GATES).to(device)
         with torch.autocast(
             device_type=device.type, dtype=cfg.AMP_DTYPE, enabled=cfg.AMP_ENABLED
         ):
@@ -178,7 +200,7 @@ def probe_references(
         # The circuit really computes the adder, so the task's targets are its
         # truth table; this checks the *prediction* against it. Sanity-check the
         # premise too, since a mis-wired reference would make this meaningless.
-        packed = evaluate_graphs(graphs, task.root_values)
+        packed = evaluate_graphs(graphs, task.root_values, cfg.GATES.operators)
         exact, _ = bit_accuracy(packed, task)
         assert float(exact[0]) == 1.0, f"the {name} reference is not an adder"
 
@@ -236,6 +258,17 @@ def main() -> None:
 
     model = GraphSimulator(cfg.GEOMETRY, cfg.MODEL).to(device)
     print(f"simulator: {format_parameter_count(parameter_count(model))} parameters")
+    print(f"gates: {', '.join(cfg.GATES.names)}")
+    # Say which probes are running. A configured gate set that cannot express a
+    # reference circuit silently drops its curve, and a missing curve is far
+    # easier to misread as a broken probe than as a deliberate skip.
+    active = {name for name, _ in available_probes(cfg.GATES)}
+    for name, _, required in REFERENCE_PROBES:
+        if name in active:
+            print(f"probe {name}: on")
+        else:
+            missing = [gate for gate in required if gate not in cfg.GATES.names]
+            print(f"probe {name}: off -- needs {', '.join(missing)}")
     # Read off the geometry-derived constants before compile wraps the module.
     rows_per_patch = model.decoder.rows_per_patch
     if cfg.TORCH_COMPILE and not args.no_compile and device.type == "cuda":
@@ -324,7 +357,8 @@ def main() -> None:
 
             postfix["eval"] = f"{result.bit_accuracy:.4f}"
             postfix["mcc"] = f"{result.mcc:+.4f}"
-            postfix["adder"] = "/".join(f"{mcc:+.3f}" for _, mcc in probes.values())
+            if probes:
+                postfix["adder"] = "/".join(f"{mcc:+.3f}" for _, mcc in probes.values())
             progress.set_postfix(postfix, refresh=False)
 
             lines = [

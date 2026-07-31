@@ -24,6 +24,8 @@ Needs the Graphviz system package for the ``dot`` binary (``brew install
 graphviz``); the Python wrapper alone is not enough.
 """
 
+from collections.abc import Sequence
+
 import graphviz
 
 from dagnabbit.dag.graphs import GraphBatch
@@ -182,8 +184,17 @@ def render_dag(
     return dot.render(output_path, format=fmt, cleanup=True)
 
 
-def describe(graphs: GraphBatch, index: int = 0) -> str:
-    """One line of what the picture should show, for cross-checking by eye."""
+def describe(
+    graphs: GraphBatch,
+    index: int = 0,
+    gate_names: Sequence[str] = GATE_NAMES,
+) -> str:
+    """One line of what the picture should show, for cross-checking by eye.
+
+    ``gate_names`` labels the type histogram; pass ``config.GATES.names`` when
+    the configured set is not the library default, or the counts come out
+    labelled with the wrong gates.
+    """
     geometry = graphs.geometry
     parents = graphs.parent_indices[index]
     mask = graphs.parent_slot_mask[index]
@@ -201,7 +212,7 @@ def describe(graphs: GraphBatch, index: int = 0) -> str:
     dead = geometry.output_start - masked - len(referenced)
     gates = types.tolist()
     histogram = "  ".join(
-        f"{name} {gates.count(gate_type)}" for gate_type, name in enumerate(GATE_NAMES)
+        f"{name} {gates.count(gate_type)}" for gate_type, name in enumerate(gate_names)
     )
     return (
         f"ranks 0..{int(graphs.ranks[index].max())}  {histogram}  "

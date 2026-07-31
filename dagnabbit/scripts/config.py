@@ -5,17 +5,36 @@ import torch
 from dagnabbit.dag.graphs import Geometry, SamplingConfig
 from dagnabbit.dag.model import SimulatorConfig
 from dagnabbit.optimizers import AutoMuon
+from dagnabbit.tasks.logic_gates.operators import gate_set
+
+# --- gate set ---
+# The circuit vocabulary. Position is the trunk type id, so *appending* a gate
+# is safe while reordering relabels every graph ever generated -- but nothing
+# downstream restates this list, so a reorder stays self-consistent: the
+# geometry, the evaluator's operators, the rendering labels, and the reference
+# adders' type ids all derive from here.
+#
+# NAND/XOR/XNOR is a measured choice, not a default -- see operators.py for the
+# free-accuracy table across gate sets and the two mechanisms behind it. The
+# short version: NAND alone has a mean-field fixed point at the golden ratio
+# 0.618, so a predictor that never reads the graph scores ~62%; XOR and XNOR
+# form a symmetric pair that pulls the fixed point to exactly 0.5, which is what
+# keeps the free floor near chance and forces the model to actually simulate.
+#
+# Available: AND, OR, NAND, NOR, XOR, XNOR. Pass in_degrees=(...) for gates
+# wider than 2 -- every gate is written as a reduction, so any arity works.
+GATES = gate_set("NAND", "XOR", "XNOR")
 
 # --- graph geometry ---
-# 16 roots + 128 NAND/XOR/XNOR trunk positions + 8 outputs = a 152-token
-# sequence, and a 2^16-row truth table. num_trunk_nodes is the number of trunk
-# *positions*; how many carry a gate is SAMPLING's business.
+# 16 roots + 128 trunk positions + 8 outputs = a 152-token sequence, and a
+# 2^16-row truth table. num_trunk_nodes is the number of trunk *positions*; how
+# many carry a gate is SAMPLING's business.
 GEOMETRY = Geometry(
     num_root_nodes=16,
     num_trunk_nodes=128,
     num_output_nodes=8,
-    num_trunk_node_types=3,
-    trunk_node_in_degrees=(2, 2, 2),
+    num_trunk_node_types=GATES.num_types,
+    trunk_node_in_degrees=GATES.in_degrees,
 )
 
 # --- what the training distribution looks like inside that geometry ---
@@ -53,8 +72,8 @@ SAMPLING = SamplingConfig(
 # attended sequence by that much. Worth trying if the simulator looks like it is
 # spending node tokens on bookkeeping rather than on that node's value.
 MODEL = SimulatorConfig(
-    embedding_dim=384,
-    attention_head_dim=64,
+    embedding_dim=128,
+    attention_head_dim=32,
     mlp_expansion_factor=4.0,
     num_simulator_layers=16,
     num_register_tokens=16,
@@ -65,7 +84,7 @@ MODEL = SimulatorConfig(
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRAPH_BATCH_SIZE = 256
+GRAPH_BATCH_SIZE = 512
 # Patches scored per step, out of MODEL.num_patches. The full table is 524288
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
@@ -73,7 +92,7 @@ GRAPH_BATCH_SIZE = 256
 PATCHES_PER_STEP = 32
 
 LEARNING_RATE = 1e-3
-GRADIENT_ACCUMULATION_STEPS = 3
+GRADIENT_ACCUMULATION_STEPS = 1
 GRADIENT_CLIP_MAX_NORM = None
 LR_WARMUP_OPTIMIZER_STEPS = 200
 

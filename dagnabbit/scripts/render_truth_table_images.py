@@ -74,6 +74,18 @@ def bit_plane_figure(
     return figure
 
 
+def describe_draw(graphs, index: int) -> str:
+    """``"58 gates / 71% XNOR"`` -- the two axes the sampling prior varies."""
+    live = ~graphs.trunk_is_masked[index]
+    types = graphs.trunk_types[index][live]
+    counts = [int((types == kind).sum()) for kind in range(cfg.GATES.num_types)]
+    dominant = max(range(len(counts)), key=counts.__getitem__)
+    return (
+        f"{int(live.sum())} gates\n"
+        f"{counts[dominant] / max(1, int(live.sum())):.0%} {cfg.GATES.names[dominant]}"
+    )
+
+
 def density_summary(image: torch.Tensor) -> str:
     """Per-bit fraction of set pixels -- 0.00 or 1.00 is a constant output."""
     return " ".join(f"{value:.2f}" for value in image.float().mean(dim=(-2, -1)))
@@ -99,16 +111,25 @@ def main() -> None:
     )
 
     def planes(graphs) -> list[torch.Tensor]:
-        return list(outputs_to_image(evaluate_graphs(graphs, roots), height, width))
+        return list(
+            outputs_to_image(
+                evaluate_graphs(graphs, roots, cfg.GATES.operators), height, width
+            )
+        )
 
     # Every image shares one coordinate system: the exhaustive input enumeration.
-    images = planes(sample(args.num_random, geometry, sampling=cfg.SAMPLING))
-    labels = [f"random {index}" for index in range(len(images))]
+    graphs = sample(args.num_random, geometry, sampling=cfg.SAMPLING)
+    images = planes(graphs)
+    # Label each draw with what the sampling prior varied: how many gates it
+    # spent, and which gate dominates. Both drive what the plane looks like --
+    # NAND-heavy circuits wash out toward a constant, XOR/XNOR stay balanced --
+    # so without them the rows are unreadable as a sample from a distribution.
+    labels = [describe_draw(graphs, index) for index in range(len(images))]
     for name, build in (
         ("NAND adder", nand_ripple_carry_adder),
         ("NAND+XOR adder", mixed_ripple_carry_adder),
     ):
-        images += planes(build(geometry))
+        images += planes(build(geometry, cfg.GATES))
         labels.append(name)
 
     print("\nper-bit set-pixel density (0.50 = balanced, 0.00/1.00 = constant)")

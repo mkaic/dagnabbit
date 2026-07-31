@@ -8,11 +8,22 @@ in-degree is not 2 needs no special casing at the callsite.
 
 The tuple index *is* the trunk node type: ``GATE_OPERATORS[t]`` is the gate for
 trunk type ``t``, matching the ``[0, num_trunk_node_types)`` slice of the type
-layout in :mod:`dagnabbit.dag.description`. Order is therefore load-bearing --
+layout in :mod:`dagnabbit.dag.graphs`. Order is therefore load-bearing --
 appending is safe, reordering silently relabels every graph ever generated.
+
+Which gates are in play is a configuration choice, made once in
+:mod:`dagnabbit.scripts.config` as a :class:`GateSet`. Everything that has to
+agree about the gate set derives from that one object rather than restating it:
+the geometry's ``num_trunk_node_types`` and ``trunk_node_in_degrees``, the
+operators evaluation dispatches through, the names rendering prints, and the
+type ids the hand-built circuits are written against. Those used to be four
+hand-maintained constants that a reordered gate set would silently desynchronize
+-- the reference adder in particular hardcoded "NAND is type 0, XOR is type 1"
+and would have quietly built a different circuit.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -30,12 +41,21 @@ def _reduce(values: Tensor, operator: Callable[[Tensor, Tensor], Tensor]) -> Ten
     return accumulator
 
 
+def conjunction(values: Tensor) -> Tensor:
+    """AND. Named in full because ``and`` is a keyword."""
+    return _reduce(values, torch.bitwise_and)
+
+
+def disjunction(values: Tensor) -> Tensor:
+    """OR. Named in full because ``or`` is a keyword."""
+    return _reduce(values, torch.bitwise_or)
+
+
 def nand(values: Tensor) -> Tensor:
     return torch.bitwise_not(_reduce(values, torch.bitwise_and))
 
 
 def nor(values: Tensor) -> Tensor:
-    """Not in :data:`GATE_OPERATORS`. Kept for tests and for experiments."""
     return torch.bitwise_not(_reduce(values, torch.bitwise_or))
 
 
@@ -45,6 +65,86 @@ def xor(values: Tensor) -> Tensor:
 
 def xnor(values: Tensor) -> Tensor:
     return torch.bitwise_not(_reduce(values, torch.bitwise_xor))
+
+
+# Every gate that can be named in a config. Being in the catalogue says nothing
+# about being in use -- see GateSet and the measurement table below.
+GATE_CATALOGUE: dict[str, GateOperator] = {
+    "AND": conjunction,
+    "OR": disjunction,
+    "NAND": nand,
+    "NOR": nor,
+    "XOR": xor,
+    "XNOR": xnor,
+}
+
+
+@dataclass(frozen=True)
+class GateSet:
+    """The gates in play, and the trunk type each one owns.
+
+    Holds names rather than function objects so it stays a plain, comparable,
+    picklable description -- the operators are looked up from
+    :data:`GATE_CATALOGUE` on demand. Position in ``names`` *is* the trunk type
+    id, so :meth:`index_of` is how anything that needs a specific gate (the
+    reference adder wanting NAND) asks for it without assuming an order.
+
+    Use :func:`gate_set` to build one; it fills in the usual in-degree.
+    """
+
+    names: tuple[str, ...]
+    in_degrees: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.names:
+            raise ValueError("a gate set needs at least one gate")
+        if len(self.names) != len(self.in_degrees):
+            raise ValueError(
+                f"{len(self.in_degrees)} in-degrees for {len(self.names)} gates"
+            )
+        unknown = [name for name in self.names if name not in GATE_CATALOGUE]
+        if unknown:
+            raise ValueError(
+                f"unknown gate(s) {unknown}; available: {sorted(GATE_CATALOGUE)}"
+            )
+        if len(set(self.names)) != len(self.names):
+            raise ValueError(f"duplicate gate in {self.names}")
+        if any(in_degree < 1 for in_degree in self.in_degrees):
+            raise ValueError("every gate needs in-degree >= 1")
+
+    @property
+    def operators(self) -> tuple[GateOperator, ...]:
+        """What :func:`~dagnabbit.tasks.logic_gates.evaluate.evaluate_choices` wants."""
+        return tuple(GATE_CATALOGUE[name] for name in self.names)
+
+    @property
+    def num_types(self) -> int:
+        """The geometry's ``num_trunk_node_types``."""
+        return len(self.names)
+
+    def index_of(self, name: str) -> int:
+        """The trunk type id of ``name``, or a clear error if it is not in use.
+
+        The error matters more than the lookup: a circuit written in terms of a
+        gate the configured set does not contain cannot be built at all, and
+        saying so beats emitting a wrong circuit against whatever sits at that
+        index.
+        """
+        try:
+            return self.names.index(name)
+        except ValueError:
+            raise ValueError(
+                f"this configuration has no {name} gate; its gates are "
+                f"{list(self.names)}"
+            ) from None
+
+
+def gate_set(*names: str, in_degrees: Sequence[int] | None = None) -> GateSet:
+    """``gate_set("NAND", "XOR", "XNOR")``. In-degree defaults to 2 per gate."""
+    return GateSet(
+        names=tuple(names),
+        in_degrees=tuple(in_degrees) if in_degrees is not None else (2,) * len(names),
+    )
 
 
 # NAND, XOR, XNOR -- chosen by measurement, for behaviour at scale.
@@ -75,10 +175,14 @@ def xnor(values: Tensor) -> Tensor:
 # 0.50 because reconvergent fan-in correlates a gate's two inputs, but the
 # ordering the theory predicts is exactly the ordering observed.
 #
+# The table is what "configurable" is for: these rows are reachable by editing
+# one line of config, e.g. gate_set("NAND", "NOR") or gate_set("AND", "NAND").
+#
 # Index == trunk node type. See the module docstring before touching the order.
-GATE_OPERATORS: tuple[GateOperator, ...] = (nand, xor, xnor)
-GATE_NAMES: tuple[str, ...] = ("NAND", "XOR", "XNOR")
+DEFAULT_GATE_SET = gate_set("NAND", "XOR", "XNOR")
 
-# Retained for readability at callsites that want a gate by name (rendering,
-# hand-built test circuits). Evaluation dispatches through GATE_OPERATORS.
-VALID_OPERATORS: dict[str, GateOperator] = dict(zip(GATE_NAMES, GATE_OPERATORS))
+# Library-level defaults, for tests and for callers with no config in hand.
+# Training does not read these -- it reads ``config.GATES`` -- so changing the
+# configured set does not silently leave a call site on the old one.
+GATE_OPERATORS: tuple[GateOperator, ...] = DEFAULT_GATE_SET.operators
+GATE_NAMES: tuple[str, ...] = DEFAULT_GATE_SET.names

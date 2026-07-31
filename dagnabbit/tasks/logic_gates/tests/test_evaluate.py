@@ -27,7 +27,7 @@ from dagnabbit.tasks.logic_gates.evaluate import (
     popcount,
     unpack_bits,
 )
-from dagnabbit.tasks.logic_gates.operators import nand, nor
+from dagnabbit.tasks.logic_gates.operators import gate_set, nand, nor
 from dagnabbit.tasks.logic_gates.reference_circuits import nand_ripple_carry_adder
 
 # These tests exercise NAND/NOR semantics and slot mapping, so they pin that
@@ -37,6 +37,10 @@ GATE_NAMES = ("NAND", "NOR")
 OPERATORS = (nand, nor)
 
 NAND, NOR = 0, 1
+# The gate set these geometries are written against. The reference builders
+# resolve gates by name through this, so "NAND" means type 0 here and would
+# still mean the right type if the pair were ordered the other way.
+TEST_GATES = gate_set("NAND", "NOR")
 ADDER_GEOMETRY = Geometry(16, 128, 8, 2, (2, 2))
 RANDOM_GEOMETRY = Geometry(4, 32, 3, 2, (2, 2))
 
@@ -493,7 +497,7 @@ def test_reference_adder_is_exactly_correct():
     scoring all at once, against a circuit whose behaviour is known from its
     construction rather than from this code.
     """
-    graphs = nand_ripple_carry_adder(ADDER_GEOMETRY)
+    graphs = nand_ripple_carry_adder(ADDER_GEOMETRY, TEST_GATES)
     task = adder_task()
 
     outputs = evaluate_graphs(graphs, task.root_values, OPERATORS)
@@ -512,30 +516,35 @@ def test_both_adder_vocabularies_compute_the_adder():
     far deeper than the other, the probe stops being a controlled comparison and
     starts measuring depth again.
     """
-    from dagnabbit.tasks.logic_gates.operators import GATE_OPERATORS
+    from dagnabbit.tasks.logic_gates.operators import DEFAULT_GATE_SET
     from dagnabbit.tasks.logic_gates.reference_circuits import (
         mixed_ripple_carry_adder,
         nand_ripple_carry_adder,
     )
 
-    geometry = Geometry(16, 128, 8, 3, (2, 2, 2))
+    gates = DEFAULT_GATE_SET
+    geometry = Geometry(16, 128, 8, gates.num_types, gates.in_degrees)
     task = adder_task()
     depths = {}
     for name, build in (
         ("nand", nand_ripple_carry_adder),
         ("mixed", mixed_ripple_carry_adder),
     ):
-        graphs = build(geometry)
-        outputs = evaluate_graphs(graphs, task.root_values, GATE_OPERATORS)
+        graphs = build(geometry, gates)
+        outputs = evaluate_graphs(graphs, task.root_values, gates.operators)
         assert torch.equal(outputs[0], task.target_values), name
         assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, name
         depths[name] = int(graphs.ranks.max())
 
         used = graphs.trunk_types[0].unique().tolist()
         if name == "nand":
-            assert used == [0], "the all-NAND build must use only NAND"
+            assert used == [gates.index_of("NAND")], (
+                "the all-NAND build must use only NAND"
+            )
         else:
-            assert 1 in used, "the mixed build must actually spend XOR gates"
+            assert gates.index_of("XOR") in used, (
+                "the mixed build must actually spend XOR gates"
+            )
 
     assert abs(depths["nand"] - depths["mixed"]) <= 6, (
         f"the two builds have drifted apart in depth: {depths}"
@@ -544,9 +553,9 @@ def test_both_adder_vocabularies_compute_the_adder():
 
 def test_reference_adder_rejects_an_impossible_width():
     with pytest.raises(ValueError):
-        nand_ripple_carry_adder(Geometry(16, 128, 4, 2, (2, 2)))
+        nand_ripple_carry_adder(Geometry(16, 128, 4, 2, (2, 2)), TEST_GATES)
     with pytest.raises(ValueError, match="trunk nodes"):
-        nand_ripple_carry_adder(Geometry(16, 32, 8, 2, (2, 2)))
+        nand_ripple_carry_adder(Geometry(16, 32, 8, 2, (2, 2)), TEST_GATES)
 
 
 def test_random_circuits_score_near_half():
@@ -654,3 +663,130 @@ def test_rejects_mismatched_node_count():
             RANDOM_GEOMETRY.trunk_node_in_degrees,
             OPERATORS,
         )
+
+
+# --------------------------------------------------------------------------
+# The gate set as configuration
+# --------------------------------------------------------------------------
+
+
+def test_gate_set_validates_its_contents():
+    from dagnabbit.tasks.logic_gates.operators import GateSet, gate_set
+
+    assert gate_set("NAND", "XOR").in_degrees == (2, 2)
+    assert gate_set("NAND", in_degrees=(3,)).in_degrees == (3,)
+
+    with pytest.raises(ValueError, match="unknown gate"):
+        gate_set("NAND", "IMPLIES")
+    with pytest.raises(ValueError, match="duplicate gate"):
+        gate_set("NAND", "NAND")
+    with pytest.raises(ValueError, match="at least one gate"):
+        gate_set()
+    with pytest.raises(ValueError, match="in-degrees for"):
+        GateSet(names=("NAND", "XOR"), in_degrees=(2,))
+
+
+def test_reference_circuits_follow_the_gate_set_order():
+    """Reordering the gate set must move the adder's type ids with it.
+
+    This is the trap the GateSet exists to close: the builders used to hardcode
+    "NAND is type 0, XOR is type 1", so a configuration that ordered them the
+    other way would have silently emitted XOR wherever the adder wanted NAND and
+    still passed every shape check. Both orders must build a real adder, and
+    each must use the type its own set assigns.
+    """
+    from dagnabbit.tasks.logic_gates.operators import gate_set
+    from dagnabbit.tasks.logic_gates.reference_circuits import (
+        mixed_ripple_carry_adder,
+        nand_ripple_carry_adder,
+    )
+
+    task = adder_task()
+    for gates in (gate_set("NAND", "XOR", "XNOR"), gate_set("XNOR", "XOR", "NAND")):
+        geometry = Geometry(16, 128, 8, gates.num_types, gates.in_degrees)
+
+        plain = nand_ripple_carry_adder(geometry, gates)
+        assert plain.trunk_types[0].unique().tolist() == [gates.index_of("NAND")]
+        outputs = evaluate_graphs(plain, task.root_values, gates.operators)
+        assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, f"nand, {gates.names}"
+
+        mixed = mixed_ripple_carry_adder(geometry, gates)
+        assert gates.index_of("XOR") in mixed.trunk_types[0].unique().tolist()
+        outputs = evaluate_graphs(mixed, task.root_values, gates.operators)
+        assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, f"mixed, {gates.names}"
+
+
+def test_a_gate_set_without_nand_says_so():
+    """The adder is written in NAND; a set lacking it cannot build one."""
+    from dagnabbit.tasks.logic_gates.operators import gate_set
+    from dagnabbit.tasks.logic_gates.reference_circuits import (
+        mixed_ripple_carry_adder,
+        nand_ripple_carry_adder,
+    )
+
+    no_nand = gate_set("AND", "OR", "XOR")
+    geometry = Geometry(16, 128, 8, no_nand.num_types, no_nand.in_degrees)
+    with pytest.raises(ValueError, match="no NAND gate"):
+        nand_ripple_carry_adder(geometry, no_nand)
+
+    no_xor = gate_set("NAND", "NOR")
+    geometry = Geometry(16, 128, 8, no_xor.num_types, no_xor.in_degrees)
+    with pytest.raises(ValueError, match="no XOR gate"):
+        mixed_ripple_carry_adder(geometry, no_xor)
+
+
+def test_a_geometry_that_disagrees_with_the_gate_set_is_rejected():
+    from dagnabbit.tasks.logic_gates.operators import gate_set
+    from dagnabbit.tasks.logic_gates.reference_circuits import nand_ripple_carry_adder
+
+    two = gate_set("NAND", "XOR")
+    with pytest.raises(ValueError, match="trunk types but the gate set"):
+        nand_ripple_carry_adder(Geometry(16, 128, 8, 3, (2, 2, 2)), two)
+
+
+def test_the_configured_gate_set_drives_the_geometry():
+    """config.GEOMETRY must not restate what config.GATES already says."""
+    from dagnabbit.scripts import config as cfg
+
+    assert cfg.GEOMETRY.num_trunk_node_types == cfg.GATES.num_types
+    assert cfg.GEOMETRY.trunk_node_in_degrees == cfg.GATES.in_degrees
+    assert len(cfg.GATES.operators) == cfg.GATES.num_types
+
+
+def test_probes_are_skipped_when_the_gate_set_cannot_express_them():
+    """A gate set chosen for training must not abort the run over a probe.
+
+    ``probe_references`` used to build both adders unconditionally, so a
+    NAND-only configuration raised at the very first eval -- step 0, before a
+    single optimizer step had been taken.
+    """
+    from dagnabbit.scripts.train_simulator import available_probes
+    from dagnabbit.tasks.logic_gates.operators import gate_set
+
+    def names(gates):
+        return [name for name, _ in available_probes(gates)]
+
+    assert names(gate_set("NAND", "XOR", "XNOR")) == ["nand", "mixed"]
+    assert names(gate_set("XNOR", "XOR", "NAND")) == ["nand", "mixed"]
+    # The mixed adder needs XOR; the all-NAND one does not.
+    assert names(gate_set("NAND")) == ["nand"]
+    assert names(gate_set("NAND", "NOR")) == ["nand"]
+    # Neither is expressible without NAND, and that is not an error.
+    assert names(gate_set("AND", "OR", "XOR")) == []
+
+
+def test_every_declared_probe_builds_under_a_gate_set_that_satisfies_it():
+    """The declared requirements must be the real ones, not a stale guess."""
+    from dagnabbit.dag.graphs import Geometry
+    from dagnabbit.scripts.train_simulator import REFERENCE_PROBES
+    from dagnabbit.tasks.logic_gates.evaluate import adder_task, bit_accuracy
+    from dagnabbit.tasks.logic_gates.evaluate import evaluate_graphs
+    from dagnabbit.tasks.logic_gates.operators import gate_set
+
+    task = adder_task()
+    for name, build, required in REFERENCE_PROBES:
+        gates = gate_set(*required)
+        geometry = Geometry(16, 128, 8, gates.num_types, gates.in_degrees)
+        graphs = build(geometry, gates)
+        outputs = evaluate_graphs(graphs, task.root_values, gates.operators)
+        assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, name

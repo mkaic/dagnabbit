@@ -42,25 +42,24 @@ def main() -> None:
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    num_types = cfg.GEOMETRY.num_trunk_node_types
     geometry = Geometry(
         num_root_nodes=args.roots,
         num_trunk_nodes=args.trunks,
         num_output_nodes=args.outputs,
-        num_trunk_node_types=num_types,
-        trunk_node_in_degrees=(2,) * num_types,
+        num_trunk_node_types=cfg.GATES.num_types,
+        trunk_node_in_degrees=cfg.GATES.in_degrees,
     )
     if args.circuit == "random":
         graphs = sample(1, geometry, sampling=cfg.SAMPLING)
     elif args.circuit == "nand":
-        graphs = nand_ripple_carry_adder(geometry)
+        graphs = nand_ripple_carry_adder(geometry, cfg.GATES)
     else:
-        graphs = mixed_ripple_carry_adder(geometry)
+        graphs = mixed_ripple_carry_adder(geometry, cfg.GATES)
 
     stem = args.out or f"dag_{args.circuit}"
     path = render_dag(graphs, output_path=stem, fmt=args.format)
     print(f"wrote {path}")
-    print(f"  {describe(graphs)}")
+    print(f"  {describe(graphs, gate_names=cfg.GATES.names)}")
 
 
 if __name__ == "__main__":
