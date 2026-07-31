@@ -23,7 +23,7 @@ from dagnabbit.tasks.logic_gates.operators import gate_set
 #
 # Available: AND, OR, NAND, NOR, XOR, XNOR. Pass in_degrees=(...) for gates
 # wider than 2 -- every gate is written as a reduction, so any arity works.
-GATES = gate_set("NAND", "XOR", "XNOR")
+GATES = gate_set("NAND")
 
 # --- graph geometry ---
 # 16 roots + 128 trunk positions + 8 outputs = a 152-token sequence, and a
