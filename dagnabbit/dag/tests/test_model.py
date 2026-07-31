@@ -13,6 +13,8 @@ graph -- which is the property Phase 1 depends on when it constructs tokens from
 categorical choices instead of reading them off a real graph.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -175,6 +177,96 @@ def test_forward_shapes_and_patch_selection(graphs):
     patch_indices = torch.tensor([2, 0, CONFIG.num_patches - 1])
     subset = model.forward_graphs(graphs, patch_indices)
     assert torch.allclose(subset, everything[:, patch_indices], atol=1e-5)
+
+
+def test_registers_extend_the_sequence_without_changing_the_output_shape(graphs):
+    """Registers ride along in attention but must not alter what is decoded."""
+    torch.manual_seed(0)
+    config = replace(CONFIG, num_register_tokens=5)
+    model = GraphSimulator(GEOMETRY, config)
+    model.eval()
+
+    tokens = model.node_tokens(
+        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+    )
+    sequence = model.simulator(tokens)
+    assert sequence.shape == (len(graphs), GEOMETRY.num_nodes + 5, CONFIG.embedding_dim)
+
+    # The decoder's output is a function of the patch count, not the context.
+    logits = model.forward_graphs(graphs)
+    assert logits.shape == (
+        len(graphs),
+        CONFIG.num_patches,
+        GEOMETRY.num_output_nodes,
+        model.decoder.rows_per_patch,
+    )
+
+
+def test_zero_registers_allocates_nothing(graphs):
+    torch.manual_seed(0)
+    model = GraphSimulator(GEOMETRY, replace(CONFIG, num_register_tokens=0))
+    assert model.simulator.register_tokens is None
+    assert not any("register" in name for name, _ in model.named_parameters())
+
+    tokens = model.node_tokens(
+        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+    )
+    assert model.simulator(tokens).shape[1] == GEOMETRY.num_nodes
+
+
+def test_registers_are_trained_and_shared_across_the_batch(graphs):
+    torch.manual_seed(0)
+    config = replace(CONFIG, num_register_tokens=3)
+    model = GraphSimulator(GEOMETRY, config)
+    assert model.simulator.register_tokens.shape == (3, CONFIG.embedding_dim)
+
+    patch_indices = sample_patch_indices(CONFIG.num_patches, 4, "cpu")
+    targets = patch_targets(
+        packed_outputs(graphs), patch_indices, model.decoder.rows_per_patch
+    )
+    logits = model.forward_graphs(graphs, patch_indices)
+    torch.nn.functional.binary_cross_entropy_with_logits(logits, targets).backward()
+    grad = model.simulator.register_tokens.grad
+    assert grad is not None and grad.abs().sum() > 0
+
+    # One bank of registers for the whole batch, not one per graph: the values
+    # entering the stack must be identical for every row.
+    model.eval()
+    tokens = model.node_tokens(
+        graphs.node_types, graphs.parent_positions, graphs.parent_slot_mask
+    )
+    stacked = torch.cat(
+        [tokens, model.simulator.register_tokens.expand(len(graphs), -1, -1)], dim=1
+    )
+    assert torch.equal(
+        stacked[:, GEOMETRY.num_nodes :],
+        model.simulator.register_tokens.expand(len(graphs), -1, -1),
+    )
+
+
+def test_registers_change_what_the_model_computes(graphs):
+    """A register the model can attend to must be able to move the prediction."""
+    torch.manual_seed(0)
+    without = GraphSimulator(GEOMETRY, replace(CONFIG, num_register_tokens=0)).eval()
+    torch.manual_seed(0)
+    with_registers = GraphSimulator(
+        GEOMETRY, replace(CONFIG, num_register_tokens=4)
+    ).eval()
+
+    # Same seed, so every shared parameter is identical; only the registers and
+    # the attention they participate in differ.
+    assert torch.equal(
+        without.node_tokens.position_embeddings,
+        with_registers.node_tokens.position_embeddings,
+    )
+    assert not torch.allclose(
+        without.forward_graphs(graphs), with_registers.forward_graphs(graphs)
+    )
+
+
+def test_negative_register_count_is_rejected():
+    with pytest.raises(ValueError, match="non-negative"):
+        GraphSimulator(GEOMETRY, replace(CONFIG, num_register_tokens=-1))
 
 
 def test_patch_count_must_divide_the_table():

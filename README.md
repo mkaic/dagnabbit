@@ -26,7 +26,8 @@ Three stages, in `dagnabbit/dag/model.py`:
 1. Each node becomes one token by summing embeddings of its type, its own
    canonical position, and its parents' canonical positions. No transformer, no
    pooling — a gather and three matmuls, fully parallel across nodes.
-2. An unmasked transformer runs over the 152-token sequence. This is where the
+2. An unmasked transformer runs over the 152-token sequence, optionally plus a
+   configurable bank of register tokens belonging to no node. This is where the
    work happens: composing a gate with its ancestors' values is a hop of message
    passing, and the layer count bounds how many hops are available.
 3. A grid of learned patch queries cross-attends the result. Patch `p` owns a
@@ -41,12 +42,24 @@ tokens from them, so what the simulator reads is always a real graph's encoding.
 **The gate.** Average bit accuracy is not the number to watch: a model can score
 well above chance on statistical regularities of random NAND/NOR circuits
 without simulating anything, and such a model has a useless loss landscape near
-an actual target. Watch `eval/accuracy_by_rank` — accuracy bucketed by each
-output node's longest-path depth. Output nodes in this sampling distribution sit
-at median depth 11 (p95 15, max 23), so if accuracy falls off a cliff at the
-simulator's layer count, the receptive field is binding and the fix is more
-layers or a weight-tied recurrent simulator. If it degrades smoothly past the
-layer count, the model found something cheaper than hop-by-hop propagation.
+an actual target. Two metrics separate the cases.
+
+`eval/mcc` is Matthews correlation between predicted and exact bits. It is 0 for
+any constant predictor regardless of class balance, so it only moves when a
+prediction tracks the *specific* circuit. This matters a lot here because random
+circuit outputs are badly imbalanced — measured over 2048 sampled circuits,
+**17% of output nodes are constant over the entire truth table and 47% are more
+lopsided than 90/10**. Accuracy climbing while MCC sits at zero is the signature
+of a model that has learned the marginal bit. Outputs with a constant target are
+excluded from the MCC average (there is nothing to correlate against) and
+reported as `eval/constant_target_fraction`.
+
+`eval/accuracy_by_rank` and `eval/mcc_by_rank` are the same two bucketed by each
+output node's longest-path depth. Output nodes sit at median depth 11 (p95 15,
+max 23), so if either falls off a cliff at the simulator's layer count, the
+receptive field is binding and the fix is more layers or a weight-tied recurrent
+simulator. If they degrade smoothly past the layer count, the model found
+something cheaper than hop-by-hop propagation.
 
 ### Phase 1 — inverse design, not yet built
 

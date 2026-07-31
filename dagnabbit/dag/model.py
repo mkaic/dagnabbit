@@ -47,6 +47,11 @@ class SimulatorConfig:
     attention_head_dim: int = 32
     mlp_expansion_factor: float = 4.0
     num_simulator_layers: int = 16
+    # Learned tokens appended to the node sequence, belonging to no node. They
+    # give the simulator scratch space for whatever global state it wants to
+    # carry, so it does not have to commandeer a node's own token to hold it.
+    # 0 disables them entirely and no parameter is allocated.
+    num_register_tokens: int = 0
     num_decoder_layers: int = 2
     # Truth-table rows are split into this many contiguous patches, each decoded
     # from one cross-attention query. 256 patches over a 65536-row table is 256
@@ -212,16 +217,45 @@ class NodeTokens(nn.Module):
 
 
 class Simulator(nn.Module):
-    """Stack of unmasked self-attention blocks over the node sequence."""
+    """Stack of unmasked self-attention blocks over the node sequence.
+
+    Returns ``[B, N + R, D]``: the ``N`` node positions in canonical order,
+    followed by the ``R`` register tokens. The registers are deliberately left
+    in rather than sliced off, because the only consumer is the patch decoder's
+    cross-attention and global circuit state is exactly what a truth-table query
+    wants to read. Slice ``[:, :num_nodes]`` for per-node features.
+
+    Registers carry no position embedding: their learned parameter *is* their
+    identity, and unlike a node they do not live anywhere in the graph.
+    """
 
     def __init__(self, config: SimulatorConfig):
         super().__init__()
+        if config.num_register_tokens < 0:
+            raise ValueError(
+                f"num_register_tokens must be non-negative, got "
+                f"{config.num_register_tokens}"
+            )
+        self.num_register_tokens = config.num_register_tokens
+        if config.num_register_tokens:
+            self.register_tokens = nn.Parameter(
+                torch.empty(config.num_register_tokens, config.embedding_dim)
+            )
+            nn.init.normal_(self.register_tokens, std=0.02)
+        else:
+            self.register_parameter("register_tokens", None)
+
         self.blocks = nn.ModuleList(
             SelfAttentionBlock(config) for _ in range(config.num_simulator_layers)
         )
         self.output_norm = nn.LayerNorm(config.embedding_dim)
 
     def forward(self, tokens: Tensor) -> Tensor:
+        if self.register_tokens is not None:
+            registers = self.register_tokens.to(dtype=tokens.dtype)
+            tokens = torch.cat(
+                [tokens, registers.unsqueeze(0).expand(tokens.shape[0], -1, -1)], dim=1
+            )
         for block in self.blocks:
             tokens = block(tokens)
         return self.output_norm(tokens)

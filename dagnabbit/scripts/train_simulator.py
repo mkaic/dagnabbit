@@ -11,22 +11,36 @@ The gate
 Average bit accuracy is not the number to watch. A model can score well above
 chance on statistical regularities of random NAND/NOR circuits without
 simulating anything, and such a model has a useless loss landscape near an
-actual target circuit. What matters is ``eval/accuracy_by_rank``: bit accuracy
-bucketed by each output node's longest-path depth. If it falls off a cliff at
-the simulator's layer count, the receptive field is binding and the fix is more
-layers (or a weight-tied recurrent simulator). If it degrades smoothly past the
+actual target circuit. Two metrics separate the cases:
+
+``eval/mcc`` -- Matthews correlation between predicted and exact bits. It is 0
+for any constant predictor no matter how lopsided the target, so it only moves
+when a prediction tracks the *specific* circuit. Accuracy climbing while MCC
+sits at zero is the signature of a model that has learned the marginal bit.
+
+``eval/accuracy_by_rank`` and ``eval/mcc_by_rank`` -- the same two bucketed by
+each output node's longest-path depth. If they fall off a cliff at the
+simulator's layer count, the receptive field is binding and the fix is more
+layers (or a weight-tied recurrent simulator). If they degrade smoothly past the
 layer count, the model found something cheaper than hop-by-hop propagation.
 """
 
 import argparse
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from dagnabbit.dag import canonical
+from dagnabbit.dag.metrics import (
+    bucket_by_rank,
+    confusion_counts,
+    matthews_correlation,
+)
 from dagnabbit.dag.model import (
     GraphSimulator,
     format_parameter_count,
@@ -59,14 +73,33 @@ def loss_and_accuracy(
     return loss, correct.mean(dim=3).mean(dim=1)
 
 
+@dataclass(frozen=True)
+class EvalResult:
+    """One depth-stratified evaluation pass.
+
+    ``mcc`` averages only over outputs whose target actually varied over the
+    bits scored; ``constant_target_fraction`` is how many were excluded. A high
+    exclusion rate is itself informative -- it means the sampled circuits are
+    collapsing to constants, and bit accuracy on those outputs is measuring
+    almost nothing.
+    """
+
+    bit_accuracy: float
+    mcc: float
+    constant_target_fraction: float
+    accuracy_by_rank: dict[int, float]
+    mcc_by_rank: dict[int, float]
+    outputs_by_rank: dict[int, int]
+
+
 @torch.no_grad()
 def evaluate(
     model: GraphSimulator,
     root_values: torch.Tensor,
     rows_per_patch: int,
     device: torch.device,
-):
-    """Bit accuracy on fresh graphs, bucketed by each output node's depth."""
+) -> EvalResult:
+    """Bit accuracy and MCC on fresh graphs, bucketed by each output's depth."""
     model.eval()
     graphs, packed = make_batch(cfg.EVAL_BATCH_SIZE, root_values, device)
     patch_indices = sample_patch_indices(
@@ -76,36 +109,45 @@ def evaluate(
         device_type=device.type, dtype=cfg.AMP_DTYPE, enabled=cfg.AMP_ENABLED
     ):
         logits = model.forward_graphs(graphs, patch_indices)
+    logits = logits.float()
     targets = patch_targets(packed, patch_indices, rows_per_patch)
-    _, accuracy = loss_and_accuracy(logits.float(), targets)
 
-    # [B, C] accuracy against [B, C] output ranks, flattened and bucketed.
+    _, accuracy = loss_and_accuracy(logits, targets)
+    mcc, defined = matthews_correlation(confusion_counts(logits, targets))
+
+    # [B, C] scores against [B, C] output ranks, flattened and bucketed.
     ranks = graphs.output_ranks.reshape(-1)
-    flat = accuracy.reshape(-1)
-    num_buckets = int(ranks.max().item()) + 1
-    totals = torch.zeros(num_buckets, device=device, dtype=torch.float64)
-    counts = torch.zeros(num_buckets, device=device, dtype=torch.float64)
-    totals.scatter_add_(0, ranks, flat.double())
-    counts.scatter_add_(0, ranks, torch.ones_like(flat, dtype=torch.float64))
+    accuracy_by_rank, outputs_by_rank = bucket_by_rank(accuracy.reshape(-1), ranks)
+    mcc_by_rank, _ = bucket_by_rank(mcc.reshape(-1), ranks, valid=defined.reshape(-1))
 
-    by_rank = {
-        rank: float(totals[rank] / counts[rank])
-        for rank in range(num_buckets)
-        if counts[rank] > 0
-    }
+    defined_count = int(defined.sum())
     model.train()
-    return float(accuracy.mean()), by_rank, {r: int(counts[r]) for r in by_rank}
+    return EvalResult(
+        bit_accuracy=float(accuracy.mean()),
+        mcc=float(mcc.reshape(-1)[defined.reshape(-1)].mean())
+        if defined_count
+        else 0.0,
+        constant_target_fraction=1.0 - defined_count / defined.numel(),
+        accuracy_by_rank=accuracy_by_rank,
+        mcc_by_rank=mcc_by_rank,
+        outputs_by_rank=outputs_by_rank,
+    )
 
 
 @torch.no_grad()
 def probe_adder(
     model: GraphSimulator, rows_per_patch: int, device: torch.device
-) -> float:
+) -> tuple[float, float]:
     """How well does the simulator predict the *reference adder's* behaviour?
 
-    Not a training signal -- an out-of-distribution check. The hand-built adder
-    is a structured circuit, which is exactly what random sampling never
-    produces and exactly what Phase 1 will be searching for.
+    Returns ``(bit accuracy, MCC)``. Not a training signal -- an
+    out-of-distribution check. The hand-built adder is a structured circuit,
+    which is exactly what random sampling never produces and exactly what Phase
+    1 will be searching for.
+
+    MCC matters more here than on random graphs: every bit of ``a + b`` is
+    balanced almost exactly 50/50 over the full table, so bit accuracy has a
+    hard floor of ~0.5 that says nothing, while MCC starts at 0.
     """
     from dagnabbit.tasks.logic_gates.reference_circuits import nand_ripple_carry_adder
 
@@ -125,8 +167,38 @@ def probe_adder(
     assert float(exact[0]) == 1.0, "reference adder does not compute the adder"
 
     targets = patch_targets(packed, patch_indices, rows_per_patch)
-    _, accuracy = loss_and_accuracy(logits.float(), targets)
-    return float(accuracy.mean())
+    logits = logits.float()
+    _, accuracy = loss_and_accuracy(logits, targets)
+    mcc, _ = matthews_correlation(confusion_counts(logits, targets))
+    return float(accuracy.mean()), float(mcc.mean())
+
+
+def format_rank_ladder(
+    result: EvalResult, per_line: int = 4, indent: str = "  "
+) -> list[str]:
+    """The depth ladder as fixed-width columns, wrapped.
+
+    Each cell is ``rank, bit accuracy, MCC, outputs in the bucket``. Printed
+    rather than only logged because a cliff at the simulator's layer count is
+    the thing worth catching by eye, and that is far easier to see in a grid
+    than in a scrolling stream of scalars.
+
+    Accuracy and MCC sit side by side because the gap between them is the
+    signal: accuracy drifting up while MCC stays at zero means the model is
+    learning the marginal bit, not the circuit. The sample count is there
+    because the deepest ranks are both the ones that matter and the ones with
+    the fewest outputs -- an ``n2`` bucket swinging around is noise, not a cliff.
+    """
+    cells = [
+        f"r{rank:<2} {result.accuracy_by_rank[rank]:.3f} "
+        f"{result.mcc_by_rank.get(rank, float('nan')):+.3f} "
+        f"n{result.outputs_by_rank[rank]:<4}"
+        for rank in sorted(result.accuracy_by_rank)
+    ]
+    return [
+        indent + " ".join(cells[start : start + per_line]).rstrip()
+        for start in range(0, len(cells), per_line)
+    ]
 
 
 def main() -> None:
@@ -158,9 +230,12 @@ def main() -> None:
     )
 
     root_values = exhaustive_root_values(cfg.GEOMETRY.num_root_nodes).to(device)
-    started = time.time()
+    progress = tqdm(range(args.steps), unit="step", dynamic_ncols=True)
+    postfix: dict[str, str] = {}
+    window_started = time.time()
+    window_start_step = 0
 
-    for step in range(args.steps):
+    for step in progress:
         graphs, packed = make_batch(cfg.GRAPH_BATCH_SIZE, root_values, device)
         patch_indices = sample_patch_indices(
             cfg.MODEL.num_patches, cfg.PATCHES_PER_STEP, device
@@ -185,34 +260,59 @@ def main() -> None:
             scheduler.step()
 
         if step % cfg.LOG_EVERY == 0:
+            # Rate over the last window rather than since launch, so a slowdown
+            # shows up instead of being averaged away by a fast start.
+            elapsed = max(time.time() - window_started, 1e-9)
             graphs_per_second = (
-                cfg.GRAPH_BATCH_SIZE * (step + 1) / (time.time() - started)
+                cfg.GRAPH_BATCH_SIZE * (step - window_start_step + 1) / elapsed
             )
+            window_started = time.time()
+            window_start_step = step
+
             writer.add_scalar("train/loss", float(loss), step)
             writer.add_scalar("train/bit_accuracy", float(accuracy.mean()), step)
             writer.add_scalar("train/graphs_per_second", graphs_per_second, step)
-            print(
-                f"step {step:>7}  loss {float(loss):.4f}  "
-                f"acc {float(accuracy.mean()):.4f}  {graphs_per_second:.0f} graphs/s"
-            )
+            postfix["loss"] = f"{float(loss):.4f}"
+            postfix["acc"] = f"{float(accuracy.mean()):.4f}"
+            postfix["g/s"] = f"{graphs_per_second:.0f}"
+            progress.set_postfix(postfix, refresh=False)
 
         if step % cfg.EVAL_EVERY == 0:
-            mean_accuracy, by_rank, counts = evaluate(
-                model, root_values, rows_per_patch, device
-            )
-            writer.add_scalar("eval/bit_accuracy", mean_accuracy, step)
-            for rank, value in by_rank.items():
-                writer.add_scalar(f"eval/accuracy_by_rank/{rank:02d}", value, step)
+            result = evaluate(model, root_values, rows_per_patch, device)
+            adder_accuracy, adder_mcc = probe_adder(model, rows_per_patch, device)
+
+            writer.add_scalar("eval/bit_accuracy", result.bit_accuracy, step)
+            writer.add_scalar("eval/mcc", result.mcc, step)
             writer.add_scalar(
-                "probe/adder_bit_accuracy",
-                probe_adder(model, rows_per_patch, device),
-                step,
+                "eval/constant_target_fraction", result.constant_target_fraction, step
             )
-            ladder = "  ".join(
-                f"r{rank}={value:.3f}(n={counts[rank]})"
-                for rank, value in sorted(by_rank.items())
-            )
-            print(f"  eval acc {mean_accuracy:.4f}   {ladder}")
+            for rank, value in result.accuracy_by_rank.items():
+                writer.add_scalar(f"eval/accuracy_by_rank/{rank:02d}", value, step)
+                writer.add_scalar(
+                    f"eval/outputs_at_rank/{rank:02d}",
+                    result.outputs_by_rank[rank],
+                    step,
+                )
+            for rank, value in result.mcc_by_rank.items():
+                writer.add_scalar(f"eval/mcc_by_rank/{rank:02d}", value, step)
+            writer.add_scalar("probe/adder_bit_accuracy", adder_accuracy, step)
+            writer.add_scalar("probe/adder_mcc", adder_mcc, step)
+
+            postfix["eval"] = f"{result.bit_accuracy:.4f}"
+            postfix["mcc"] = f"{result.mcc:+.4f}"
+            postfix["adder"] = f"{adder_accuracy:.4f}"
+            progress.set_postfix(postfix, refresh=False)
+
+            lines = [
+                f"step {step:>8}  acc {result.bit_accuracy:.4f}  "
+                f"mcc {result.mcc:+.4f}  "
+                f"adder {adder_accuracy:.4f}/{adder_mcc:+.4f}  "
+                f"const {result.constant_target_fraction:.1%}",
+                f"  cells: rank, accuracy, mcc, outputs -- past "
+                f"r{cfg.MODEL.num_simulator_layers} exceeds the simulator's depth",
+                *format_rank_ladder(result),
+            ]
+            progress.write("\n".join(lines))
 
         if cfg.CHECKPOINT_EVERY and step and step % cfg.CHECKPOINT_EVERY == 0:
             torch.save(
@@ -225,6 +325,7 @@ def main() -> None:
                 run_directory / f"step_{step:08d}.pt",
             )
 
+    progress.close()
     writer.close()
 
 

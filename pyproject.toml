@@ -14,6 +14,7 @@ dependencies = [
     # dagnabbit/dag/generate.py.
     "numba>=0.61",
     "tensorboard>=2.18.0",
+    "tqdm",
     "pytest>=8.0",
     "ruff",
 ]

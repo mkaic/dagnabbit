@@ -25,11 +25,17 @@ GEOMETRY = Geometry(
 # accuracy stratified by output rank falls off a cliff at the layer count, that
 # bound is binding and this is the number to raise; if it degrades smoothly
 # past it, the model found something cheaper than message passing.
+#
+# num_register_tokens is off by default so the model is unchanged until asked.
+# 4-8 is the usual range; they cost one parameter row each and lengthen the
+# attended sequence by that much. Worth trying if the simulator looks like it is
+# spending node tokens on bookkeeping rather than on that node's value.
 MODEL = SimulatorConfig(
-    embedding_dim=384,
+    embedding_dim=256,
     attention_head_dim=64,
     mlp_expansion_factor=4.0,
-    num_simulator_layers=24,
+    num_simulator_layers=16,
+    num_register_tokens=16,
     num_decoder_layers=2,
     num_patches=256,
     dropout=0.0,
@@ -37,12 +43,12 @@ MODEL = SimulatorConfig(
 
 # --- training ---
 NUM_STEPS = 1_000_000
-GRAPH_BATCH_SIZE = 64
+GRAPH_BATCH_SIZE = 1024
 # Patches scored per step, out of MODEL.num_patches. The full table is 524288
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
 # it trades directly against GRAPH_BATCH_SIZE.
-PATCHES_PER_STEP = 256
+PATCHES_PER_STEP = 32
 
 LEARNING_RATE = 1e-3
 GRADIENT_ACCUMULATION_STEPS = 1
@@ -88,7 +94,7 @@ LOG_EVERY = 10
 # the Phase 0 gate -- average accuracy can look fine while deep outputs sit at
 # chance, and that gap is what says whether the simulator is simulating.
 EVAL_EVERY = 100
-EVAL_BATCH_SIZE = 32
+EVAL_BATCH_SIZE = 256
 # Patches per eval graph. Higher than training since there is no backward pass.
 EVAL_PATCHES = 256
 CHECKPOINT_EVERY = 5000
