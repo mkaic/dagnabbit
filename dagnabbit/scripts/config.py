@@ -54,7 +54,7 @@ GEOMETRY = Geometry(
 # 90/5/5 splits, and everything between, with the batch-wide marginal unchanged.
 # The all-NAND adder is a 100/0/0 circuit and was previously ~unreachable.
 SAMPLING = SamplingConfig(
-    minimum_trunk_nodes=32,
+    minimum_trunk_nodes=16,
     trunk_type_concentration=1.0,
 )
 
@@ -89,7 +89,7 @@ GRAPH_BATCH_SIZE = 128
 # bits per graph; at 32 patches a step sees 1/8 of it, which at batch 256 is
 # ~17M logits. Raise for a lower-variance gradient, lower if VRAM is tight --
 # it trades directly against GRAPH_BATCH_SIZE.
-PATCHES_PER_STEP = 32
+PATCHES_PER_STEP = 256
 
 LEARNING_RATE = 3e-4
 GRADIENT_ACCUMULATION_STEPS = 1
