@@ -26,6 +26,7 @@ layer count, the model found something cheaper than hop-by-hop propagation.
 """
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,7 @@ from dagnabbit.dag.model import (
     sample_patch_indices,
 )
 from dagnabbit.scripts import config as cfg
+from dagnabbit.scripts import provenance
 from dagnabbit.tasks.logic_gates.evaluate import (
     adder_task,
     bit_accuracy,
@@ -265,6 +267,11 @@ def main() -> None:
     run_directory = Path(cfg.LOG_DIR) / run_name
     run_directory.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(run_directory))
+
+    # Before anything can fail: a run that dies at step 3 is still worth being
+    # able to identify. See provenance.py for what lands in the directory.
+    record = provenance.capture(run_directory, cfg, sys.argv, writer)
+    print(provenance.format_summary(record))
 
     model = GraphSimulator(cfg.GEOMETRY, cfg.MODEL).to(device)
     print(f"simulator: {format_parameter_count(parameter_count(model))} parameters")
