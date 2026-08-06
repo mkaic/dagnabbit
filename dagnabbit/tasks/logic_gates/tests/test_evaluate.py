@@ -493,9 +493,9 @@ def test_reference_adder_is_exactly_correct():
     """A hand-wired NAND adder must score 1.0 on every bit of every row.
 
     The strongest end-to-end check available: root slot mapping, gate semantics,
-    23 ranks of topological evaluation, the node layout, output slot mapping and
-    scoring all at once, against a circuit whose behaviour is known from its
-    construction rather than from this code.
+    19 ranks of topological evaluation, the node layout, the trailing <MASK>
+    block, output slot mapping and scoring all at once, against a circuit whose
+    behaviour is known from its construction rather than from this code.
     """
     graphs = nand_ripple_carry_adder(ADDER_GEOMETRY, TEST_GATES)
     task = adder_task()
@@ -511,10 +511,11 @@ def test_reference_adder_is_exactly_correct():
 def test_both_adder_vocabularies_compute_the_adder():
     """The NAND and NAND+XOR builds must agree on behaviour and differ on gates.
 
-    The pair only isolates gate vocabulary if everything else is held roughly
-    fixed, so this also pins that they stay comparable in depth. If one drifts
-    far deeper than the other, the probe stops being a controlled comparison and
-    starts measuring depth again.
+    Both are built mask-padded (the default): the minimal core followed by a
+    trailing ``<MASK>`` block, which is the in-distribution representation
+    under a sampler that varies the live gate count. The live counts pin that
+    the build stayed minimal -- buffer padding sneaking back in would show up
+    here as a live count above the core size.
     """
     from dagnabbit.tasks.logic_gates.operators import DEFAULT_GATE_SET
     from dagnabbit.tasks.logic_gates.reference_circuits import (
@@ -525,7 +526,7 @@ def test_both_adder_vocabularies_compute_the_adder():
     gates = DEFAULT_GATE_SET
     geometry = Geometry(16, 128, 8, gates.num_types, gates.in_degrees)
     task = adder_task()
-    depths = {}
+    core_sizes = {"nand": 67, "mixed": 36}
     for name, build in (
         ("nand", nand_ripple_carry_adder),
         ("mixed", mixed_ripple_carry_adder),
@@ -534,9 +535,14 @@ def test_both_adder_vocabularies_compute_the_adder():
         outputs = evaluate_graphs(graphs, task.root_values, gates.operators)
         assert torch.equal(outputs[0], task.target_values), name
         assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, name
-        depths[name] = int(graphs.ranks.max())
 
-        used = graphs.trunk_types[0].unique().tolist()
+        live = ~graphs.trunk_is_masked[0]
+        assert int(live.sum()) == core_sizes[name], name
+        # The mask block must be trailing: no live gate after the first mask.
+        first_mask = int(live.long().argmin()) if not bool(live.all()) else len(live)
+        assert not bool(live[first_mask:].any()), name
+
+        used = graphs.trunk_types[0][live].unique().tolist()
         if name == "nand":
             assert used == [gates.index_of("NAND")], (
                 "the all-NAND build must use only NAND"
@@ -545,10 +551,6 @@ def test_both_adder_vocabularies_compute_the_adder():
             assert gates.index_of("XOR") in used, (
                 "the mixed build must actually spend XOR gates"
             )
-
-    assert abs(depths["nand"] - depths["mixed"]) <= 6, (
-        f"the two builds have drifted apart in depth: {depths}"
-    )
 
 
 def test_reference_adder_rejects_an_impossible_width():
@@ -706,7 +708,8 @@ def test_reference_circuits_follow_the_gate_set_order():
         geometry = Geometry(16, 128, 8, gates.num_types, gates.in_degrees)
 
         plain = nand_ripple_carry_adder(geometry, gates)
-        assert plain.trunk_types[0].unique().tolist() == [gates.index_of("NAND")]
+        live_types = plain.trunk_types[0][~plain.trunk_is_masked[0]]
+        assert live_types.unique().tolist() == [gates.index_of("NAND")]
         outputs = evaluate_graphs(plain, task.root_values, gates.operators)
         assert float(bit_accuracy(outputs, task)[0][0]) == 1.0, f"nand, {gates.names}"
 

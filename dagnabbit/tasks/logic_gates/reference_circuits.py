@@ -12,20 +12,22 @@ separates gate vocabulary from depth and structure.
 
 Padding
 -------
-The model's geometry fixes the trunk node count (128 by default) while an
-adder core needs only 67 gates (36 with XOR). The spare capacity is spent on **identity
-buffers** rather than dead gates, which matters whenever the circuit is used to
-probe a trained model: the sampler's coverage pass guarantees every trunk node
-has at least one child, so a circuit padded with
-dead gates is off-distribution in a way that has nothing to do with what it
-computes, and its padding gates are structural twins that the node-index
-ordering cannot distinguish.
+The model's geometry fixes the trunk position count (128 by default) while an
+adder core needs only 67 gates (36 with XOR). The default is now to fill the
+spare positions with trailing ``<MASK>`` tokens -- exactly how the sampler
+represents a graph smaller than the budget -- so the probe circuit is
+in-distribution in both live gate count and depth. Measured against the current
+training prior (live count uniform in [16, 128]): output ranks of the masked
+NAND core top out at 19 versus a training max of 20, while the old
+buffer-padded variant reached 29 and put four of eight output bits at depths
+the model had never seen.
 
-A buffer is transparent because ``NAND(x, x) = NOT x``, so an inverter feeding
-a restorer returns the original signal. One inverter can be shared by several
-restorers, which makes padding cost ``1 + (number of rerouted consumers)`` and
-therefore reachable at either parity -- a chain of pure pairs could only ever
-spend an even number of gates.
+``padding="buffers"`` keeps the historical behaviour: identity buffers
+(``NAND(x, x)`` inverter feeding a restorer returns the original signal)
+spliced into the output wires until every position holds a live gate. It
+predates ``<MASK>`` -- the old sampler guaranteed every trunk node a child, so
+dead padding was off-distribution then -- and is kept constructible because the
+score gap between the two paddings is a free depth-extrapolation probe.
 
 Because buffers are spliced into existing wires, gates cannot simply be
 appended in index order; the circuit is built against symbolic ids and
@@ -159,11 +161,15 @@ def build_ripple_carry_adder(
     num_output_nodes: int = 8,
     gates: GateSet = DEFAULT_GATE_SET,
     use_xor: bool = False,
+    padding: str = "mask",
 ) -> tuple[GraphBatch, AdderAnnotations]:
-    """An 8-bit ripple-carry adder, padded to the trunk budget with buffers.
+    """An 8-bit ripple-carry adder, spare trunk positions ``<MASK>`` by default.
 
     Scores exactly 1.0 on :func:`~dagnabbit.tasks.logic_gates.evaluate.adder_task`
-    and contains **no dead gates**.
+    and contains **no dead gates**. ``padding`` is ``"mask"`` (the minimal core,
+    trailing positions masked -- the in-distribution representation under the
+    current sampler) or ``"buffers"`` (every position live, spare spent on
+    identity-buffer pairs -- see the module docstring for why this exists).
 
     Bit-order convention follows the truth table: roots 0-7 are the bits of
     ``a`` most significant first, roots 8-15 the bits of ``b``, and output j is
@@ -179,14 +185,13 @@ def build_ripple_carry_adder(
     omits gates differently either builds the same circuit or says plainly that
     it cannot.
 
-    Fewer core gates means *more* padding at a fixed trunk budget, so the two
-    land at comparable depth (29 and 28) rather than the XOR version being
-    shallower. That is what makes them a controlled pair.
-
-    Both compute the same function and both score exactly 1.0. Keeping the pair
-    is the point: probing a trained simulator on each separates "this circuit is
-    deep and structured" from "this circuit uses gates the training distribution
-    rarely puts on that path".
+    Both compute the same function and both score exactly 1.0. Under
+    ``padding="mask"`` each keeps its natural depth (NAND output ranks up to
+    19, mixed up to 16); under ``padding="buffers"`` the spare budget lands
+    them at comparable depth (29 and 28), which was the old controlled-pair
+    rationale. Probing a trained simulator on each still separates "this
+    circuit is deep and structured" from "this circuit uses gates the training
+    distribution rarely puts on that path".
 
     Either way the most significant bit omits its carry-out, which
     ``(a + b) mod 256`` discards -- that gate would otherwise be childless.
@@ -268,6 +273,7 @@ def build_ripple_carry_adder(
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         gates=gates,
+        padding=padding,
     )
     for bit, gate_id in sum_bits.items():
         annotations.sum_node_of_bit[bit] = final_index[gate_id]
@@ -281,6 +287,7 @@ def build_nand_bitwise_xor(
     num_trunk_nodes: int = 128,
     num_output_nodes: int = 8,
     gates: GateSet = DEFAULT_GATE_SET,
+    padding: str = "mask",
 ) -> tuple[GraphBatch, AdderAnnotations]:
     """Bitwise ``a XOR b``: the same inputs and outputs, no long-range structure.
 
@@ -329,6 +336,7 @@ def build_nand_bitwise_xor(
         num_trunk_nodes=num_trunk_nodes,
         num_output_nodes=num_output_nodes,
         gates=gates,
+        padding=padding,
     )
     for bit, gate_id in xor_bits.items():
         annotations.sum_node_of_bit[bit] = final_index[gate_id]
@@ -366,19 +374,24 @@ def _pad_and_emit(
     num_trunk_nodes: int,
     num_output_nodes: int,
     gates: GateSet,
+    padding: str = "mask",
 ) -> tuple[GraphBatch, dict[int, int]]:
-    """Pad a core circuit to the trunk budget with buffers, then emit it.
+    """Pad a core circuit to the trunk budget, then emit it.
 
-    Returns the description and the symbolic-id -> final-index map, which the
-    caller needs to translate its own annotations.
+    ``padding="mask"`` emits the core followed by trailing ``<MASK>``
+    positions; ``padding="buffers"`` splices identity buffers until every
+    position is live. Returns the description and the symbolic-id ->
+    final-index map, which the caller needs to translate its own annotations.
     """
+    if padding not in ("mask", "buffers"):
+        raise ValueError(f"padding must be 'mask' or 'buffers', got {padding!r}")
     spare = num_trunk_nodes - annotations.core_gates
     if spare < 0:
         raise ValueError(
             f"the circuit needs {annotations.core_gates} gates but only "
             f"{num_trunk_nodes} trunk nodes are available"
         )
-    if spare == 1:
+    if padding == "buffers" and spare == 1:
         raise ValueError(
             "cannot spend exactly one spare trunk node transparently; the "
             "cheapest buffer costs two gates"
@@ -399,7 +412,7 @@ def _pad_and_emit(
     # Odd budgets need one shared-inverter insertion first (cost 1 + k for k
     # rerouted consumers): a pure chain of self-NAND pairs can only ever spend
     # an even number, since an odd chain inverts.
-    if spare % 2 == 1:
+    if padding == "buffers" and spare % 2 == 1:
         for source in sorted(circuit.parents, key=_descendant_counts(circuit).get):
             consumers = circuit.consumers_of(source)
             if len(consumers) >= 2:
@@ -412,7 +425,7 @@ def _pad_and_emit(
             )
 
     slot = 0
-    while spare >= 2:
+    while padding == "buffers" and spare >= 2:
         index = slot % num_output_nodes
         source = output_sources[index]
         bit = circuit.bit.get(source, 0)
@@ -426,9 +439,10 @@ def _pad_and_emit(
     annotations.buffer_gates = len(circuit.parents) - annotations.core_gates
 
     order = circuit.topological_order()
-    if len(order) != num_trunk_nodes:
+    if len(order) + spare != num_trunk_nodes:
         raise AssertionError(
-            f"built {len(order)} trunk gates, expected {num_trunk_nodes}"
+            f"built {len(order)} trunk gates + {spare} masked positions, "
+            f"expected {num_trunk_nodes}"
         )
     final_index = {
         gate_id: num_root_nodes + position for position, gate_id in enumerate(order)
@@ -447,6 +461,13 @@ def _pad_and_emit(
         annotations.role_of_node[index] = circuit.role[gate_id]
         if circuit.role[gate_id].startswith("buffer"):
             annotations.buffer_nodes.add(index)
+
+    # Trailing <MASK> positions: no parents, no value, referenced by nothing --
+    # the same layout the sampler emits for a graph under the trunk budget.
+    mask_type = gates.num_types + num_root_nodes + 1
+    for _ in range(spare if padding == "mask" else 0):
+        node_inputs_indices.append([])
+        node_types.append(mask_type)
 
     output_type = gates.num_types + num_root_nodes
     width = num_output_nodes
@@ -469,6 +490,7 @@ def ripple_carry_adder(
     geometry: Geometry,
     use_xor: bool = False,
     gates: GateSet = DEFAULT_GATE_SET,
+    padding: str = "mask",
 ) -> GraphBatch:
     """The adder circuit alone, as a batch of one.
 
@@ -487,18 +509,19 @@ def ripple_carry_adder(
         num_output_nodes=geometry.num_output_nodes,
         gates=gates,
         use_xor=use_xor,
+        padding=padding,
     )[0]
 
 
 def nand_ripple_carry_adder(
-    geometry: Geometry, gates: GateSet = DEFAULT_GATE_SET
+    geometry: Geometry, gates: GateSet = DEFAULT_GATE_SET, padding: str = "mask"
 ) -> GraphBatch:
-    """The all-NAND adder: 67 core gates, output depths up to 23."""
-    return ripple_carry_adder(geometry, use_xor=False, gates=gates)
+    """The all-NAND adder: 67 core gates, masked output depths up to 19."""
+    return ripple_carry_adder(geometry, use_xor=False, gates=gates, padding=padding)
 
 
 def mixed_ripple_carry_adder(
-    geometry: Geometry, gates: GateSet = DEFAULT_GATE_SET
+    geometry: Geometry, gates: GateSet = DEFAULT_GATE_SET, padding: str = "mask"
 ) -> GraphBatch:
     """The NAND+XOR adder: 35 core gates, and much shallower."""
-    return ripple_carry_adder(geometry, use_xor=True, gates=gates)
+    return ripple_carry_adder(geometry, use_xor=True, gates=gates, padding=padding)

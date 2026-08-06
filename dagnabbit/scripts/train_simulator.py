@@ -174,12 +174,14 @@ def probe_references(
 ) -> dict[str, tuple[float, float]]:
     """Predict the hand-built adders' behaviour. Returns {name: (accuracy, mcc)}.
 
-    Not a training signal -- an out-of-distribution check. Two circuits compute
+    Not a training signal -- a structured-circuit check. Two circuits compute
     the same function from different vocabularies: ``nand`` is all-NAND with a
     67-gate core, ``mixed`` spends XOR where the NAND version spends four gates
-    and has a 35-gate core. Both are padded to the same trunk budget and end up
-    at comparable depth, so the difference between the two scores isolates gate
-    vocabulary from depth and structure.
+    and has a 36-gate core. Both are mask-padded minimal cores, which under the
+    variable-gate-count sampler is in-distribution in both live gate count and
+    depth -- the old buffer-padded probe reached rank 29 and put half its
+    output bits at depths the training distribution never produces, so its
+    score conflated "structured circuit" with "depth extrapolation".
 
     MCC matters more here than on random graphs: every bit of ``a + b`` is
     balanced almost exactly 50/50 over the full table, so bit accuracy has a

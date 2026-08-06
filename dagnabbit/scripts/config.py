@@ -143,3 +143,40 @@ CHECKPOINT_EVERY = 5000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 1
 LOG_DIR = "runs"
+
+# --- Phase 1: adaptation (scripts/adapt_circuit.py) ---
+# A population of independent candidate circuits is hill-climbed by gradient
+# through a Phase 0 checkpoint, while the checkpoint itself fine-tunes on the
+# exact truth tables of whatever the candidates currently build (the
+# hindsight-relabelling loop). Different loop, different metrics, so these runs
+# log under their own directory rather than runs/.
+ADAPT_LOG_DIR = "adaptations"
+ADAPT_STEPS = 100_000
+# Candidates optimized per step. Every candidate is exact-evaluated every step
+# -- the bitpacked evaluator is cheap enough that the surrogate exists for its
+# gradient, not to save evaluations.
+ADAPT_POPULATION = 256
+# Gumbel-softmax temperature for the straight-through sampling. The hard
+# forward pass is a real graph at any temperature; this only scales how sharp
+# the backward mixture is.
+ADAPT_TEMPERATURE = 1.0
+# Adam on the candidate logits. Logit space tolerates far larger steps than
+# weight space; 3e-2 moves a uniform 128-way choice to near-deterministic in
+# a few hundred steps if the gradient keeps agreeing.
+ADAPT_CANDIDATE_LR = 3e-2
+# Each candidate's logits start at +concentration on one seed graph's choices,
+# so the population begins as distinct hypotheses rather than one shared
+# maximum-entropy blur. ~2 is a soft prior; gumbel noise still explores.
+ADAPT_INIT_CONCENTRATION = 2.0
+# Patches scored per candidate step. The candidate gradient only needs to
+# point roughly toward the target; the exact evaluator judges the result.
+ADAPT_PATCHES_PER_STEP = 64
+# Surrogate refresh: each step the simulator fine-tunes on the exact tables of
+# the hard candidate graphs plus this many fresh random graphs (anti-forgetting
+# and, as a side effect, a running random-search baseline at the same evaluator
+# budget). The learning rate is deliberately well below Phase 0's -- the model
+# is adapting to a shifting local distribution, not learning from scratch.
+ADAPT_FINETUNE_LR = 3e-5
+ADAPT_RANDOM_GRAPHS = 256
+ADAPT_LOG_EVERY = 10
+ADAPT_CHECKPOINT_EVERY = 2_000
