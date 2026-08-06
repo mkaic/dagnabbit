@@ -170,7 +170,7 @@ ADAPT_CANDIDATE_LR = 3e-2
 ADAPT_INIT_CONCENTRATION = 2.0
 # Patches scored per candidate step. The candidate gradient only needs to
 # point roughly toward the target; the exact evaluator judges the result.
-ADAPT_PATCHES_PER_STEP = 64
+ADAPT_PATCHES_PER_STEP = 256
 # Surrogate refresh: each step the simulator fine-tunes on the exact tables of
 # the hard candidate graphs plus this many fresh random graphs (anti-forgetting
 # and, as a side effect, a running random-search baseline at the same evaluator
