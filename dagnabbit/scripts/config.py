@@ -171,6 +171,16 @@ ADAPT_INIT_CONCENTRATION = 2.0
 # Patches scored per candidate step. The candidate gradient only needs to
 # point roughly toward the target; the exact evaluator judges the result.
 ADAPT_PATCHES_PER_STEP = 256
+# The candidate loss is BCE(logits / temperature, target). The simulator is
+# (correctly) so confident that its bit logits sit around |l| ~ 16, where raw
+# BCE weighs fixing a wrong bit ~e^|l| times heavier than preserving a right
+# one -- the gradient then sees only upside in any rewiring and commits to
+# accuracy-neutral shuffles. Scaling restores preservation pressure: the
+# repair:preserve weight ratio is exp(mean|l| / temperature), so at |l| ~ 16
+# this 16 gives ~e : 1. Watch adapt/mean_abs_logit -- if the fine-tune drives
+# confidence up, the realized ratio drifts with it. Candidate loss only; the
+# fine-tune wants its confident calibration untouched.
+ADAPT_LOSS_TEMPERATURE = 16.0
 # Surrogate refresh: each step the simulator fine-tunes on the exact tables of
 # the hard candidate graphs plus this many fresh random graphs (anti-forgetting
 # and, as a side effect, a running random-search baseline at the same evaluator

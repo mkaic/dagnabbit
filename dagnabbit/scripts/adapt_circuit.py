@@ -155,7 +155,7 @@ def main() -> None:
         ):
             logits = model.decoder(model.simulator(sample.tokens), patch_indices)
         surrogate_loss = F.binary_cross_entropy_with_logits(
-            logits.float(), target_bits
+            logits.float() / cfg.ADAPT_LOSS_TEMPERATURE, target_bits
         )
         candidate_optimizer.zero_grad(set_to_none=True)
         surrogate_loss.backward()
@@ -166,6 +166,7 @@ def main() -> None:
         # what the simulator says the candidates compute, versus the target
         # and versus what they actually compute.
         with torch.no_grad():
+            mean_abs_logit = logits.detach().abs().mean()
             predictions = logits.detach() > 0
             predicted_vs_target = (
                 (predictions == target_bits.bool()).float().mean()
@@ -254,6 +255,7 @@ def main() -> None:
                 step,
             )
             writer.add_scalar("adapt/faithfulness", float(faithfulness), step)
+            writer.add_scalar("adapt/mean_abs_logit", float(mean_abs_logit), step)
             writer.add_scalar("adapt/live_gates", float(live.mean()), step)
             writer.add_scalar(
                 "adapt/max_output_rank",
